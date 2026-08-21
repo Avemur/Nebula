@@ -221,8 +221,27 @@ So the "zero-boot-time path" is:
 - **Run time:** nothing. It is the hot path from §4.2, and the boot cost is
   already paid.
 
-Nebula records whether a module was wizened and exposes it in telemetry so the
-benchmark can compare wizened against raw. The runtime code path is identical.
+**The runtime needs no flag for this, and does not have one.** Wizer drops the
+init export after consuming it, so the runtime rule is simply the WASI reactor
+convention: *call `_initialize` if the module exports it, then call the
+handler*. A raw module still exports it and pays the boot on every request; a
+wizened module does not export it and there is nothing to call. One code path,
+and the export's absence is the entire signal.
+
+**Measured** (`crates/nebula-runtime/tests/wizer_bench.rs`, `heavy_init` guest —
+a 200k sieve kept on the heap plus a hash chain, ~22 ms of boot):
+
+| | Median execution | Share of the 50 ms deadline |
+|---|---|---|
+| Raw | 20.5 ms | 41% |
+| Wizened | 0.25 ms | 0.5% |
+| | **~80× faster** | |
+
+Both emit an identical result, which the test asserts — a module that skipped
+the work would otherwise look like a win. The share-of-budget column is the
+operationally interesting half: the raw guest burns two fifths of its request
+budget before the handler starts, and roughly 2.4× this boot cost would exceed
+the deadline outright and fail the request.
 
 > **Superseded:** the original spec proposed freezing and `mmap`-ing linear
 > memory snapshots inside the worker. That is a reimplementation of
@@ -409,6 +428,8 @@ limiter is ever removed.
 | Module artifact size | registry validation at deploy | 32 MiB |
 | Total request incl. host I/O | tokio `timeout` at gateway | 100 ms |
 | KV entries / bytes per node | host shim caps | 10 000 / 16 MiB |
+| KV key / value size | host shim caps | 1 KiB / 64 KiB |
+| Captured stdout+stderr per request | `MemoryOutputPipe` capacity | 64 KiB each |
 
 Every default is a named constant in one config module, overridable per
 function through registry metadata. No magic numbers at call sites.
@@ -451,10 +472,22 @@ Registered on the `Linker` under the `nebula` module namespace:
 | `nebula.kv_set` | `(kptr, klen, vptr, vlen) -> i32` | Write to the node-local KV shim |
 | `nebula.log` | `(level: i32, ptr, len)` | Emit a structured log line |
 
-The KV shim is **node-local and non-durable** — a concurrent map behind a
-per-tenant key prefix, bounded per §6.4. It exists to exercise host-call
-plumbing and memory translation, not to be a database. Guests must not assume a
-value written on one request is visible on the next.
+The KV shim is **node-local and non-durable** — a `DashMap` keyed by
+`(tenant, key)` *tuples*, not by a concatenated prefix, and bounded per §6.4.
+The tuple matters: a delimiter scheme needs an argument about escaping before
+you can believe one tenant cannot spell its way into another's namespace, and a
+tuple needs none. It exists to exercise host-call plumbing and memory
+translation, not to be a database. Guests must not assume a value written on one
+request is visible on the next.
+
+Integer returns across the `nebula` namespace follow one convention: a
+non-negative count on success, `-1` on refusal. A refusal (store full, item
+oversized) is a recoverable condition the guest can handle — the precedent is
+WebAssembly's own `memory.grow` returning `-1`. Traps are reserved for a guest
+that hands the host an invalid pointer, which is not recoverable. Silent
+truncation is used only where the guest can detect it: `kv_get` returns the
+value's full length even when it wrote fewer bytes, and `response_write` returns
+the count it accepted.
 
 ### 7.3 Memory translation
 
@@ -769,7 +802,7 @@ another tenant's data, or escape to the host.
 | Network access | No socket imports exist |
 | Reading host environment | `WasiCtx` env is explicitly constructed, never inherited |
 | Cross-request state leakage | Fresh `Store` and fresh CoW memory per request; instances never reused |
-| Cross-tenant KV access | Keys namespaced by tenant, enforced host-side; the guest cannot spell another prefix |
+| Cross-tenant KV access | Keys are `(tenant, key)` tuples supplied host-side; no choice of key bytes reaches another tenant |
 | Poisoned AOT cache | L2 keyed by artifact hash + engine config + wasmtime version; worker-writable only |
 | Compile bombs | Size cap and compile timeout at deploy time, not request time |
 
@@ -986,6 +1019,9 @@ Phase boundaries are commit points.
 - L2 on-disk AOT cache with the composite key of §8.2.
 - Content-hash addressing; `PUT /functions/{id}` deploy path with validation.
 - **Pick and wizen the heavy example guest now, not in Phase 4** (risk R2).
+  Done: `guests/examples/heavy_init` plus `guests/build.sh`. Wizer integration
+  in the *deploy* path stays in Phase 4; this is the build-time proof that the
+  §4.3 mechanism works and is worth wiring up.
 
 **Exit criteria**
 
@@ -1092,7 +1128,7 @@ numbers clearing the bar is marketing.
 | # | Risk | Impact | Mitigation |
 |---|---|---|---|
 | R1 | Pooling allocator address-space reservation is large (slots × max memory) | Startup failure or reduced density | 64 slots × 128 MiB = 8 GiB of *virtual* reservation, fine on 64-bit. Validate on the target box in week 1. |
-| R2 | Wizer does not work on the chosen heavy guest | Phase 4's headline demo weakens | Pick and wizen the heavy guest in **Phase 2**. Wizer needs a WASI-p1 guest with no non-determinism during init. |
+| ~~R2~~ | ~~Wizer does not work on the chosen heavy guest~~ | — | **Closed in Phase 2.** `guests/examples/heavy_init` wizens cleanly and is measured at ~80×. Two constraints found in the doing: Wizer must instantiate the module to run the initializer, so *every* import has to be satisfiable at build time — the guest therefore imports only WASI and reports through stdout rather than through `nebula` host functions. And Wizer's default init export is `wizer.initialize`, so the build passes `--init-func _initialize`. |
 | R3 | Wasmtime API drift mid-project | Rework | Pin an exact version; no upgrades inside a phase. |
 | R4 | Guest toolchain friction (Rust → `wasm32-wasip1`, TinyGo) | Time sink | The corpus is hand-written `.wat` — no toolchain in the critical path for G3/G4. |
 | R5 | Loopback benchmarking hides real network effects | Optimistic M2/M3 | State it. Add a two-machine run in Phase 4 if time allows. |

@@ -1,1 +1,2 @@
-/target
+# Unanchored, so it also catches guests/examples/*/target from the wasm builds.
+target/

@@ -1,0 +1,14 @@
+[package]
+name = "heavy_init"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace on purpose: this crate builds for wasm32-wasip1, not the
+# host, so it must not be a member of the nebula workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3

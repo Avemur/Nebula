@@ -1,33 +1,20 @@
-//! Sandbox tests for `nebula-runtime`.
+//! Sandbox tests: memory safety and resource ceilings.
 //!
-//! Covers all three source files: `engine.rs` (epoch deadline, memory ceiling),
-//! `host.rs` (`checked_range`, `guest_slice`, `nebula.log`), and `lib.rs`
-//! (`run`, store freshness).
+//! Covers `engine.rs` (epoch deadline, memory ceiling), `host.rs`
+//! (`checked_range`, `guest_slice`, `nebula.log`), and `lib.rs` (store
+//! freshness).
 //!
 //! The guest-facing tests assert a *specific* outcome, not merely "did not
 //! crash" — DESIGN.md §15.
 
-use std::sync::OnceLock;
+mod common;
 
 use nebula_runtime::host::{checked_range, MAX_LOG_BYTES};
-use wasmtime::{Engine, Error, Result, Trap};
+use nebula_runtime::HostCtx;
+use wasmtime::{Error, Result, Trap};
 
-/// One engine for the whole test binary.
-///
-/// The pooling allocator reserves address space per engine, so building one per
-/// test multiplies that reservation by the number of tests (risk R1). One
-/// engine, one ticker.
-fn engine() -> &'static Engine {
-    static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| {
-        let engine = nebula_runtime::engine::engine().expect("engine construction");
-        nebula_runtime::engine::spawn_epoch_ticker(&engine);
-        engine
-    })
-}
-
-fn run(wat: &str) -> Result<nebula_runtime::HostCtx> {
-    nebula_runtime::run(engine(), wat.as_bytes(), "run")
+fn run(wat: &str) -> Result<HostCtx> {
+    common::runtime().execute(wat.as_bytes(), "run", "sandbox", Vec::new())
 }
 
 #[track_caller]
@@ -87,7 +74,7 @@ fn checked_range_rejects_everything_against_empty_memory() {
 }
 
 // ---------------------------------------------------------------------------
-// host.rs — nebula.log, happy path
+// host.rs — nebula.log
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -134,10 +121,10 @@ fn log_payload_is_truncated_not_trapped() {
         "#)
     .expect("in-bounds oversized log should truncate");
 
-    let (level, msg) = &ctx.logs[0];
+    let (level, message) = &ctx.logs[0];
     assert_eq!(*level, 1);
-    assert_eq!(msg.len(), MAX_LOG_BYTES as usize);
-    assert!(msg.bytes().all(|b| b == b'A'));
+    assert_eq!(message.len(), MAX_LOG_BYTES as usize);
+    assert!(message.bytes().all(|byte| byte == b'A'));
 }
 
 // ---------------------------------------------------------------------------
@@ -290,8 +277,32 @@ fn each_run_gets_a_fresh_host_context() {
 }
 
 #[test]
+fn guest_memory_does_not_carry_over_between_runs() {
+    // The CoW mapping is discarded on teardown, so a second instance must see
+    // zeroed memory rather than whatever the first one wrote (§4.2).
+    let guest = r#"
+        (module
+          (import "nebula" "log" (func $log (param i32 i32 i32)))
+          (memory (export "memory") 1)
+          (func (export "run")
+            (if (i32.ne (i32.load (i32.const 2048)) (i32.const 0))
+              (then (unreachable)))
+            (i32.store (i32.const 2048) (i32.const 12345))))
+        "#;
+
+    run(guest).expect("first run sees zeroed memory");
+    run(guest).expect("second run must also see zeroed memory");
+}
+
+#[test]
 fn missing_entry_point_is_an_error_not_a_panic() {
-    let err = nebula_runtime::run(engine(), br#"(module (func (export "other")))"#, "run")
+    let err = common::runtime()
+        .execute(
+            br#"(module (func (export "other")))"#,
+            "run",
+            "sandbox",
+            Vec::new(),
+        )
         .expect_err("a missing export must surface as an error");
 
     assert!(err.downcast_ref::<Trap>().is_none(), "not a guest trap");

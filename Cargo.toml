@@ -6,6 +6,16 @@ members = ["crates/nebula-runtime"]
 version = "0.1.0"
 edition = "2021"
 
+# Optimize dependencies even in dev builds. wasmtime does the store creation,
+# instantiation, and WASI context setup on every execution; unoptimized that
+# costs milliseconds and swamps any latency measurement. Our own crates stay at
+# opt-level 0 so they remain quick to compile and debuggable.
+[profile.dev.package."*"]
+opt-level = 3
+
 [workspace.dependencies]
 # DESIGN.md R3: pin one exact version, do not upgrade mid-phase.
 wasmtime = "48"
+wasmtime-wasi = "48"
+dashmap = "6"
+sha2 = "0.11"
