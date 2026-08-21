@@ -1,25 +1,34 @@
 //! Control plane binary (§3.1).
 //!
-//! Placeholder. The axum gateway, the tonic server, and the membership
-//! reconciler replace this body entirely; it exists so the crate has a binary
-//! target and so the ring can be exercised by hand.
-//!
-//! `nebula-control worker-a worker-b worker-c`
+//! Serves the `NebulaControl` gRPC surface and runs the membership reconciler.
+//! The axum API gateway of §11.1 is not wired yet.
 
-use nebula_control::ring::Ring;
+use std::sync::Arc;
 
-fn main() {
-    let mut ring = Ring::new();
-    for node in std::env::args().skip(1) {
-        ring.insert(&node);
-    }
+use nebula_control::membership::{self, Membership, RECONCILE_INTERVAL};
+use nebula_control::registry::Registry;
+use nebula_control::server::ControlService;
+use nebula_proto::nebula_control_server::NebulaControlServer;
+use tonic::transport::Server;
 
-    println!(
-        "nebula-control: {} worker(s), {} ring points. gRPC and HTTP not wired yet.",
-        ring.len(),
-        ring.virtual_nodes()
-    );
-    for node in ring.members() {
-        println!("  {node}");
-    }
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr =
+        std::env::var("NEBULA_CONTROL_ADDR").unwrap_or_else(|_| "127.0.0.1:7000".to_string());
+    let registry_dir =
+        std::env::var("NEBULA_REGISTRY_DIR").unwrap_or_else(|_| "/tmp/nebula-registry".to_string());
+
+    let membership = Arc::new(Membership::with_defaults());
+    let registry = Arc::new(Registry::new(&registry_dir)?);
+
+    membership::spawn_reconciler(membership.clone(), RECONCILE_INTERVAL);
+
+    println!("nebula-control: listening on {addr}, registry at {registry_dir}");
+    Server::builder()
+        .add_service(NebulaControlServer::new(ControlService::new(
+            membership, registry,
+        )))
+        .serve(addr.parse()?)
+        .await?;
+    Ok(())
 }

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-# `nebula-proto` and `tonic` arrive with the server itself. Today this binary
-# only starts the execution core.
+nebula-proto.workspace = true
 nebula-runtime.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# The mesh test drives a real control plane, not a mock of one.
+nebula-control.workspace = true

@@ -27,6 +27,11 @@ pub fn content_hash(wasm: &[u8]) -> Hash {
     Sha256::digest(wasm).into()
 }
 
+/// The same hash as hex — the form that travels on the wire and names files.
+pub fn content_hash_hex(wasm: &[u8]) -> String {
+    hex(&content_hash(wasm))
+}
+
 /// What produced a `Module`.
 ///
 /// The distinction is a Phase 2 exit criterion: a worker restart must replay

@@ -1,10 +1,13 @@
-//! Control plane: API gateway, scheduler, module registry, membership (§3.1).
+//! Control plane: scheduler, module registry, membership (§3.1).
 //!
-//! Library plus binary rather than a bare binary so the scheduler is testable on
-//! its own — and so `pub` means something, instead of every ring method
-//! tripping `dead_code` until `main` happens to call it.
+//! Library plus binary rather than a bare binary so the scheduler and the
+//! membership tracker are testable on their own — and so `pub` means something
+//! instead of every method tripping `dead_code` until `main` happens to call it.
 //!
-//! Today this is the ring alone. The gateway, registry, and membership tracker
-//! land with the gRPC mesh.
+//! The axum API gateway of §11.1 is still outstanding; today this serves the
+//! `NebulaControl` gRPC surface only.
 
+pub mod membership;
+pub mod registry;
 pub mod ring;
+pub mod server;

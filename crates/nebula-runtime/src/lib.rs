@@ -9,6 +9,11 @@ pub mod engine;
 pub mod host;
 pub mod kv;
 
+/// Re-exported so dependents can name `Trap`, `Error`, and `Result` without
+/// declaring their own `wasmtime` dependency and risking a version skew against
+/// the one the engine was built with.
+pub use wasmtime;
+
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
