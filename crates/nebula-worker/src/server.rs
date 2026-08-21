@@ -22,6 +22,12 @@ use crate::exec_pool::{ExecPool, PoolError};
 /// or hostile control plane cannot stream the worker to death.
 pub const MAX_ARTIFACT_BYTES: usize = 32 << 20;
 
+/// Ceiling on a caller-supplied `deadline_ms`. The field is a request, not an
+/// instruction: without a cap a client could pin an execution thread for as
+/// long as it liked, which is the resource exhaustion admission control exists
+/// to prevent.
+pub const MAX_DEADLINE_MS: u32 = 5_000;
+
 #[derive(Debug, Clone, Copy)]
 enum FetchError {
     NotFound,
@@ -226,7 +232,18 @@ impl NebulaWorker for WorkerService {
         // to one tenant share a store and two tenants never can.
         let tenant = request.tenant.clone();
 
-        let result = match self.pool.run(admitted, wasm, tenant, request.body).await {
+        // §6.4's default when the caller says nothing, and capped so a client
+        // cannot ask a worker to hold a thread indefinitely.
+        let deadline_ticks = match request.deadline_ms {
+            0 => nebula_runtime::engine::DEFAULT_DEADLINE_TICKS,
+            requested => requested.min(MAX_DEADLINE_MS) as u64,
+        };
+
+        let result = match self
+            .pool
+            .run(admitted, wasm, tenant, request.body, deadline_ticks)
+            .await
+        {
             Ok(result) => result,
             Err(PoolError::Full) => {
                 return Err(Status::resource_exhausted("execution queue full"));

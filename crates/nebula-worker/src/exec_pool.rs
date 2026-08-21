@@ -41,6 +41,7 @@ struct Job {
     wasm: Arc<Vec<u8>>,
     tenant: String,
     body: Vec<u8>,
+    deadline_ticks: u64,
     reply: oneshot::Sender<wasmtime::Result<HostCtx>>,
     permit: OwnedSemaphorePermit,
 }
@@ -110,13 +111,20 @@ impl ExecPool {
                         wasm,
                         tenant,
                         body,
+                        deadline_ticks,
                         reply,
                         permit,
                     } = job;
 
                     queued.fetch_sub(1, Ordering::Relaxed);
                     in_flight.fetch_add(1, Ordering::Relaxed);
-                    let result = runtime.execute(&wasm, HANDLER_EXPORT, &tenant, body);
+                    let result = runtime.execute_with_deadline(
+                        &wasm,
+                        HANDLER_EXPORT,
+                        &tenant,
+                        body,
+                        deadline_ticks,
+                    );
                     in_flight.fetch_sub(1, Ordering::Relaxed);
 
                     // Send first, then release the slot: a caller that sees its
@@ -161,12 +169,14 @@ impl ExecPool {
         wasm: Arc<Vec<u8>>,
         tenant: String,
         body: Vec<u8>,
+        deadline_ticks: u64,
     ) -> Result<wasmtime::Result<HostCtx>, PoolError> {
         let (reply, wait) = oneshot::channel();
         let job = Job {
             wasm,
             tenant,
             body,
+            deadline_ticks,
             reply,
             permit: admitted.0,
         };
@@ -240,6 +250,7 @@ mod tests {
                 Arc::new(ECHO.as_bytes().to_vec()),
                 "tenant".to_string(),
                 b"round trip".to_vec(),
+                50,
             )
             .await
             .expect("pool accepted the job");
@@ -277,6 +288,7 @@ mod tests {
                 Arc::new(SPIN.as_bytes().to_vec()),
                 "tenant".to_string(),
                 Vec::new(),
+                50,
             )
             .await
             .expect("pool accepted the job");

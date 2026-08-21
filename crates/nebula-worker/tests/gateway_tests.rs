@@ -190,7 +190,8 @@ impl Cluster {
                 .await;
         });
 
-        let gateway = Arc::new(Gateway::new(membership.clone(), registry.clone()));
+        let gateway =
+            Arc::new(Gateway::open(membership.clone(), registry.clone()).expect("gateway"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = listener.local_addr().unwrap().to_string();
         let state = gateway.clone();

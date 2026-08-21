@@ -19,10 +19,14 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::Code;
 
 use crate::membership::Membership;
-use crate::registry::{Registry, MAX_ARTIFACT_BYTES};
+use crate::registry::{Deployments, Registry, MAX_ARTIFACT_BYTES};
 
 /// §6.4 caps a request body at 1 MiB.
 pub const MAX_REQUEST_BYTES: usize = 1 << 20;
+
+/// Bound on a caller-supplied function id. It is a map key and a ring key, not
+/// a path, but an unbounded one is still a free allocation for anyone asking.
+pub const MAX_FUNCTION_ID_BYTES: usize = 128;
 
 /// The worker's per-request budget, sent so the worker can size its own
 /// deadline. §6.4's default.
@@ -31,14 +35,12 @@ const DEADLINE_MS: u32 = 50;
 pub struct Gateway {
     membership: Arc<Membership>,
     registry: Arc<Registry>,
-    /// `function_id` to content hash.
+    /// `function_id` to content hash, mirrored to `deployments.json`.
     ///
-    /// In memory, so a control-plane restart forgets deployments even though
-    /// their artifacts survive on disk. Acceptable while the control plane is a
-    /// single process (§2); persisting it means naming files after a
-    /// caller-supplied id, which is a second path-traversal surface to get
-    /// right, and not one this run needs.
-    functions: Mutex<HashMap<String, String>>,
+    /// One file for the whole table rather than a file per function: a
+    /// `function_id` comes from a URL, and the surest way not to have to defend
+    /// it against path traversal is never to put it in a path.
+    functions: Mutex<Deployments>,
     /// Connected channels by worker address.
     ///
     /// Connections are established eagerly and cached. That is what makes §10.2
@@ -59,25 +61,52 @@ enum Attempt {
 }
 
 impl Gateway {
-    pub fn new(membership: Arc<Membership>, registry: Arc<Registry>) -> Self {
-        Self {
+    /// Opens the gateway, restoring the deployment table from disk.
+    ///
+    /// Fallible on purpose: a control plane that cannot read its own deployments
+    /// should refuse to start rather than come up serving 404 for every function
+    /// that was working a minute ago.
+    pub fn open(membership: Arc<Membership>, registry: Arc<Registry>) -> std::io::Result<Self> {
+        let functions = registry.load_deployments()?;
+        Ok(Self {
             membership,
             registry,
-            functions: Mutex::new(HashMap::new()),
+            functions: Mutex::new(functions),
             workers: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     pub fn content_hash_of(&self, function_id: &str) -> Option<String> {
-        self.functions.lock().unwrap().get(function_id).cloned()
-    }
-
-    pub fn publish(&self, function_id: &str, wasm: &[u8]) -> std::io::Result<String> {
-        let hash = self.registry.put(wasm)?;
         self.functions
             .lock()
             .unwrap()
+            .functions
+            .get(function_id)
+            .cloned()
+    }
+
+    pub fn deployed(&self) -> usize {
+        self.functions.lock().unwrap().functions.len()
+    }
+
+    pub fn publish(&self, function_id: &str, wasm: &[u8]) -> std::io::Result<String> {
+        if function_id.is_empty() || function_id.len() > MAX_FUNCTION_ID_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "function id must be 1..=128 bytes",
+            ));
+        }
+
+        let hash = self.registry.put(wasm)?;
+        let mut functions = self.functions.lock().unwrap();
+        functions
+            .functions
             .insert(function_id.to_string(), hash.clone());
+
+        // Persisted before the caller is told the deployment succeeded. The lock
+        // is held across the write so the file can never disagree with the map;
+        // deploys are rare, so serialising them costs nothing that matters.
+        self.registry.save_deployments(&functions)?;
         Ok(hash)
     }
 

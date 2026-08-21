@@ -1,0 +1,432 @@
+//! The Phase 3 scale exit criteria (README.md §5.2, §9.1, §10.1, §10.3, §18).
+//!
+//! Two proofs the mesh tests could not give:
+//!
+//! * a worker held at five times its capacity still heartbeats, because guest
+//!   execution never touches the async reactor;
+//! * fifty functions across three workers each land on exactly one worker and
+//!   stay there.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use nebula_control::gateway::{self, Gateway};
+use nebula_control::membership::{self, Membership};
+use nebula_control::registry::Registry;
+use nebula_control::server::ControlService;
+use nebula_proto::nebula_control_client::NebulaControlClient;
+use nebula_proto::nebula_control_server::NebulaControlServer;
+use nebula_proto::nebula_worker_client::NebulaWorkerClient;
+use nebula_proto::nebula_worker_server::NebulaWorkerServer;
+use nebula_proto::ExecuteRequest;
+use nebula_runtime::Runtime;
+use nebula_worker::exec_pool::ExecPool;
+use nebula_worker::heartbeat::{self, Identity};
+use nebula_worker::server::WorkerService;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Channel, Endpoint, Server};
+use tonic::Code;
+
+const ECHO: &str = r#"
+    (module
+      (import "nebula" "request_len" (func $len (result i32)))
+      (import "nebula" "request_read" (func $read (param i32 i32) (result i32)))
+      (import "nebula" "response_write" (func $write (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "run")
+        (local $n i32)
+        (local.set $n (call $len))
+        (drop (call $read (i32.const 0) (local.get $n)))
+        (drop (call $write (i32.const 0) (local.get $n)))))
+    "#;
+
+/// Burns roughly 100 ms of CPU.
+///
+/// Stores to memory on every iteration so Cranelift cannot decide the loop is
+/// unobservable and delete it. A load-test guest that optimises away to nothing
+/// is the classic way to "prove" a thread pool is fast.
+const SLOW: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (func (export "run")
+        (local $i i64)
+        (local.set $i (i64.const 250000000))
+        (loop $l
+          (i32.store (i32.const 0) (i32.wrap_i64 (local.get $i)))
+          (local.set $i (i64.sub (local.get $i) (i64.const 1)))
+          (br_if $l (i64.ne (local.get $i) (i64.const 0))))))
+    "#;
+
+// ---------------------------------------------------------------------------
+// Fixture
+// ---------------------------------------------------------------------------
+
+fn temp_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "nebula-scale-{tag}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}
+
+struct Worker {
+    node_id: String,
+    address: String,
+    runtime: Arc<Runtime>,
+    pool: Arc<ExecPool>,
+}
+
+struct Cluster {
+    http_addr: String,
+    control_url: String,
+    membership: Arc<Membership>,
+    gateway: Arc<Gateway>,
+    workers: Vec<Worker>,
+}
+
+impl Cluster {
+    async fn start(liveness: Duration) -> Self {
+        let membership = Arc::new(Membership::new(liveness));
+        let registry = Arc::new(Registry::new(temp_dir("registry")).expect("registry"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_url = format!("http://{}", listener.local_addr().unwrap());
+        let control = ControlService::new(membership.clone(), registry.clone());
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(NebulaControlServer::new(control))
+                .serve_with_incoming(TcpIncoming::from(listener))
+                .await;
+        });
+
+        let gateway =
+            Arc::new(Gateway::open(membership.clone(), registry.clone()).expect("gateway"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = listener.local_addr().unwrap().to_string();
+        let state = gateway.clone();
+        tokio::spawn(async move {
+            let _ = gateway::serve(listener, state).await;
+        });
+
+        Self {
+            http_addr,
+            control_url,
+            membership,
+            gateway,
+            workers: Vec::new(),
+        }
+    }
+
+    async fn add_worker(&mut self, threads: usize, max_concurrent: usize) -> String {
+        let runtime = Arc::new(Runtime::new(temp_dir("l2")).expect("runtime"));
+        let pool = Arc::new(ExecPool::new(runtime.clone(), threads, max_concurrent));
+        let service = WorkerService::new(runtime.clone(), pool.clone(), &self.control_url)
+            .expect("worker service");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(NebulaWorkerServer::new(service))
+                .serve_with_incoming(TcpIncoming::from(listener))
+                .await;
+        });
+
+        let node_id = format!("worker-{address}");
+        self.membership.register(&node_id, &address, 1);
+        self.workers.push(Worker {
+            node_id: node_id.clone(),
+            address,
+            runtime,
+            pool,
+        });
+        node_id
+    }
+
+    fn worker(&self, node_id: &str) -> &Worker {
+        self.workers
+            .iter()
+            .find(|worker| worker.node_id == node_id)
+            .expect("known worker")
+    }
+
+    async fn post(&self, function_id: &str, token: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let mut stream = TcpStream::connect(&self.http_addr)
+            .await
+            .expect("connect gateway");
+        let head = format!(
+            "POST /execute/{function_id} HTTP/1.1\r\nHost: nebula\r\nConnection: close\r\n\
+             Authorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("head");
+        let status = String::from_utf8_lossy(&raw[..split])
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .expect("status");
+        (status, raw[split + 4..].to_vec())
+    }
+}
+
+/// Fires `count` requests at once over one multiplexed HTTP/2 connection.
+///
+/// One connection, cloned: dialling per request would stagger arrivals by more
+/// than the guest runs for, and the test would be measuring the dialling rather
+/// than the admission control.
+async fn wave(
+    client: &NebulaWorkerClient<Channel>,
+    template: &ExecuteRequest,
+    count: usize,
+) -> (usize, usize) {
+    let mut tasks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut client = client.clone();
+        let request = template.clone();
+        tasks.push(tokio::spawn(async move { client.execute(request).await }));
+    }
+
+    let (mut admitted, mut shed) = (0, 0);
+    for task in tasks {
+        match task.await.expect("task") {
+            Ok(_) => admitted += 1,
+            Err(status) if status.code() == Code::ResourceExhausted => shed += 1,
+            Err(other) => panic!("unexpected dispatch failure: {other}"),
+        }
+    }
+    (admitted, shed)
+}
+
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deployments_survive_a_control_plane_restart() {
+    // Artifacts were always on disk; the *names* pointing at them were not, so a
+    // restart used to answer 404 for every function that had been working.
+    let dir = temp_dir("persist");
+    let membership = Arc::new(Membership::new(Duration::from_secs(60)));
+    let registry = Arc::new(Registry::new(&dir).expect("registry"));
+
+    let before = Gateway::open(membership.clone(), registry.clone()).expect("gateway");
+    let hash = before.publish("echo", ECHO.as_bytes()).expect("publish");
+    assert_eq!(before.deployed(), 1);
+    drop(before);
+
+    // A second gateway over the same directory is what a restart looks like.
+    let registry = Arc::new(Registry::new(&dir).expect("registry"));
+    let after = Gateway::open(membership, registry).expect("gateway reopens");
+
+    assert_eq!(after.deployed(), 1);
+    assert_eq!(
+        after.content_hash_of("echo").as_deref(),
+        Some(hash.as_str())
+    );
+    assert!(dir.join("deployments.json").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saturated_worker_sheds_and_keeps_its_heartbeat() {
+    // The proof that §5.2 was worth its complexity. Every execution thread is
+    // busy for seconds on end. If guest execution ran on the tokio reactor the
+    // heartbeats would stop, the reconciler would evict a perfectly healthy
+    // worker, and the cluster would shed load off a node that was merely busy —
+    // which looks exactly like a crash from the outside.
+    let mut cluster = Cluster::start(membership::LIVENESS_TIMEOUT).await;
+    let node = cluster.add_worker(2, 2).await;
+    let (address, runtime, pool) = {
+        let worker = cluster.worker(&node);
+        (
+            worker.address.clone(),
+            worker.runtime.clone(),
+            worker.pool.clone(),
+        )
+    };
+
+    let hash = cluster
+        .gateway
+        .publish("slow", SLOW.as_bytes())
+        .expect("publish");
+
+    // Real heartbeats on the async reactor, and the real reconciler.
+    let control = NebulaControlClient::new(
+        Endpoint::from_shared(cluster.control_url.clone())
+            .unwrap()
+            .connect_lazy(),
+    );
+    tokio::spawn(heartbeat::beat_forever(
+        control,
+        Identity {
+            node_id: node.clone(),
+            address: address.clone(),
+            generation: 1,
+        },
+        pool,
+        runtime,
+        Duration::from_millis(200),
+    ));
+    membership::spawn_reconciler(cluster.membership.clone(), Duration::from_millis(100));
+
+    let client = NebulaWorkerClient::connect(format!("http://{address}"))
+        .await
+        .expect("dial worker");
+    let template = ExecuteRequest {
+        function_id: "slow".to_string(),
+        content_hash: hash,
+        body: Vec::new(),
+        request_id: "load".to_string(),
+        // Well above the guest's runtime, and well under MAX_DEADLINE_MS.
+        deadline_ms: 1_000,
+        partition_key: None,
+        tenant: "acme".to_string(),
+    };
+
+    // Warm the module, so the first wave measures admission and not compilation.
+    let warm = Instant::now();
+    let warmed = client
+        .clone()
+        .execute(template.clone())
+        .await
+        .expect("warm-up")
+        .into_inner();
+    eprintln!(
+        "guest ran for {:?} (worker reported {} us)",
+        warm.elapsed(),
+        warmed.exec_micros
+    );
+
+    // Assertion 1: ten at once against a capacity of two.
+    let (admitted, shed) = wave(&client, &template, 10).await;
+    assert_eq!(
+        (admitted, shed),
+        (2, 8),
+        "capacity 2 must admit 2 and shed 8 — queueing them would be the bug"
+    );
+
+    // Assertion 2: stay saturated for longer than the liveness timeout, and
+    // check membership on every wave rather than only at the end, so a
+    // transient eviction cannot heal before anyone looks.
+    let until = Instant::now() + membership::LIVENESS_TIMEOUT + Duration::from_millis(900);
+    let (mut total_admitted, mut total_shed) = (admitted, shed);
+    while Instant::now() < until {
+        let (admitted, shed) = wave(&client, &template, 10).await;
+        total_admitted += admitted;
+        total_shed += shed;
+        assert!(
+            cluster.membership.contains(&node),
+            "the worker left the ring while saturated — heartbeats are not \
+             flowing independently of guest execution"
+        );
+    }
+
+    eprintln!("sustained 5x load: {total_admitted} admitted, {total_shed} shed");
+    assert!(
+        cluster.membership.contains(&node),
+        "a busy worker is not a dead worker"
+    );
+    assert!(
+        total_shed > total_admitted * 3,
+        "offered load was not actually 5x capacity: {total_admitted} admitted \
+         against {total_shed} shed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fifty_functions_spread_across_three_workers_and_stay_put() {
+    const FUNCTIONS: usize = 50;
+    const ROUNDS: usize = 20;
+
+    let mut cluster = Cluster::start(Duration::from_secs(60)).await;
+    let mut nodes = Vec::new();
+    for _ in 0..3 {
+        nodes.push(cluster.add_worker(2, 8).await);
+    }
+    // Each function gets a *distinct* artifact.
+    //
+    // Publishing the same bytes under fifty names would prove nothing about
+    // routing: the module cache is keyed by content hash, so fifty names sharing
+    // one artifact compile once per worker no matter where requests land. That
+    // deduplication is a real and welcome property of content addressing — it is
+    // simply not the property under test here.
+    for n in 0..FUNCTIONS {
+        let distinct = format!("{ECHO}\n(; unique {n} ;)");
+        cluster
+            .gateway
+            .publish(&format!("fn-{n}"), distinct.as_bytes())
+            .expect("publish");
+    }
+
+    for round in 0..ROUNDS {
+        for n in 0..FUNCTIONS {
+            let function = format!("fn-{n}");
+            let (status, body) = cluster.post(&function, "acme", b"x").await;
+            assert_eq!(status, 200, "round {round}, {function}");
+            assert_eq!(body, b"x");
+        }
+    }
+
+    let mut compiles = 0usize;
+    let mut hits = 0usize;
+    let mut per_worker = Vec::new();
+    for node in &nodes {
+        let cache = cluster.worker(node).runtime.cache();
+        compiles += cache.cranelift_compiles();
+        hits += cache.l1_hits();
+        per_worker.push(cache.cranelift_compiles() + cache.l1_hits());
+    }
+
+    let total = FUNCTIONS * ROUNDS;
+    eprintln!(
+        "{total} requests over {FUNCTIONS} functions: {compiles} compiles, \
+         {hits} L1 hits, per-worker {per_worker:?}"
+    );
+
+    // Every function compiled exactly once across the whole cluster. That is a
+    // stronger claim than a hit ratio: it says no function was ever served by
+    // two different workers, which is precisely what ring affinity means. A
+    // ratio alone would still look healthy if a few functions flapped.
+    assert_eq!(
+        compiles, FUNCTIONS,
+        "a function compiled more than once means it moved between workers"
+    );
+    assert_eq!(hits, total - FUNCTIONS);
+
+    let hit_ratio = hits as f64 / total as f64;
+    assert!(
+        hit_ratio >= 0.95,
+        "cache hit ratio {:.1}% is below the 95% §18 asks for",
+        hit_ratio * 100.0
+    );
+
+    // Distribution. Fifty keys is a different regime from the ring test's ten
+    // thousand: sampling noise here is about sqrt(50/3)/(50/3), roughly 24%, so
+    // §9.1's 10% bound does not apply and asserting it would be wrong. What must
+    // hold is that all three workers carry real traffic.
+    assert_eq!(per_worker.iter().sum::<usize>(), total);
+    for (node, served) in nodes.iter().zip(&per_worker) {
+        let share = *served as f64 / total as f64;
+        assert!(
+            share > 0.10,
+            "{node} served only {:.1}% — the ring is not spreading 50 keys",
+            share * 100.0
+        );
+        assert!(
+            share < 0.60,
+            "{node} served {:.1}% — one worker is carrying the cluster",
+            share * 100.0
+        );
+    }
+}

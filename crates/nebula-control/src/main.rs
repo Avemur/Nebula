@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let http_addr =
         std::env::var("NEBULA_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    let gateway = Arc::new(Gateway::new(membership.clone(), registry.clone()));
+    let gateway = Arc::new(Gateway::open(membership.clone(), registry.clone())?);
     let listener = tokio::net::TcpListener::bind(&http_addr).await?;
     tokio::spawn(async move {
         let _ = gateway::serve(listener, gateway).await;

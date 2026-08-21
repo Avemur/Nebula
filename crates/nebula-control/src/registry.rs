@@ -4,11 +4,19 @@
 //! `function_id`, so a new version is a new name and there is no invalidation
 //! protocol.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// The deployment table lives beside the artifacts it names.
+pub const DEPLOYMENTS_FILE: &str = "deployments.json";
+
+/// On-disk format version for [`Deployments`].
+pub const DEPLOYMENTS_VERSION: u32 = 1;
 
 /// §4.1 streams artifacts in 256 KiB chunks.
 pub const CHUNK_BYTES: usize = 256 * 1024;
@@ -68,6 +76,68 @@ impl Registry {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    fn deployments_path(&self) -> PathBuf {
+        self.dir.join(DEPLOYMENTS_FILE)
+    }
+
+    /// Reads the deployment table, or an empty one on a fresh node.
+    ///
+    /// A missing file is normal. A *corrupt* one is not silently discarded —
+    /// that would look like every function vanishing with no explanation — so it
+    /// surfaces as an error the caller has to decide about.
+    pub fn load_deployments(&self) -> io::Result<Deployments> {
+        match fs::read(self.deployments_path()) {
+            Ok(bytes) => {
+                let deployments: Deployments = serde_json::from_slice(&bytes)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                if deployments.version != DEPLOYMENTS_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "deployments.json is version {}, expected {DEPLOYMENTS_VERSION}",
+                            deployments.version
+                        ),
+                    ));
+                }
+                Ok(deployments)
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Deployments::new()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Writes the deployment table via a temporary and a rename, so a crash
+    /// mid-write leaves the previous table intact rather than a half file.
+    pub fn save_deployments(&self, deployments: &Deployments) -> io::Result<()> {
+        let path = self.deployments_path();
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        fs::write(&tmp, serde_json::to_vec_pretty(deployments)?)?;
+        fs::rename(&tmp, &path)
+    }
+}
+
+/// The name-to-artifact table, kept beside the artifacts it points at.
+///
+/// One file rather than a file per function: a `function_id` arrives from a URL,
+/// and the surest way not to have to defend it against path traversal is never
+/// to put it in a path.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Deployments {
+    /// Bumped when the on-disk shape changes. An unrecognised version is
+    /// refused rather than half-read.
+    pub version: u32,
+    /// `function_id` to content hash. Ordered so the file has a stable diff.
+    pub functions: BTreeMap<String, String>,
+}
+
+impl Deployments {
+    pub fn new() -> Self {
+        Self {
+            version: DEPLOYMENTS_VERSION,
+            functions: BTreeMap::new(),
+        }
     }
 }
 
@@ -150,6 +220,45 @@ mod tests {
         let absent = "0".repeat(64);
         assert!(!registry.contains(&absent));
         assert!(registry.read(&absent).is_err());
+    }
+
+    #[test]
+    fn deployments_round_trip_across_a_restart() {
+        let registry = temp_registry();
+        assert!(registry.load_deployments().unwrap().functions.is_empty());
+
+        let mut deployments = Deployments::new();
+        deployments
+            .functions
+            .insert("echo".to_string(), "a".repeat(64));
+        registry.save_deployments(&deployments).unwrap();
+
+        // A second `Registry` over the same directory is what a restart looks
+        // like.
+        let restarted = Registry::new(registry.dir()).unwrap();
+        let loaded = restarted.load_deployments().unwrap();
+        assert_eq!(loaded.version, DEPLOYMENTS_VERSION);
+        assert_eq!(loaded.functions.get("echo"), Some(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn a_corrupt_deployment_table_is_reported_not_ignored() {
+        // Silently starting empty would look like every function vanishing for
+        // no reason.
+        let registry = temp_registry();
+        std::fs::write(registry.dir().join(DEPLOYMENTS_FILE), b"{not json").unwrap();
+        assert!(registry.load_deployments().is_err());
+    }
+
+    #[test]
+    fn an_unknown_deployment_version_is_refused() {
+        let registry = temp_registry();
+        std::fs::write(
+            registry.dir().join(DEPLOYMENTS_FILE),
+            br#"{"version":99,"functions":{}}"#,
+        )
+        .unwrap();
+        assert!(registry.load_deployments().is_err());
     }
 
     #[test]

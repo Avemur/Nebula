@@ -195,10 +195,26 @@ impl Runtime {
         tenant: &str,
         request: Vec<u8>,
     ) -> Result<HostCtx> {
+        self.execute_with_deadline(wasm, entry, tenant, request, engine::DEFAULT_DEADLINE_TICKS)
+    }
+
+    /// As [`Runtime::execute`], with an explicit epoch budget in ticks.
+    ///
+    /// §6.4 says limits are overridable per function; this is the first of them
+    /// to become real, because `ExecuteRequest.deadline_ms` has been on the wire
+    /// since the mesh landed and was being silently ignored.
+    pub fn execute_with_deadline(
+        &self,
+        wasm: &[u8],
+        entry: &str,
+        tenant: &str,
+        request: Vec<u8>,
+        deadline_ticks: u64,
+    ) -> Result<HostCtx> {
         let cached = self
             .cache
             .get_or_compile(&self.engine, &self.linker, wasm)?;
-        let mut store = self.new_store(tenant, request);
+        let mut store = self.new_store(tenant, request, deadline_ticks);
 
         // Run the guest through a closure so the store's borrow ends before the
         // context is taken back. The context has to be readable even on failure:
@@ -234,11 +250,13 @@ impl Runtime {
     ///
     /// Both are set here rather than at the call site so there is no path to a
     /// `Store` that runs guest code without them (§13, invariant 3).
-    fn new_store(&self, tenant: &str, request: Vec<u8>) -> Store<HostCtx> {
+    fn new_store(&self, tenant: &str, request: Vec<u8>, deadline_ticks: u64) -> Store<HostCtx> {
         let ctx = HostCtx::new(tenant.to_string(), request, self.kv.clone());
         let mut store = Store::new(&self.engine, ctx);
         store.limiter(|ctx| &mut ctx.limits);
-        store.set_epoch_deadline(engine::DEFAULT_DEADLINE_TICKS);
+        // A zero deadline would mean "no budget at all", which is never what a
+        // caller means; treat it as the default.
+        store.set_epoch_deadline(deadline_ticks.max(1));
         store
     }
 }

@@ -738,6 +738,16 @@ Deploy-time work happens on `PUT`: size validation, `Module::validate`, an
 optional Wizer pass, hashing, and registry write. **Compilation errors surface
 at deploy, not on a user's first request.**
 
+**Deployment persistence.** The `function_id` → content-hash table lives in
+`deployments.json` in the registry directory, written via a temporary and a
+rename before the `PUT` is acknowledged — a client told its function is
+deployed must not lose it to a restart a moment later. It is one file for the
+whole table rather than a file per function, deliberately: a `function_id`
+arrives from a URL, and the surest way not to have to defend it against path
+traversal is never to put it in a path. A corrupt or unknown-version table is
+an error that stops startup, not something to shrug off into an empty map —
+silently starting empty would look like every function vanishing for no reason.
+
 ### 11.2 gRPC (internal)
 
 ```proto
@@ -1007,7 +1017,7 @@ tested without a cluster.
 Each phase ends with something that runs and a demo you could show someone.
 Phase boundaries are commit points.
 
-### Phase 1 — Single-Node Execution Core (Weeks 1–3)
+### Phase 1 — Single-Node Execution Core
 
 **Goal:** `curl` a WASM function on localhost, with hostile code contained.
 
@@ -1036,7 +1046,7 @@ Phase boundaries are commit points.
 
 ---
 
-### Phase 2 — Host Interface & Module Caching (Weeks 4–5)
+### Phase 2 — Host Interface & Module Caching
 
 **Goal:** guests do useful work; hot starts are measurably fast.
 
@@ -1067,7 +1077,7 @@ Phase boundaries are commit points.
 
 ---
 
-### Phase 3 — The Distributed Mesh (Weeks 6–8)
+### Phase 3 — The Distributed Mesh
 
 **Goal:** a real cluster that survives node loss and overload.
 
@@ -1081,6 +1091,21 @@ Phase boundaries are commit points.
   streaming, HTTP gateway with bounded-load dispatch and the §10.2 retry policy.
 - ✅ Chaos: `kill -9` reported as 502 without retry; a paused worker reconciled
   out of the ring after the real 1.5 s timeout.
+- ✅ Deployment persistence: `deployments.json` beside the artifacts, written
+  before a `PUT` is acknowledged and reloaded on startup.
+- ✅ **Scale criteria, measured.** A worker at capacity 2 offered 10 concurrent
+  100 ms guests admits exactly 2 and sheds 8, and stays in the ring through
+  2.4 s of continuous saturation — the proof that §5.2 was worth its
+  complexity, since heartbeats keep flowing while every execution thread is
+  busy. Fifty distinct functions over three workers across 1 000 requests:
+  **50 compiles, 950 L1 hits (95.0%)**, per-worker split 46 / 22 / 32%.
+
+  The split is wide because fifty keys is a different regime from §9.1's ten
+  thousand: sampling noise is about `sqrt(50/3)/(50/3)` ≈ 24%, so the 10% bound
+  does not apply at this scale and asserting it would be wrong. The stable-
+  routing claim is carried by the compile count instead — 50 compiles for 50
+  functions means no function was ever served by two workers, which a hit ratio
+  alone would not show.
 - `FetchModule` chunked streaming with SHA-256 verification; L3 registry.
 - **Replace `spawn_blocking` with the dedicated bounded execution pool (§5.2).**
 - Admission semaphore, bounded queue, `RESOURCE_EXHAUSTED` → 503 mapping
@@ -1102,7 +1127,7 @@ Phase boundaries are commit points.
 
 ---
 
-### Phase 4 — Pre-initialization, Benchmarking, Optimization (Weeks 9–10)
+### Phase 4 — Pre-initialization, Benchmarking, Optimization
 
 **Goal:** numbers that support the claims in §1.
 
@@ -1161,7 +1186,7 @@ numbers clearing the bar is marketing.
 
 | # | Risk | Impact | Mitigation |
 |---|---|---|---|
-| R1 | Pooling allocator address-space reservation is large (slots × max memory) | Startup failure or reduced density | 64 slots × 128 MiB = 8 GiB of *virtual* reservation, fine on 64-bit. Validate on the target box in week 1. |
+| R1 | Pooling allocator address-space reservation is large (slots × max memory) | Startup failure or reduced density | 64 slots × 128 MiB = 8 GiB of *virtual* reservation, fine on 64-bit. Validate on the target box before anything depends on it. |
 | ~~R2~~ | ~~Wizer does not work on the chosen heavy guest~~ | — | **Closed in Phase 2.** `guests/examples/heavy_init` wizens cleanly and is measured at ~80×. Two constraints found in the doing: Wizer must instantiate the module to run the initializer, so *every* import has to be satisfiable at build time — the guest therefore imports only WASI and reports through stdout rather than through `nebula` host functions. And Wizer's default init export is `wizer.initialize`, so the build passes `--init-func _initialize`. |
 | R3 | Wasmtime API drift mid-project | Rework | Pin an exact version; no upgrades inside a phase. |
 | R4 | Guest toolchain friction (Rust → `wasm32-wasip1`, TinyGo) | Time sink | The corpus is hand-written `.wat` — no toolchain in the critical path for G3/G4. |
@@ -1181,14 +1206,14 @@ numbers clearing the bar is marketing.
 3. **Is loopback-only benchmarking acceptable** for the headline numbers, or is
    a two-machine setup required for M2/M3 to be credible?
 4. **WASI preview 1 vs the component model.** p1 is the pragmatic v1 choice.
-   Committing to p2 would change §7 substantially and is much better decided now
-   than in week 6.
+   Committing to p2 would change §7 substantially and is much better decided
+   before Phase 2 than during Phase 3.
 
 ---
 
 ## 21. Deferred Work
 
-Not cancelled — scoped out of the 10 weeks, with the reasoning recorded so the
+Not cancelled — scoped out of v1, with the reasoning recorded so the
 decision can be revisited rather than re-derived.
 
 ### Stateful Execution Pins (Actor Model)
@@ -1222,8 +1247,8 @@ routing tweak.
 follow-on with proper design. The `partition_key` field is reserved in the proto
 and the HTTP header so adding it later is additive.
 
-That reserved plumbing is the entire concession. If actors are wanted inside the
-10 weeks, they replace Phase 4 — they do not fit alongside it.
+That reserved plumbing is the entire concession. If actors are wanted inside
+v1, they replace Phase 4 — they do not fit alongside it.
 
 ### Other deferrals
 
