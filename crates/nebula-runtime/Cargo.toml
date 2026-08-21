@@ -1,0 +1,9 @@
+[package]
+name = "nebula-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Default features give us cranelift, wat, and the pooling allocator.
+# wasmtime::{Error, Result} cover our error handling, so no anyhow.
+wasmtime.workspace = true

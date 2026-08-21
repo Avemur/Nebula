@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/nebula-runtime"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# DESIGN.md R3: pin one exact version, do not upgrade mid-phase.
+wasmtime = "48"
