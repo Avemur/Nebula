@@ -592,9 +592,40 @@ maintenance, no binary search to write.
 
 **Virtual nodes (V = 160 per physical node) are mandatory, not an
 optimization.** With one point per node, a 4-node cluster produces arc lengths
-that differ by 3–4×, and one worker takes the majority of traffic. At V = 160
-the load spread is within a few percent. The original spec's "hash the
-function_id to a node" is only balanced with virtual nodes present.
+that differ by 3–4×, and one worker takes the majority of traffic. The original
+spec's "hash the `function_id` to a node" is only balanced with virtual nodes
+present.
+
+**What V = 160 actually buys, measured.** Consistent hashing's load imbalance
+falls off as roughly `1/√V`, so V = 160 gives about 8% — not "a few percent",
+as an earlier draft of this document claimed. Over 200 key sets of 10 000 keys
+on a 3-worker ring:
+
+| median | p90 | max | over 10% |
+|---|---|---|---|
+| 8.0% | 9.9% | 11.6% | 17 of 200 |
+
+So a 10% spread is the **typical** case at V = 160, not a guarantee, and a test
+asserting 10% against a single key set is a coin flip that lands right about
+11 times in 12. `crates/nebula-control/src/ring.rs` therefore keeps the
+single-key-set assertion the requirement asks for *and* a sweep that asserts the
+median, so a genuine regression is distinguishable from an unlucky draw.
+
+Raising V is the lever if a hard worst-case bound is ever needed: the error
+shrinks as `1/√V`, so a 10% worst case wants V ≈ 640. That is a deliberate
+trade — 640 points per node makes ring rebuilds and memory four times heavier —
+and §9.2's bounded-load check is the cheaper answer to the same problem, since
+it corrects hotspots at request time rather than trying to eliminate them
+structurally.
+
+**Hashing.** The ring uses stdlib `DefaultHasher`. That is sound only while the
+control plane is a single process (§2): the ring is rebuilt in memory from live
+membership, never persisted and never compared across processes, so the hash
+only has to be stable within one run — and `DefaultHasher` is explicitly not
+stable across Rust releases. Replacing it with a fixed hash (§16 names xxhash)
+is a prerequisite for replicating the control plane, not an optimization;
+without it two instances on different toolchains would disagree about routing
+and silently split the keyspace.
 
 **Failover:** if the owning node is unhealthy, walk the ring to the next
 *distinct* physical node. This is deliberately not replication — the second
@@ -1042,11 +1073,12 @@ Phase boundaries are commit points.
 
 **Goal:** a real cluster that survives node loss and overload.
 
-- `nebula.proto`; `tonic` client and server; split `nebula-control` and
-  `nebula-worker` into separate processes.
+- ✅ `nebula.proto` and the `nebula-proto` codegen crate; workspace split into
+  `nebula-control` and `nebula-worker` binaries. Transport not yet wired.
+- ✅ Consistent hash ring with 160 virtual nodes and the failover walk.
+  Bounded-load advance (§9.2) waits on live load, which arrives with heartbeats.
+- `tonic` client and server; the two binaries actually speaking.
 - `Register` + unary `Heartbeat` + reconciliation loop (§10.1), generation IDs.
-- Consistent hash ring with 160 virtual nodes; failover walk; bounded-load
-  advance (§9.2).
 - `FetchModule` chunked streaming with SHA-256 verification; L3 registry.
 - **Replace `spawn_blocking` with the dedicated bounded execution pool (§5.2).**
 - Admission semaphore, bounded queue, `RESOURCE_EXHAUSTED` → 503 mapping

@@ -1,4 +1,4 @@
-//! The "zero-boot-time path" of DESIGN.md §4.3, measured.
+//! The "zero-boot-time path" of README.md §4.3, measured.
 //!
 //! Compares a heavy-boot guest against its Wizer-preinitialized twin. The claim
 //! under test is narrow and specific: the wizened module is faster *because the

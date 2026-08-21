@@ -1,0 +1,15 @@
+[package]
+name = "nebula-proto"
+version.workspace = true
+edition.workspace = true
+
+# Isolated from the service crates on purpose: codegen and protoc run here and
+# nowhere else, so a change to a service does not re-run the build script.
+
+[dependencies]
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true

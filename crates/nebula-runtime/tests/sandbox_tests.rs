@@ -5,7 +5,7 @@
 //! freshness).
 //!
 //! The guest-facing tests assert a *specific* outcome, not merely "did not
-//! crash" — DESIGN.md §15.
+//! crash" — README.md §15.
 
 mod common;
 
@@ -257,7 +257,7 @@ fn memory_growth_within_the_ceiling_succeeds() {
 
 #[test]
 fn each_run_gets_a_fresh_host_context() {
-    // DESIGN.md §13, invariant 2. If state ever leaks between runs, the second
+    // README.md §13, invariant 2. If state ever leaks between runs, the second
     // context sees two entries.
     let guest = r#"
         (module

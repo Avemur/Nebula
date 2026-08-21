@@ -1,6 +1,6 @@
 //! Engine configuration, resource ceilings, and the epoch ticker.
 //!
-//! See DESIGN.md §5.1 (engine config), §6.1 (epochs), §6.3–6.4 (limits).
+//! See README.md §5.1 (engine config), §6.1 (epochs), §6.3–6.4 (limits).
 
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -10,7 +10,7 @@ use wasmtime::{
     StoreLimits, StoreLimitsBuilder,
 };
 
-/// DESIGN.md §6.4. Per-function overrides arrive with the registry in Phase 3;
+/// README.md §6.4. Per-function overrides arrive with the registry in Phase 3;
 /// until then these are the only values in the system.
 ///
 /// Default per-function linear memory ceiling, enforced per store by

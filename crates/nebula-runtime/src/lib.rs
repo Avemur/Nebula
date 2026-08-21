@@ -1,4 +1,4 @@
-//! Nebula's in-process WASM execution core (DESIGN.md §5).
+//! Nebula's in-process WASM execution core (README.md §5).
 //!
 //! Deliberately has no networking dependency: the sandbox tests and, later, the
 //! benchmark harness link this directly, so the security and latency goals can

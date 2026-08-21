@@ -1,0 +1,9 @@
+[package]
+name = "nebula-worker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# `nebula-proto` and `tonic` arrive with the server itself. Today this binary
+# only starts the execution core.
+nebula-runtime.workspace = true

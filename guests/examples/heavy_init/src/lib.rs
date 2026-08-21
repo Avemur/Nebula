@@ -1,4 +1,4 @@
-//! A guest with an expensive boot, used to demonstrate DESIGN.md §4.3.
+//! A guest with an expensive boot, used to demonstrate README.md §4.3.
 //!
 //! This stands in for a framework or language runtime that spends tens of
 //! milliseconds building its heap before it can serve anything. The point is
@@ -29,7 +29,7 @@ const SIEVE_LIMIT: usize = 200_000;
 /// artifact large.
 ///
 /// Tuned to roughly 22 ms of boot — a little under half the 50 ms epoch
-/// deadline (DESIGN.md §6.4). Enough to show that boot eats a serious share of
+/// deadline (README.md §6.4). Enough to show that boot eats a serious share of
 /// the request budget, with enough headroom left that a loaded machine does not
 /// trip the deadline and turn the benchmark into a flaky trap.
 const HASH_ROUNDS: u64 = 15_000_000;

@@ -1,6 +1,6 @@
 //! Host functions and the single guest-memory access path.
 //!
-//! See DESIGN.md §7. The set of imports registered here *is* the security
+//! See README.md §7. The set of imports registered here *is* the security
 //! policy — a guest can reach nothing the linker did not hand it.
 
 use std::ops::Range;

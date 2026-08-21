@@ -1,4 +1,4 @@
-//! Node-local key-value shim (DESIGN.md §7.2).
+//! Node-local key-value shim (README.md §7.2).
 //!
 //! Not a database. It exists to exercise host-call plumbing and memory
 //! translation. Values are per-node, non-durable, and lost on restart — guests

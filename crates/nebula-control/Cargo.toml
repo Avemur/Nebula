@@ -1,0 +1,9 @@
+[package]
+name = "nebula-control"
+version.workspace = true
+edition.workspace = true
+
+# No dependencies yet, deliberately. The ring is stdlib only, and `nebula-proto`
+# arrives when this crate actually speaks gRPC rather than now, on the promise
+# that it will.
+[dependencies]

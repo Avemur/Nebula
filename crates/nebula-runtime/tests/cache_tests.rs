@@ -1,5 +1,5 @@
 //! Module cache tests: L1, L2, single-flight compilation, byte-bounded
-//! eviction. DESIGN.md §8.
+//! eviction. README.md §8.
 //!
 //! These build `Cache` instances directly against the shared runtime's engine
 //! and linker, so each test gets an isolated cache without paying for another
@@ -98,7 +98,7 @@ fn l1_hit_avoids_recompilation() {
 
 #[test]
 fn l2_replays_after_a_restart_without_invoking_cranelift() {
-    // DESIGN.md Phase 2 exit criterion: a worker restart replays from L2.
+    // README.md Phase 2 exit criterion: a worker restart replays from L2.
     let runtime = common::runtime();
     let dir = common::temp_dir("l2-replay");
     let wasm = guest(4).into_bytes();

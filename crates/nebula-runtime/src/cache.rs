@@ -1,4 +1,4 @@
-//! Compiled-module cache: L1 in memory, L2 on disk (DESIGN.md §8).
+//! Compiled-module cache: L1 in memory, L2 on disk (README.md §8).
 //!
 //! Modules are addressed by SHA-256 of the artifact, never by `function_id`
 //! (§8.1). A new version is a new hash and a new entry, so there is no

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/nebula-runtime"]
+members = [
+    "crates/nebula-control",
+    "crates/nebula-proto",
+    "crates/nebula-runtime",
+    "crates/nebula-worker",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,8 +19,18 @@ edition = "2021"
 opt-level = 3
 
 [workspace.dependencies]
-# DESIGN.md R3: pin one exact version, do not upgrade mid-phase.
+# README.md R3: pin one exact version, do not upgrade mid-phase.
 wasmtime = "48"
 wasmtime-wasi = "48"
 dashmap = "6"
 sha2 = "0.11"
+
+# tonic 0.14 split prost codegen out of `tonic-build`; `tonic-prost-build` is
+# the build-time half and `tonic-prost` the runtime half.
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+
+nebula-proto = { path = "crates/nebula-proto" }
+nebula-runtime = { path = "crates/nebula-runtime" }

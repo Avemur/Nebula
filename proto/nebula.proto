@@ -1,0 +1,149 @@
+// Nebula internal gRPC contracts (README.md §11.2).
+//
+// Two services, no worker-to-worker traffic: a worker only ever talks to the
+// control plane, and the control plane only ever talks to workers.
+
+syntax = "proto3";
+
+package nebula.v1;
+
+// Executed on a worker node.
+service NebulaWorker {
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  rpc Drain(DrainRequest) returns (DrainResponse);
+}
+
+// Served by the control plane, called by workers.
+service NebulaControl {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Unary, deliberately, not a bidirectional stream (§10.1). A stale
+  // `last_seen` timestamp catches process death, network partition, and a
+  // wedged process identically, whereas a stream stays open through a
+  // stop-the-world pause and needs a reconnect state machine of its own.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  rpc FetchModule(FetchModuleRequest) returns (stream ModuleChunk);
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------
+
+message ExecuteRequest {
+  string function_id = 1;
+
+  // The worker fetches the artifact if this hash is not already cached.
+  string content_hash = 2;
+
+  bytes body = 3;
+  string request_id = 4;
+  uint32 deadline_ms = 5;
+
+  // Reserved for the stateful actor pins of §21. Present so adding them later
+  // is additive rather than a wire break; nothing reads it yet.
+  optional string partition_key = 6;
+}
+
+message ExecuteResponse {
+  Outcome outcome = 1;
+  bytes body = 2;
+
+  // Trap reason. Empty when `outcome` is OK.
+  string fault_detail = 3;
+
+  uint64 exec_micros = 4;
+  bool cold = 5;
+
+  // Zero when fuel metering is not enabled for this function (§6.2).
+  uint64 fuel_used = 6;
+}
+
+// How a guest execution ended.
+//
+// A guest fault is a value here inside a *successful* RPC, never a gRPC status
+// code (§11.2). A tenant's infinite loop is a normal Tuesday: it must not show
+// up in transport error rates, must not trip retry logic, and must not look
+// like a worker crash on a dashboard.
+//
+// These discriminants are wire values. Renumbering one silently re-labels every
+// response already in flight.
+//
+// Note: proto3 scopes top-level enum value names to the package, so a second
+// enum in `nebula.v1` cannot reuse `OK` or `INTERNAL` and will need prefixed
+// names. Kept unprefixed here to match §11.2 exactly.
+enum Outcome {
+  OK = 0;
+  TRAP = 1;
+  TIMEOUT = 2;
+  FUEL_EXHAUSTED = 3;
+  MEMORY_LIMIT = 4;
+  MODULE_NOT_FOUND = 5;
+  INTERNAL = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+
+message DrainRequest {}
+
+message DrainResponse {
+  // Executions still running when the drain was accepted, so the caller can
+  // log what it is waiting on.
+  uint32 in_flight = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Membership (§10.1)
+// ---------------------------------------------------------------------------
+
+message RegisterRequest {
+  string node_id = 1;
+
+  // host:port the control plane dials for Execute.
+  string address = 2;
+
+  // Random per process start. Lets the control plane spot a worker that died
+  // and restarted between beats, and drop stale routing state rather than
+  // assume continuity.
+  uint64 generation = 3;
+}
+
+message RegisterResponse {
+  uint32 heartbeat_interval_ms = 1;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  uint64 generation = 2;
+
+  // Feeds the bounded-load check in §9.2.
+  uint32 in_flight = 3;
+
+  // Leading indicator of shedding (§10.3).
+  uint32 queue_depth = 4;
+
+  // Module cache occupancy, for the `nebula_module_cache_bytes` gauge (§14).
+  uint64 cache_bytes = 5;
+}
+
+message HeartbeatResponse {
+  // Set when the control plane does not recognise this node or generation —
+  // it restarted, and the worker should register again.
+  bool re_register = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Module distribution (§4.1)
+// ---------------------------------------------------------------------------
+
+message FetchModuleRequest {
+  string content_hash = 1;
+}
+
+message ModuleChunk {
+  bytes data = 1;
+  uint64 offset = 2;
+  bool last = 3;
+}

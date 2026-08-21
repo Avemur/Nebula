@@ -1,6 +1,6 @@
 //! Host interface tests: WASI lockdown, request/response, and the KV shim.
 //!
-//! DESIGN.md §7. Tests share one `Runtime`, so each uses its own tenant name to
+//! README.md §7. Tests share one `Runtime`, so each uses its own tenant name to
 //! stay independent of the others running in parallel.
 
 mod common;

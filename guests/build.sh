@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the heavy_init guest and its Wizer-preinitialized twin (DESIGN.md §4.3).
+# Builds the heavy_init guest and its Wizer-preinitialized twin (README.md §4.3).
 #
 # Requires: rustup target add wasm32-wasip1
 #           cargo install wizer --all-features
