@@ -798,6 +798,7 @@ reserved for things that are genuinely Nebula's fault.
 | Epoch deadline exceeded | `TIMEOUT` | 504 | |
 | Fuel exhausted | `FUEL_EXHAUSTED` | 504 | Only when opted in |
 | Memory ceiling hit | `MEMORY_LIMIT` | 500 + `X-Nebula-Fault: memory_limit` | Guest's own fault; 5xx by convention |
+| — | — | — | *The limiter records its refusal on the store (`engine::Limits`), and a failed execution after one is tagged `MemoryLimitExceeded`. Without that, a guest refused memory and then dereferencing the pointer reports `TRAP` — the symptom, not the cause.* |
 | Unknown `function_id` | `MODULE_NOT_FOUND` | 404 | |
 | Artifact fails validation at deploy | `INVALID_ARGUMENT` | 400 | Deploy path only |
 | Artifact > 32 MiB / body > 1 MiB | — | 413 | Gateway-enforced |
@@ -1077,8 +1078,12 @@ Phase boundaries are commit points.
   `nebula-control` and `nebula-worker` binaries. Transport not yet wired.
 - ✅ Consistent hash ring with 160 virtual nodes and the failover walk.
   Bounded-load advance (§9.2) waits on live load, which arrives with heartbeats.
-- `tonic` client and server; the two binaries actually speaking.
-- `Register` + unary `Heartbeat` + reconciliation loop (§10.1), generation IDs.
+- ✅ `tonic` client and server; the two binaries actually speaking.
+- ✅ `Register` + unary `Heartbeat` + reconciliation loop (§10.1), generation IDs.
+- ✅ Dedicated bounded execution pool, admission semaphore, `FetchModule`
+  streaming, HTTP gateway with bounded-load dispatch and the §10.2 retry policy.
+- ✅ Chaos: `kill -9` reported as 502 without retry; a paused worker reconciled
+  out of the ring after the real 1.5 s timeout.
 - `FetchModule` chunked streaming with SHA-256 verification; L3 registry.
 - **Replace `spawn_blocking` with the dedicated bounded execution pool (§5.2).**
 - Admission semaphore, bounded queue, `RESOURCE_EXHAUSTED` → 503 mapping

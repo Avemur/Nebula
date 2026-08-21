@@ -123,6 +123,7 @@ fn execute(function_id: &str, content_hash: &str, body: &[u8]) -> ExecuteRequest
         body: body.to_vec(),
         request_id: "req".to_string(),
         deadline_ms: 50,
+        tenant: "mesh-tenant".to_string(),
         partition_key: None,
     }
 }

@@ -6,8 +6,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use wasmtime::{
-    Config, Engine, InstanceAllocationStrategy, OptLevel, PoolingAllocationConfig, Result,
-    StoreLimits, StoreLimitsBuilder,
+    Config, Engine, InstanceAllocationStrategy, OptLevel, PoolingAllocationConfig, ResourceLimiter,
+    Result, StoreLimits, StoreLimitsBuilder,
 };
 
 /// README.md §6.4. Per-function overrides arrive with the registry in Phase 3;
@@ -67,14 +67,75 @@ pub fn engine() -> Result<Engine> {
 /// The pooling slot bounds the same numbers from above, but it bounds them at
 /// *instantiation* time. This is what turns a breach into a guest-visible
 /// `memory.grow` → `-1` instead of a failed instantiation.
-pub fn store_limits() -> StoreLimits {
-    StoreLimitsBuilder::new()
+/// `StoreLimits` plus a record of whether it ever refused a growth request.
+///
+/// Wasmtime turns a refusal into `memory.grow` returning `-1`, which a
+/// well-written guest handles — so a refusal on its own is not a failure. But
+/// when execution *does* fail after one, the ceiling is the reason, and §12
+/// wants that reported as `MEMORY_LIMIT` rather than as whatever trap the guest
+/// happened to hit next. Nothing downstream can tell the difference after the
+/// fact, so it has to be recorded here, as it happens.
+#[derive(Debug)]
+pub struct Limits {
+    inner: StoreLimits,
+    refused: bool,
+}
+
+impl Limits {
+    /// Whether the limiter refused a growth request during this execution.
+    pub fn refused(&self) -> bool {
+        self.refused
+    }
+}
+
+impl ResourceLimiter for Limits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool> {
+        let allowed = self.inner.memory_growing(current, desired, maximum)?;
+        self.refused |= !allowed;
+        Ok(allowed)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool> {
+        let allowed = self.inner.table_growing(current, desired, maximum)?;
+        self.refused |= !allowed;
+        Ok(allowed)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
+    }
+}
+
+pub fn store_limits() -> Limits {
+    let inner = StoreLimitsBuilder::new()
         .memory_size(MAX_MEMORY_BYTES)
         .memories(1)
         .instances(1)
         .tables(1)
         .table_elements(MAX_TABLE_ELEMENTS)
-        .build()
+        .build();
+    Limits {
+        inner,
+        refused: false,
+    }
 }
 
 /// Drives `Engine::increment_epoch` so epoch deadlines actually fire.

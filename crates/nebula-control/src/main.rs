@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use nebula_control::gateway::{self, Gateway};
 use nebula_control::membership::{self, Membership, RECONCILE_INTERVAL};
 use nebula_control::registry::Registry;
 use nebula_control::server::ControlService;
@@ -23,7 +24,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     membership::spawn_reconciler(membership.clone(), RECONCILE_INTERVAL);
 
-    println!("nebula-control: listening on {addr}, registry at {registry_dir}");
+    let http_addr =
+        std::env::var("NEBULA_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let gateway = Arc::new(Gateway::new(membership.clone(), registry.clone()));
+    let listener = tokio::net::TcpListener::bind(&http_addr).await?;
+    tokio::spawn(async move {
+        let _ = gateway::serve(listener, gateway).await;
+    });
+
+    println!("nebula-control: gRPC on {addr}, HTTP on {http_addr}, registry at {registry_dir}");
     Server::builder()
         .add_service(NebulaControlServer::new(ControlService::new(
             membership, registry,

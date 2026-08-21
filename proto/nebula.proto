@@ -43,6 +43,15 @@ message ExecuteRequest {
   // Reserved for the stateful actor pins of §21. Present so adding them later
   // is additive rather than a wire break; nothing reads it yet.
   optional string partition_key = 6;
+
+  // Namespace for the KV shim and, later, for quota and audit (§7.2).
+  //
+  // The gateway derives this from the bearer token and the worker trusts it: a
+  // worker has no way to authenticate a caller, so the trust boundary is the
+  // gateway, and the internal mesh is assumed trusted (§13, accepted risks).
+  // Required — an empty tenant is rejected rather than defaulted, because a
+  // default would silently pool every caller into one namespace.
+  string tenant = 7;
 }
 
 message ExecuteResponse {

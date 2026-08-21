@@ -28,6 +28,7 @@ sha2 = "0.11"
 # tonic 0.14 split prost codegen out of `tonic-build`; `tonic-prost-build` is
 # the build-time half and `tonic-prost` the runtime half.
 tonic = "0.14"
+axum = "0.8"
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"
@@ -35,7 +36,7 @@ prost = "0.14"
 # tonic re-exports `tokio_stream` through `tonic::codegen`, so there is no
 # direct dependency on it here — and no chance of a version skew against the
 # one the generated code uses.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 
 nebula-control = { path = "crates/nebula-control" }
 nebula-proto = { path = "crates/nebula-proto" }

@@ -12,7 +12,7 @@ use nebula_proto::{
     DrainRequest, DrainResponse, ExecuteRequest, ExecuteResponse, FetchModuleRequest, Outcome,
 };
 use nebula_runtime::wasmtime::Trap;
-use nebula_runtime::{wasmtime, HostCtx, Runtime};
+use nebula_runtime::{wasmtime, HostCtx, MemoryLimitExceeded, Runtime};
 use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status};
 
@@ -138,12 +138,19 @@ fn classify(result: wasmtime::Result<HostCtx>) -> ExecuteResponse {
             ..Default::default()
         },
         Err(err) => {
-            let outcome = match err.downcast_ref::<Trap>() {
-                Some(Trap::Interrupt) => Outcome::Timeout,
-                Some(Trap::OutOfFuel) => Outcome::FuelExhausted,
-                Some(_) => Outcome::Trap,
-                // No trap means the host failed, not the guest.
-                None => Outcome::Internal,
+            // Checked before the trap: a guest that is refused memory and then
+            // touches the pointer anyway traps with `MemoryOutOfBounds`, and
+            // reporting *that* would name the symptom instead of the cause.
+            let outcome = if err.downcast_ref::<MemoryLimitExceeded>().is_some() {
+                Outcome::MemoryLimit
+            } else {
+                match err.downcast_ref::<Trap>() {
+                    Some(Trap::Interrupt) => Outcome::Timeout,
+                    Some(Trap::OutOfFuel) => Outcome::FuelExhausted,
+                    Some(_) => Outcome::Trap,
+                    // No trap means the host failed, not the guest.
+                    None => Outcome::Internal,
+                }
             };
 
             // §12: guest fault detail goes back to the caller — it is their
@@ -190,6 +197,11 @@ impl NebulaWorker for WorkerService {
         };
 
         let request = request.into_inner();
+        if request.tenant.is_empty() {
+            // Defaulting would pool every caller into one KV namespace, which
+            // is exactly the failure this field exists to prevent.
+            return Err(Status::invalid_argument("tenant is required"));
+        }
         let started = Instant::now();
 
         // The permit is held across the fetch as well as the execution — a cold
@@ -209,10 +221,10 @@ impl NebulaWorker for WorkerService {
             }
         };
 
-        // `function_id` stands in for the tenant until the Execute contract
-        // carries one. This is stricter than §7.2 asks for, not looser: KV
-        // namespaces end up per function rather than per tenant.
-        let tenant = request.function_id.clone();
+        // The gateway derived this from the bearer token; the worker trusts it
+        // (§13). It namespaces the KV shim per §7.2, so two functions belonging
+        // to one tenant share a store and two tenants never can.
+        let tenant = request.tenant.clone();
 
         let result = match self.pool.run(admitted, wasm, tenant, request.body).await {
             Ok(result) => result,

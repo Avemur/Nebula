@@ -20,6 +20,9 @@ pub const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 /// Three missed beats, per §10.1.
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// A node above this multiple of mean cluster load loses the lead (§9.2).
+pub const BOUNDED_LOAD_FACTOR: f64 = 1.25;
+
 #[derive(Debug, Clone)]
 pub struct NodeState {
     pub address: String,
@@ -125,6 +128,50 @@ impl Membership {
             .ring
             .route(key)
             .map(str::to_string)
+    }
+
+    /// Ordered dispatch plan of `(node_id, address)` for `key`.
+    ///
+    /// The ring's owner leads, unless it is carrying more than
+    /// [`BOUNDED_LOAD_FACTOR`] times the mean cluster load — then the walk
+    /// starts at the next node instead (§9.2). Everything after the lead stays
+    /// in ring order, so failover is unaffected by the load check.
+    ///
+    /// Computed under one lock: sampling the ring and the load separately would
+    /// let a rebalance land between them.
+    pub fn route_plan(&self, key: &str) -> Vec<(String, String)> {
+        let inner = self.inner.lock().unwrap();
+        if inner.nodes.is_empty() {
+            return Vec::new();
+        }
+
+        let total: u32 = inner.nodes.values().map(|state| state.in_flight).sum();
+        let limit = BOUNDED_LOAD_FACTOR * (total as f64 / inner.nodes.len() as f64);
+        let load = |node: &str| {
+            inner
+                .nodes
+                .get(node)
+                .map(|state| state.in_flight as f64)
+                .unwrap_or(0.0)
+        };
+
+        let walk: Vec<&str> = inner.ring.candidates(key).collect();
+        // If every node is hot, keep cache affinity rather than thrash: fall
+        // back to the owner and let admission control do the shedding.
+        let lead = walk
+            .iter()
+            .position(|node| load(node) <= limit)
+            .unwrap_or(0);
+
+        (0..walk.len())
+            .filter_map(|offset| {
+                let node = walk[(lead + offset) % walk.len()];
+                inner
+                    .nodes
+                    .get(node)
+                    .map(|state| (node.to_string(), state.address.clone()))
+            })
+            .collect()
     }
 
     /// Owner first, then the failover walk (§9.1).

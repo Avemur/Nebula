@@ -8,5 +8,6 @@ edition.workspace = true
 # depending on the engine to hash a few bytes would be backwards.
 nebula-proto.workspace = true
 tonic.workspace = true
+axum.workspace = true
 tokio.workspace = true
 sha2.workspace = true

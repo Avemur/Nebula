@@ -18,7 +18,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use wasmtime::{Engine, Linker, Result, Store, StoreLimits};
+use wasmtime::{Engine, Linker, Result, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::WasiCtxBuilder;
@@ -33,6 +33,24 @@ use crate::kv::Kv;
 /// of the "zero-boot-time path": one code path, and a wizened module simply has
 /// nothing here to call.
 pub const INIT_EXPORT: &str = "_initialize";
+
+/// Attached to an execution error when the store's limiter refused a growth
+/// request during the call (§6.3).
+///
+/// The trap the guest ultimately hit is usually `MemoryOutOfBounds` — it asked
+/// for memory, was told no, and used the pointer anyway. Reporting that as a
+/// plain trap loses the only fact that matters, which is that *the host* said
+/// no. §12 calls this `MEMORY_LIMIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryLimitExceeded;
+
+impl fmt::Display for MemoryLimitExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("execution exceeded its linear memory ceiling")
+    }
+}
+
+impl std::error::Error for MemoryLimitExceeded {}
 
 /// Per-request host state.
 ///
@@ -53,7 +71,7 @@ pub struct HostCtx {
     stdout_pipe: MemoryOutputPipe,
     stderr_pipe: MemoryOutputPipe,
     wasi: WasiP1Ctx,
-    limits: StoreLimits,
+    limits: engine::Limits,
 }
 
 impl HostCtx {
@@ -97,6 +115,11 @@ impl HostCtx {
 
     pub(crate) fn kv(&self) -> &Kv {
         &self.kv
+    }
+
+    /// Whether the limiter refused a growth request during this execution.
+    pub fn memory_refused(&self) -> bool {
+        self.limits.refused()
     }
 }
 
@@ -176,21 +199,35 @@ impl Runtime {
             .cache
             .get_or_compile(&self.engine, &self.linker, wasm)?;
         let mut store = self.new_store(tenant, request);
-        let instance = cached.pre.instantiate(&mut store)?;
 
-        // Presence is checked with `get_func` rather than by treating a failed
-        // `get_typed_func` as "absent" — that would silently skip an
-        // initializer with an unexpected signature instead of reporting it.
-        if instance.get_func(&mut store, INIT_EXPORT).is_some() {
+        // Run the guest through a closure so the store's borrow ends before the
+        // context is taken back. The context has to be readable even on failure:
+        // it carries whether the limiter refused an allocation, which is the
+        // only way to tell a memory-ceiling breach from an ordinary trap.
+        let outcome = (|store: &mut Store<HostCtx>| -> Result<()> {
+            let instance = cached.pre.instantiate(&mut *store)?;
+
+            // Presence is checked with `get_func` rather than by treating a
+            // failed `get_typed_func` as "absent" — that would silently skip an
+            // initializer with an unexpected signature instead of reporting it.
+            if instance.get_func(&mut *store, INIT_EXPORT).is_some() {
+                instance
+                    .get_typed_func::<(), ()>(&mut *store, INIT_EXPORT)?
+                    .call(&mut *store, ())?;
+            }
+
             instance
-                .get_typed_func::<(), ()>(&mut store, INIT_EXPORT)?
-                .call(&mut store, ())?;
-        }
+                .get_typed_func::<(), ()>(&mut *store, entry)?
+                .call(&mut *store, ())?;
+            Ok(())
+        })(&mut store);
 
-        instance
-            .get_typed_func::<(), ()>(&mut store, entry)?
-            .call(&mut store, ())?;
-        Ok(store.into_data())
+        let ctx = store.into_data();
+        match outcome {
+            Ok(()) => Ok(ctx),
+            Err(err) if ctx.memory_refused() => Err(err.context(MemoryLimitExceeded)),
+            Err(err) => Err(err),
+        }
     }
 
     /// A fresh store with both a limiter and an epoch deadline installed.
