@@ -2,9 +2,6 @@
 
 **Project:** Distributed WebAssembly Serverless Runtime
 **Author:** Anirudh Vemuri
-**Status:** Draft — pre-implementation
-**Date:** 2026-08-21
-**Target:** 10 weeks, 4 phases
 
 ---
 
