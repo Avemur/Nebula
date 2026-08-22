@@ -734,9 +734,56 @@ GET  /cluster                      # node list, ring occupancy, per-node load
 GET  /metrics                      # Prometheus exposition
 ```
 
-Deploy-time work happens on `PUT`: size validation, `Module::validate`, an
-optional Wizer pass, hashing, and registry write. **Compilation errors surface
-at deploy, not on a user's first request.**
+### Where compilation happens, and why not here
+
+**The control plane does not depend on `wasmtime`, and that is a deliberate
+architectural boundary rather than an omission.** An earlier draft of this
+section claimed deploy-time `Module::validate` and that "compilation errors
+surface at deploy, not on a user's first request." That was never implemented
+and is now retracted: it would have required the engine on the control plane,
+which is the one thing this split exists to prevent.
+
+Deploy-time work on `PUT` is therefore everything that does *not* need a
+compiler:
+
+| Stage | Where | What it costs |
+|---|---|---|
+| Size cap (32 MiB) and `function_id` shape | Control plane | A comparison |
+| Export-section parse (`wasmparser`) | Control plane | A linear scan, no codegen |
+| Wizer pass, if the module exports `_initialize` | Control plane, **subprocess** | One guest boot |
+| SHA-256, registry write, `deployments.json` | Control plane | One hash, two writes |
+| **Cranelift compilation** | **Worker, lazily, on first execution** | Cached in L1 and L2 (§8.2) |
+
+Three reasons the compiler stays on the data plane:
+
+1. **Blast radius.** Cranelift compiling a hostile artifact is the largest
+   attack surface in the system. A compiler bug on a worker costs one
+   replaceable node; the same bug on the control plane costs cluster routing,
+   membership, and the registry at once.
+2. **Compilation is CPU-bound work, and §5.2 already solved that** — on the
+   worker, behind a bounded pool and an admission semaphore. Doing it on the
+   control plane would put unbounded CPU work on the reactor that also serves
+   heartbeats, which is the exact failure §5.2 exists to prevent.
+3. **It would be compiled twice anyway.** A worker's L2 cache is keyed by the
+   engine's own compatibility hash (§8.2), so a control-plane artifact is not
+   reusable by a worker with a different wasmtime build or target. Compiling at
+   deploy would be work thrown away.
+
+The cost of this choice is honest and worth stating: **a malformed artifact
+deploys `201` and fails on the first worker that tries it**, surfacing as
+`INTERNAL` (§12) rather than as a `400`. If that trade stops being acceptable,
+the fix is not to move the compiler — it is to have a *worker* validate on
+deploy and report back, keeping the engine on the data plane where it belongs.
+
+**One caveat, because the principle is "no untrusted execution on the control
+plane" and Wizer bends it.** Wizer instantiates the guest and runs its
+`_initialize`, so a tenant's code does execute on the control-plane host. It is
+meaningfully contained — a separate process, `--allow-wasi` with no preopened
+directories, and a crash takes the subprocess rather than the control plane —
+but it is guest execution, not merely inspection. §13 records it as an accepted
+risk. Moving the Wizer pass onto a worker is the clean answer if that stops
+being acceptable, and it costs nothing architecturally: Wizer's output is just
+bytes, and the artifact must be hashed after it either way.
 
 **Deployment persistence.** The `function_id` → content-hash table lives in
 `deployments.json` in the registry directory, written via a temporary and a
@@ -857,6 +904,15 @@ another tenant's data, or escape to the host.
   matters later.
 - **Control-plane DoS.** The gateway is a single instance in v1 with no
   per-tenant rate limiting. Deployment concern.
+- **Wizer runs guest code on the control plane.** Pre-initialization at deploy
+  (§11.1) instantiates the tenant's module and runs its `_initialize`. The
+  compiler and the runtime are kept off the control plane deliberately, and this
+  is the one exception. It is contained by a process boundary and a WASI context
+  with no preopened directories, so a hostile initializer costs a failed deploy
+  rather than the control plane — but it is execution, not inspection, and it is
+  reachable by anyone who can `PUT` a function. Moving the Wizer pass onto a
+  worker removes the exception entirely and is the answer if deploy is ever
+  exposed to callers less trusted than today's.
 - **v1 authentication is a static bearer token per tenant**, compared in
   constant time. Sufficient to prove the authorization *path* exists; not a
   credential system.

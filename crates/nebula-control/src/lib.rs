@@ -43,3 +43,41 @@ pub fn init_tracing_with_default(default: &str) {
         .with_target(false)
         .try_init();
 }
+
+#[cfg(test)]
+mod architecture {
+    /// The control plane must never gain a compiler.
+    ///
+    /// §11.1 makes this an architectural boundary, not a preference: Cranelift
+    /// compiling a hostile artifact is the largest attack surface in the system,
+    /// and it belongs on a replaceable worker rather than on the node that owns
+    /// routing, membership, and the registry. A boundary nobody checks is a
+    /// boundary that erodes on the first convenient afternoon, so this reads the
+    /// manifest and fails if the engine ever appears.
+    #[test]
+    fn the_control_plane_has_no_engine() {
+        let manifest = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .expect("own manifest");
+
+        // Comments are stripped first. The manifest documents *why* the engine
+        // is absent, so a plain substring search finds the explanation and
+        // reports it as the violation.
+        let declarations: String = manifest
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for forbidden in ["wasmtime", "nebula-runtime"] {
+            assert!(
+                !declarations.contains(forbidden),
+                "nebula-control gained a dependency on `{forbidden}`. Compilation \
+                 happens lazily on the worker data plane (README.md §11.1); if \
+                 deploy-time validation is genuinely needed, have a *worker* \
+                 validate and report back."
+            );
+        }
+    }
+}
