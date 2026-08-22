@@ -26,6 +26,9 @@ dashmap = "6"
 sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+wasmparser = "0.257"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # tonic 0.14 split prost codegen out of `tonic-build`; `tonic-prost-build` is
 # the build-time half and `tonic-prost` the runtime half.
@@ -38,7 +41,7 @@ prost = "0.14"
 # tonic re-exports `tokio_stream` through `tonic::codegen`, so there is no
 # direct dependency on it here — and no chance of a version skew against the
 # one the generated code uses.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process", "fs"] }
 
 nebula-control = { path = "crates/nebula-control" }
 nebula-proto = { path = "crates/nebula-proto" }

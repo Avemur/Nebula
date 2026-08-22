@@ -82,6 +82,9 @@ struct Worker {
     address: String,
     runtime: Arc<Runtime>,
     pool: Arc<ExecPool>,
+    /// Closes the server and its established connections. Aborting the accept
+    /// task is not enough — tonic runs each connection in its own task.
+    kill: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 struct Cluster {
@@ -94,6 +97,8 @@ struct Cluster {
 
 impl Cluster {
     async fn start(liveness: Duration) -> Self {
+        // Quiet unless NEBULA_LOG says otherwise; see the span-tree test.
+        nebula_worker::init_tracing_with_default("off");
         let membership = Arc::new(Membership::new(liveness));
         let registry = Arc::new(Registry::new(temp_dir("registry")).expect("registry"));
 
@@ -133,10 +138,13 @@ impl Cluster {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
+        let (kill, killed) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let _ = Server::builder()
                 .add_service(NebulaWorkerServer::new(service))
-                .serve_with_incoming(TcpIncoming::from(listener))
+                .serve_with_incoming_shutdown(TcpIncoming::from(listener), async {
+                    let _ = killed.await;
+                })
                 .await;
         });
 
@@ -147,8 +155,44 @@ impl Cluster {
             address,
             runtime,
             pool,
+            kill: Some(kill),
         });
         node_id
+    }
+
+    fn kill(&mut self, node_id: &str) {
+        if let Some(worker) = self.workers.iter_mut().find(|w| w.node_id == node_id) {
+            if let Some(kill) = worker.kill.take() {
+                let _ = kill.send(());
+            }
+        }
+    }
+
+    /// Beats for every worker except `silent`, so the reconciler evicts exactly
+    /// one node rather than the whole cluster.
+    fn beat_all_except(&self, silent: &str) {
+        for worker in &self.workers {
+            if worker.node_id != silent {
+                self.membership.heartbeat(&worker.node_id, 1, 0, 0, 0);
+            }
+        }
+    }
+
+    fn compiles(&self, nodes: &[String]) -> usize {
+        nodes
+            .iter()
+            .map(|node| self.worker(node).runtime.cache().cranelift_compiles())
+            .sum()
+    }
+
+    fn lookups(&self, nodes: &[String]) -> usize {
+        nodes
+            .iter()
+            .map(|node| {
+                let cache = self.worker(node).runtime.cache();
+                cache.cranelift_compiles() + cache.l1_hits()
+            })
+            .sum()
     }
 
     fn worker(&self, node_id: &str) -> &Worker {
@@ -180,6 +224,17 @@ impl Cluster {
             .and_then(|code| code.parse().ok())
             .expect("status");
         (status, raw[split + 4..].to_vec())
+    }
+}
+
+/// Sends `rounds` passes over `functions` distinct function ids.
+async fn drive(cluster: &Cluster, functions: usize, rounds: usize) {
+    for _ in 0..rounds {
+        for n in 0..functions {
+            let (status, body) = cluster.post(&format!("fn-{n}"), "acme", b"x").await;
+            assert_eq!(status, 200, "fn-{n}");
+            assert_eq!(body, b"x");
+        }
     }
 }
 
@@ -222,7 +277,11 @@ async fn deployments_survive_a_control_plane_restart() {
     let registry = Arc::new(Registry::new(&dir).expect("registry"));
 
     let before = Gateway::open(membership.clone(), registry.clone()).expect("gateway");
-    let hash = before.publish("echo", ECHO.as_bytes()).expect("publish");
+    let hash = before
+        .publish("echo", ECHO.as_bytes())
+        .await
+        .expect("publish")
+        .content_hash;
     assert_eq!(before.deployed(), 1);
     drop(before);
 
@@ -236,6 +295,131 @@ async fn deployments_survive_a_control_plane_restart() {
         Some(hash.as_str())
     );
     assert!(dir.join("deployments.json").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deploying_a_guest_with_an_initializer_pre_initializes_it() {
+    // §4.3 moved into the deploy path: the artifact the cluster stores is
+    // already booted, so no worker ever pays that cost at request time.
+    let raw = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../guests/examples/heavy_init/dist/heavy_init.wasm"),
+    );
+    let Ok(raw) = raw else {
+        eprintln!("SKIPPED: guest artifacts missing; see `bash guests/build.sh`.");
+        return;
+    };
+
+    let dir = temp_dir("wizer-deploy");
+    let membership = Arc::new(Membership::new(Duration::from_secs(60)));
+    let registry = Arc::new(Registry::new(&dir).expect("registry"));
+    let gateway = Gateway::open(membership, registry.clone()).expect("gateway");
+
+    let published = gateway.publish("heavy", &raw).await.expect("deploy");
+    if !published.wizened {
+        eprintln!("SKIPPED: wizer is not on PATH; deploy fell back to the raw artifact.");
+        return;
+    }
+
+    let stored = registry
+        .read(&published.content_hash)
+        .expect("stored artifact");
+    assert!(
+        !nebula_control::wizer::should_wizen(&stored),
+        "the stored artifact must have had its initializer consumed, or every \
+         worker would still boot it on instantiation"
+    );
+    assert!(
+        stored.len() > raw.len(),
+        "the pre-initialized artifact carries the booted heap: {} vs {} bytes",
+        stored.len(),
+        raw.len()
+    );
+    assert_ne!(
+        published.content_hash,
+        nebula_control::registry::content_hash_hex(&raw),
+        "wizening happens before hashing, so the stored hash is the snapshot's"
+    );
+    eprintln!(
+        "wizened at deploy: {} bytes -> {} bytes",
+        raw.len(),
+        stored.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn losing_a_worker_reshuffles_only_its_share_of_the_keyspace() {
+    // The property consistent hashing exists for. Losing one of three nodes must
+    // move that node's ~1/3 of the functions and leave the rest untouched; under
+    // `hash % n` the modulus changes and roughly 2/3 of keys would move, so the
+    // whole cluster would cold-start at once.
+    //
+    // A recompile on a surviving worker is the observable: it means a function
+    // arrived somewhere it had never been.
+    const FUNCTIONS: usize = 100;
+    const ROUNDS: usize = 10;
+    let liveness = Duration::from_millis(300);
+
+    let mut cluster = Cluster::start(liveness).await;
+    let mut nodes = Vec::new();
+    for _ in 0..3 {
+        nodes.push(cluster.add_worker(4, 16).await);
+    }
+    for n in 0..FUNCTIONS {
+        let distinct = format!("{ECHO}\n(; churn {n} ;)");
+        cluster
+            .gateway
+            .publish(&format!("fn-{n}"), distinct.as_bytes())
+            .await
+            .expect("publish");
+    }
+
+    // Phase 1: steady state across three workers.
+    drive(&cluster, FUNCTIONS, ROUNDS).await;
+    let victim = nodes[1].clone();
+    let survivors: Vec<String> = nodes.iter().filter(|n| **n != victim).cloned().collect();
+    let compiles_before = cluster.compiles(&survivors);
+    let lookups_before = cluster.lookups(&survivors);
+    let cluster_compiles = cluster.compiles(&nodes);
+    assert_eq!(
+        cluster_compiles, FUNCTIONS,
+        "steady state should compile each function exactly once"
+    );
+
+    // Kill one worker and let the reconciler notice, by beating only the others.
+    cluster.kill(&victim);
+    tokio::time::sleep(liveness + Duration::from_millis(150)).await;
+    cluster.beat_all_except(&victim);
+    let removed = cluster.membership.reconcile();
+    assert_eq!(removed, vec![victim.clone()], "exactly one node should go");
+    assert_eq!(cluster.membership.len(), 2);
+
+    // Phase 2: the same traffic against two workers.
+    drive(&cluster, FUNCTIONS, ROUNDS).await;
+
+    let moved = cluster.compiles(&survivors) - compiles_before;
+    let lookups = cluster.lookups(&survivors) - lookups_before;
+    let hit_ratio = (lookups - moved) as f64 / lookups as f64;
+    eprintln!(
+        "after losing 1 of 3: {moved} of {FUNCTIONS} functions moved \
+         ({:.0}% of the keyspace), phase-2 hit ratio {:.1}%",
+        100.0 * moved as f64 / FUNCTIONS as f64,
+        hit_ratio * 100.0
+    );
+
+    // A third of the keyspace, give or take the sampling noise of 100 keys over
+    // 3 nodes (about 1/sqrt(33), ~17%). The upper bound is what matters: it is
+    // far below the ~2/3 that modulo hashing would have moved.
+    assert!(
+        (15..=55).contains(&moved),
+        "{moved} functions moved; consistent hashing should shift about a third"
+    );
+    assert!(
+        hit_ratio >= 0.90,
+        "phase-2 hit ratio {:.1}% — losing one worker should not cold-start the \
+         whole cluster",
+        hit_ratio * 100.0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -259,7 +443,9 @@ async fn a_saturated_worker_sheds_and_keeps_its_heartbeat() {
     let hash = cluster
         .gateway
         .publish("slow", SLOW.as_bytes())
-        .expect("publish");
+        .await
+        .expect("publish")
+        .content_hash;
 
     // Real heartbeats on the async reactor, and the real reconciler.
     let control = NebulaControlClient::new(
@@ -366,6 +552,7 @@ async fn fifty_functions_spread_across_three_workers_and_stay_put() {
         cluster
             .gateway
             .publish(&format!("fn-{n}"), distinct.as_bytes())
+            .await
             .expect("publish");
     }
 

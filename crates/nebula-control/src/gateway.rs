@@ -20,6 +20,7 @@ use tonic::Code;
 
 use crate::membership::Membership;
 use crate::registry::{Deployments, Registry, MAX_ARTIFACT_BYTES};
+use crate::wizer;
 
 /// §6.4 caps a request body at 1 MiB.
 pub const MAX_REQUEST_BYTES: usize = 1 << 20;
@@ -47,6 +48,32 @@ pub struct Gateway {
     /// implementable: a failure from `connect` proves the request was never
     /// sent, while a failure from a live channel proves nothing.
     workers: Mutex<HashMap<String, NebulaWorkerClient<Channel>>>,
+}
+
+/// The result of a successful deploy.
+#[derive(Debug, Clone)]
+pub struct Published {
+    pub content_hash: String,
+    /// Whether Wizer pre-initialized the artifact (§4.3).
+    pub wizened: bool,
+}
+
+#[derive(Debug)]
+pub enum PublishError {
+    InvalidId,
+    /// The caller's module failed its own initializer. A 400.
+    Wizer(String),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidId => f.write_str("function id must be 1..=128 bytes"),
+            Self::Wizer(detail) => write!(f, "pre-initialization failed: {detail}"),
+            Self::Io(err) => write!(f, "{err}"),
+        }
+    }
 }
 
 /// What happened to one dispatch attempt.
@@ -89,25 +116,60 @@ impl Gateway {
         self.functions.lock().unwrap().functions.len()
     }
 
-    pub fn publish(&self, function_id: &str, wasm: &[u8]) -> std::io::Result<String> {
+    /// Deploys `wasm` under `function_id`, pre-initializing it if it asks to be.
+    ///
+    /// This is where §4.3's build-time step actually happens: a module that
+    /// exports an initializer is run through Wizer *before* it is hashed, so the
+    /// artifact the cluster stores and every worker compiles is already booted.
+    #[tracing::instrument(name = "publish", skip_all, fields(function_id = %function_id, bytes = wasm.len(), wizened = tracing::field::Empty))]
+    pub async fn publish(&self, function_id: &str, wasm: &[u8]) -> Result<Published, PublishError> {
         if function_id.is_empty() || function_id.len() > MAX_FUNCTION_ID_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "function id must be 1..=128 bytes",
-            ));
+            return Err(PublishError::InvalidId);
         }
 
-        let hash = self.registry.put(wasm)?;
+        let (artifact, wizened) = if wizer::should_wizen(wasm) {
+            match wizer::wizen(wasm, self.registry.dir()).await {
+                Ok(initialized) => (initialized, true),
+                Err(wizer::WizerError::Failed(detail)) => {
+                    return Err(PublishError::Wizer(detail));
+                }
+                // Wizer missing is an operator gap, not a bad artifact. The
+                // module still runs; it just pays its boot on every request, and
+                // saying so beats refusing a deploy the caller cannot fix.
+                Err(wizer::WizerError::Unavailable) => {
+                    tracing::warn!(
+                        "wizer is not installed; {function_id} deployed without \
+                         pre-initialization and will boot on every request"
+                    );
+                    (wasm.to_vec(), false)
+                }
+                Err(other) => {
+                    return Err(PublishError::Io(std::io::Error::other(other.to_string())))
+                }
+            }
+        } else {
+            (wasm.to_vec(), false)
+        };
+
+        tracing::Span::current().record("wizened", wizened);
+
+        let content_hash = self.registry.put(&artifact).map_err(PublishError::Io)?;
         let mut functions = self.functions.lock().unwrap();
         functions
             .functions
-            .insert(function_id.to_string(), hash.clone());
+            .insert(function_id.to_string(), content_hash.clone());
 
         // Persisted before the caller is told the deployment succeeded. The lock
         // is held across the write so the file can never disagree with the map;
         // deploys are rare, so serialising them costs nothing that matters.
-        self.registry.save_deployments(&functions)?;
-        Ok(hash)
+        self.registry
+            .save_deployments(&functions)
+            .map_err(PublishError::Io)?;
+
+        Ok(Published {
+            content_hash,
+            wizened,
+        })
     }
 
     async fn client(&self, address: &str) -> Option<NebulaWorkerClient<Channel>> {
@@ -131,13 +193,22 @@ impl Gateway {
         self.workers.lock().unwrap().remove(address);
     }
 
+    /// One dispatch attempt. Instrumented per attempt rather than per request,
+    /// so a retry shows up as a second span instead of hiding inside the first.
+    #[tracing::instrument(name = "route_to_worker", skip_all, fields(worker = %address, outcome = tracing::field::Empty))]
     async fn dispatch(&self, address: &str, request: ExecuteRequest) -> Attempt {
+        let span = tracing::Span::current();
         let Some(mut client) = self.client(address).await else {
+            span.record("outcome", "not_sent");
             return Attempt::NotSent;
         };
         match client.execute(request).await {
-            Ok(response) => Attempt::Answered(response.into_inner()),
+            Ok(response) => {
+                span.record("outcome", "answered");
+                Attempt::Answered(response.into_inner())
+            }
             Err(status) => {
+                span.record("outcome", status.code().description());
                 // The channel is suspect now; drop it so the next request
                 // reconnects and gets a clean "never sent" answer instead of
                 // failing on a corpse.
@@ -202,19 +273,35 @@ async fn publish(
     if tenant_of(&headers).is_none() {
         return unauthorized();
     }
-    match gateway.publish(&function_id, &body) {
-        Ok(hash) => (
+    match gateway.publish(&function_id, &body).await {
+        Ok(published) => (
             StatusCode::CREATED,
             [(header::CONTENT_TYPE, "application/json")],
-            // A hand-built object rather than a serde dependency for one field.
-            // `hash` is hex, so there is nothing here to escape.
-            format!("{{\"content_hash\":\"{hash}\"}}"),
+            // Hand-built rather than a serde dependency for two fields. The hash
+            // is hex and the flag is a bool, so there is nothing here to escape.
+            format!(
+                "{{\"content_hash\":\"{}\",\"wizened\":{}}}",
+                published.content_hash, published.wizened
+            ),
         )
             .into_response(),
-        Err(err) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        // A module whose own initializer fails is a bad artifact, and the caller
+        // is the only one who can fix it.
+        Err(err @ (PublishError::Wizer(_) | PublishError::InvalidId)) => {
+            (StatusCode::BAD_REQUEST, err.to_string()).into_response()
+        }
+        Err(PublishError::Io(err)) => {
+            tracing::error!("deploy of {function_id} failed: {err}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "deploy failed").into_response()
+        }
     }
 }
 
+#[tracing::instrument(
+    name = "request_received",
+    skip_all,
+    fields(function_id = %function_id, bytes = body.len(), tenant = tracing::field::Empty)
+)]
 async fn execute(
     State(gateway): State<Arc<Gateway>>,
     Path(function_id): Path<String>,
@@ -224,6 +311,7 @@ async fn execute(
     let Some(tenant) = tenant_of(&headers) else {
         return unauthorized();
     };
+    tracing::Span::current().record("tenant", tenant.as_str());
 
     let Some(content_hash) = gateway.content_hash_of(&function_id) else {
         return (StatusCode::NOT_FOUND, "unknown function").into_response();

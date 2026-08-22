@@ -91,7 +91,18 @@ impl WorkerService {
         if let Some(cached) = self.artifacts.lock().unwrap().get(hash) {
             return Ok((cached.clone(), false));
         }
+        self.fetch(hash).await.map(|artifact| (artifact, true))
+    }
 
+    /// Split out from [`WorkerService::artifact`] so the span exists only on a
+    /// miss. A `fetch_module` span that closes in 200 ns on every warm request
+    /// is noise in exactly the trace you are reading to find the cold ones.
+    #[tracing::instrument(
+        name = "fetch_module",
+        skip_all,
+        fields(hash = %hash, bytes = tracing::field::Empty)
+    )]
+    async fn fetch(&self, hash: &str) -> Result<Arc<Vec<u8>>, FetchError> {
         let mut client = self.control.clone();
         let mut stream = client
             .fetch_module(FetchModuleRequest {
@@ -122,12 +133,14 @@ impl WorkerService {
             return Err(FetchError::Corrupt);
         }
 
+        tracing::Span::current().record("bytes", artifact.len());
+
         let artifact = Arc::new(artifact);
         self.artifacts
             .lock()
             .unwrap()
             .insert(hash.to_string(), artifact.clone());
-        Ok((artifact, true))
+        Ok(artifact)
     }
 }
 
@@ -188,6 +201,16 @@ fn fault(outcome: Outcome, detail: &str) -> ExecuteResponse {
 
 #[tonic::async_trait]
 impl NebulaWorker for WorkerService {
+    #[tracing::instrument(
+        name = "grpc_execute",
+        skip_all,
+        fields(
+            function_id = tracing::field::Empty,
+            tenant = tracing::field::Empty,
+            cold = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        )
+    )]
     async fn execute(
         &self,
         request: Request<ExecuteRequest>,
@@ -209,6 +232,9 @@ impl NebulaWorker for WorkerService {
             return Err(Status::invalid_argument("tenant is required"));
         }
         let started = Instant::now();
+        let span = tracing::Span::current();
+        span.record("function_id", request.function_id.as_str());
+        span.record("tenant", request.tenant.as_str());
 
         // The permit is held across the fetch as well as the execution — a cold
         // start is in-flight work and should count against capacity. Dropping
@@ -255,6 +281,11 @@ impl NebulaWorker for WorkerService {
 
         let mut response = classify(result);
         response.exec_micros = started.elapsed().as_micros() as u64;
+        span.record("cold", cold);
+        span.record(
+            "outcome",
+            tracing::field::debug(Outcome::try_from(response.outcome).unwrap_or(Outcome::Internal)),
+        );
         // "Cold" here means this request had to fetch the artifact. A worker
         // that restarted with a warm L2 will report warm, which is the honest
         // answer for the question the gateway asks.

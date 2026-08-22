@@ -12,6 +12,7 @@ use tonic::transport::Server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    nebula_worker::init_tracing();
     let addr = std::env::var("NEBULA_WORKER_ADDR").unwrap_or_else(|_| "127.0.0.1:7001".to_string());
     let control =
         std::env::var("NEBULA_CONTROL_URL").unwrap_or_else(|_| "http://127.0.0.1:7000".to_string());

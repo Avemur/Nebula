@@ -14,6 +14,7 @@ use tonic::transport::Server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    nebula_control::init_tracing();
     let addr =
         std::env::var("NEBULA_CONTROL_ADDR").unwrap_or_else(|_| "127.0.0.1:7000".to_string());
     let registry_dir =

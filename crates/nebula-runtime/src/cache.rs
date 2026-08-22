@@ -175,6 +175,16 @@ impl Cache {
         wasm: &[u8],
         hash: &Hash,
     ) -> Result<CachedModule> {
+        // `source` is recorded rather than logged so one span answers both
+        // "how long did this take" and "did L2 save us from Cranelift".
+        let span = tracing::info_span!(
+            "compile_l1",
+            bytes = wasm.len(),
+            source = tracing::field::Empty,
+            compiled_bytes = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+
         let path = self.l2_path(engine, hash);
 
         let mut loaded = None;
@@ -211,6 +221,15 @@ impl Cache {
         let size = fs::metadata(&path)
             .map(|meta| meta.len() as usize)
             .unwrap_or(wasm.len());
+        span.record(
+            "source",
+            match source {
+                Source::Aot => "aot",
+                Source::Cranelift => "cranelift",
+            },
+        );
+        span.record("compiled_bytes", size);
+
         let pre = linker.instantiate_pre(&module)?;
         Ok(CachedModule {
             module,

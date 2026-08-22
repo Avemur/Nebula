@@ -44,6 +44,14 @@ struct Job {
     deadline_ticks: u64,
     reply: oneshot::Sender<wasmtime::Result<HostCtx>>,
     permit: OwnedSemaphorePermit,
+    /// The span the request arrived on.
+    ///
+    /// Carried explicitly because this job crosses from a tokio task to a plain
+    /// OS thread, and nothing propagates context across a channel. Without it
+    /// `wasm_execute` would appear at the root of the trace rather than under
+    /// the request that caused it — which is exactly the link you open a
+    /// latency trace to follow.
+    parent: tracing::Span,
 }
 
 pub struct ExecPool {
@@ -114,17 +122,28 @@ impl ExecPool {
                         deadline_ticks,
                         reply,
                         permit,
+                        parent,
                     } = job;
 
                     queued.fetch_sub(1, Ordering::Relaxed);
                     in_flight.fetch_add(1, Ordering::Relaxed);
-                    let result = runtime.execute_with_deadline(
-                        &wasm,
-                        HANDLER_EXPORT,
-                        &tenant,
-                        body,
-                        deadline_ticks,
-                    );
+                    let result = {
+                        let _parent = parent.enter();
+                        let span = tracing::info_span!(
+                            "wasm_execute",
+                            tenant = %tenant,
+                            deadline_ms = deadline_ticks,
+                            bytes = wasm.len()
+                        );
+                        let _entered = span.enter();
+                        runtime.execute_with_deadline(
+                            &wasm,
+                            HANDLER_EXPORT,
+                            &tenant,
+                            body,
+                            deadline_ticks,
+                        )
+                    };
                     in_flight.fetch_sub(1, Ordering::Relaxed);
 
                     // Send first, then release the slot: a caller that sees its
@@ -179,6 +198,7 @@ impl ExecPool {
             deadline_ticks,
             reply,
             permit: admitted.0,
+            parent: tracing::Span::current(),
         };
 
         self.queued.fetch_add(1, Ordering::Relaxed);

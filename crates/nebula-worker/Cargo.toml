@@ -8,6 +8,8 @@ nebula-proto.workspace = true
 nebula-runtime.workspace = true
 tonic.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # The mesh test drives a real control plane, not a mock of one.

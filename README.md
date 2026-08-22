@@ -883,19 +883,49 @@ exporter for metrics.
 ### Spans
 
 ```
-gateway.request
-├── scheduler.route            { function_id, chosen_node, ring_hops }
-└── worker.execute             { request_id, worker_id }
-    ├── cache.lookup           { hit, tier }
-    ├── module.fetch           { bytes, chunks }         [cold only]
-    ├── module.compile         { source: aot|cranelift } [cold only]
-    ├── instance.instantiate   { micros }
-    └── guest.call             { micros, outcome, fuel_used }
+request_received     { function_id, bytes, tenant }              [gateway]
+└── route_to_worker  { worker, outcome }                          one per attempt
+
+grpc_execute         { function_id, tenant, cold, outcome }       [worker]
+├── fetch_module     { hash, bytes }                              cold only
+└── wasm_execute     { tenant, deadline_ms, bytes }
+    └── compile_l1   { bytes, source: aot|cranelift, compiled_bytes }   L1 miss only
 ```
 
-`instance.instantiate` and `guest.call` are the two spans G1 is measured
-against. They are separated on purpose — conflating them hides which half
-regressed.
+`tracing-subscriber` with `FmtSpan::CLOSE` is the whole configuration: it prints
+each span's duration as it closes, which is what turns the tree into a latency
+breakdown rather than a log. No collector — `tracing` alone answers "where did
+the time go", and a collector is infrastructure to run, not a question to
+answer. `NEBULA_LOG` sets the filter; it defaults to `off` under test so a
+normal `cargo test` stays quiet.
+
+**Measured**, one cold request then one warm, against the echo guest:
+
+```
+grpc_execute{function_id=echo tenant=acme}:fetch_module{bytes=482}:               close time.busy=169µs
+grpc_execute:wasm_execute:compile_l1{source="cranelift" compiled_bytes=14024}:    close time.busy=2.53ms
+grpc_execute:wasm_execute{deadline_ms=50 bytes=482}:                              close time.busy=2.76ms
+grpc_execute{cold=true outcome=Ok}:                                               close time.busy=2.95ms
+
+grpc_execute:wasm_execute{deadline_ms=50 bytes=482}:                              close time.busy=77.9µs
+grpc_execute{cold=false outcome=Ok}:                                              close time.busy=178µs
+```
+
+Cold is 2.95 ms, of which Cranelift is 2.53 ms — compilation dominates, and the
+fetch is noise beside it. Warm is **78 µs of guest inside 178 µs of worker**,
+the rest being instantiation and the gRPC frame.
+
+Two deliberate shapes here. `route_to_worker` is one span *per attempt*, so a
+§10.2 retry shows as a second span instead of hiding inside the first. And
+`compile_l1` nests *inside* `wasm_execute` rather than beside it, because
+compilation is lazy — it happens during the execute call, not before it. That
+nesting is what lets you read actual execution as the difference: 2.76 − 2.53 ≈
+0.23 ms on the cold path.
+
+`wasm_execute` runs on a pool thread, not the reactor, so nothing propagates
+the request context to it automatically. The job carries its parent `Span`
+explicitly (§5.2); without that the guest's span would appear at the root of the
+trace rather than under the request that caused it.
 
 ### SLIs
 
@@ -1131,8 +1161,18 @@ Phase boundaries are commit points.
 
 **Goal:** numbers that support the claims in §1.
 
-- Wizer integration in the deploy path; `wizened` flag through registry,
-  telemetry, and API.
+- ✅ Wizer integration in the deploy path; `wizened` flag through the API
+  response and the `publish` span. A module exporting `_initialize` is run
+  through Wizer *before* hashing, so the artifact the cluster stores is already
+  booted. Text `.wat` and modules without an initializer pass through untouched;
+  a module whose own initializer fails is a 400, while Wizer being absent is an
+  operator gap that logs and deploys un-wizened rather than refusing a deploy
+  the caller cannot fix.
+- ✅ Full `tracing` span tree with durations (§14).
+- ✅ Ring churn: losing 1 of 3 workers moved **31 of 100 functions (31%)** and
+  left the phase-2 cache hit ratio at **96.9%**. Under `hash % n` the modulus
+  changes and roughly two thirds of the keyspace would have moved, cold-starting
+  most of the cluster at once.
 - `nebula-bench`: cold/hot/wizened split, percentiles from a microsecond
   histogram, sustained and burst profiles.
 - Full `tracing` span tree; flamegraph the hot path; eliminate what shows up.

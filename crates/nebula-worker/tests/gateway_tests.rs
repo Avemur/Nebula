@@ -177,6 +177,8 @@ struct Worker {
 
 impl Cluster {
     async fn start(liveness: Duration) -> Self {
+        // Quiet unless NEBULA_LOG says otherwise.
+        nebula_worker::init_tracing_with_default("off");
         let membership = Arc::new(Membership::new(liveness));
         let registry = Arc::new(Registry::new(temp_dir("registry")).expect("registry"));
 
@@ -254,6 +256,7 @@ impl Cluster {
     async fn publish(&self, function_id: &str, wasm: &str) {
         self.gateway
             .publish(function_id, wasm.as_bytes())
+            .await
             .expect("publish");
     }
 
