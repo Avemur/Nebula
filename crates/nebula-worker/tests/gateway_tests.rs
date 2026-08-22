@@ -70,6 +70,22 @@ const MEMORY_HOG: &str = r#"
         (i32.store (i32.const 65536) (i32.const 1))))
     "#;
 
+const TRAPPER: &str = r#"(module (func (export "run") (unreachable)))"#;
+
+/// Burns roughly 100 ms — comfortably past the 50 ms default budget, and
+/// comfortably inside anything a tool-calling client would ask for.
+const SLOW: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (func (export "run")
+        (local $i i64)
+        (local.set $i (i64.const 250000000))
+        (loop $l
+          (i32.store (i32.const 0) (i32.wrap_i64 (local.get $i)))
+          (local.set $i (i64.sub (local.get $i) (i64.const 1)))
+          (br_if $l (i64.ne (local.get $i) (i64.const 0))))))
+    "#;
+
 // ---------------------------------------------------------------------------
 // A very small HTTP/1.1 client
 // ---------------------------------------------------------------------------
@@ -94,6 +110,7 @@ async fn http(
     method: &str,
     path: &str,
     token: Option<&str>,
+    extra: &[(&str, &str)],
     body: &[u8],
 ) -> HttpResponse {
     let mut stream = TcpStream::connect(addr).await.expect("connect gateway");
@@ -105,6 +122,9 @@ async fn http(
     );
     if let Some(token) = token {
         head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    for (name, value) in extra {
+        head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
 
@@ -261,11 +281,22 @@ impl Cluster {
     }
 
     async fn post(&self, function_id: &str, token: &str, body: &[u8]) -> HttpResponse {
+        self.post_with(function_id, token, &[], body).await
+    }
+
+    async fn post_with(
+        &self,
+        function_id: &str,
+        token: &str,
+        extra: &[(&str, &str)],
+        body: &[u8],
+    ) -> HttpResponse {
         http(
             &self.http_addr,
             "POST",
             &format!("/execute/{function_id}"),
             Some(token),
+            extra,
             body,
         )
         .await
@@ -286,6 +317,7 @@ async fn http_execute_round_trips_through_the_cluster() {
         "PUT",
         "/functions/echo",
         Some("acme"),
+        &[],
         ECHO.as_bytes(),
     )
     .await;
@@ -308,7 +340,7 @@ async fn requests_without_a_bearer_token_are_rejected() {
     cluster.add_worker(1, 2).await;
     cluster.publish("echo", ECHO).await;
 
-    let anonymous = http(&cluster.http_addr, "POST", "/execute/echo", None, b"x").await;
+    let anonymous = http(&cluster.http_addr, "POST", "/execute/echo", None, &[], b"x").await;
     assert_eq!(anonymous.status, 401);
     assert!(anonymous.header("www-authenticate").is_some());
 
@@ -355,6 +387,111 @@ async fn an_empty_cluster_reports_service_unavailable() {
     let response = cluster.post("echo", "acme", b"x").await;
     assert_eq!(response.status, 503);
     assert_eq!(response.header("retry-after"), Some("1"));
+}
+
+// ---------------------------------------------------------------------------
+// Caller-supplied deadlines and machine-readable faults
+//
+// Both exist for tool-calling clients: 50 ms suits a web handler and starves an
+// agent, and a status code alone cannot tell one 503 from another.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_caller_supplied_deadline_is_honoured() {
+    let mut cluster = Cluster::start(Duration::from_secs(30)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("slow", SLOW).await;
+
+    // The default budget is too small for this guest, and says so precisely.
+    let default = cluster.post("slow", "acme", b"").await;
+    assert_eq!(default.status, 504);
+    assert_eq!(default.header("x-nebula-fault"), Some("timeout"));
+    assert_eq!(default.header("x-nebula-deadline-ms"), Some("50"));
+
+    // Asking for more is all it takes.
+    let generous = cluster
+        .post_with("slow", "acme", &[("X-Nebula-Deadline-Ms", "2000")], b"")
+        .await;
+    assert_eq!(
+        generous.status,
+        200,
+        "a 2 s budget should cover a 100 ms guest: {}",
+        generous.text()
+    );
+    assert_eq!(generous.header("x-nebula-deadline-ms"), Some("2000"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_out_of_range_deadline_is_clamped_and_the_effective_value_echoed() {
+    let mut cluster = Cluster::start(Duration::from_secs(30)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    // Silently clamping without saying so is how a caller ends up reading a
+    // `timeout` fault as a bug in its own code.
+    let greedy = cluster
+        .post_with("echo", "acme", &[("X-Nebula-Deadline-Ms", "60000")], b"x")
+        .await;
+    assert_eq!(greedy.status, 200);
+    assert_eq!(greedy.header("x-nebula-deadline-ms"), Some("5000"));
+
+    let tiny = cluster
+        .post_with("echo", "acme", &[("X-Nebula-Deadline-Ms", "0")], b"x")
+        .await;
+    assert_eq!(tiny.header("x-nebula-deadline-ms"), Some("10"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_deadline_is_rejected_rather_than_defaulted() {
+    // Falling back to 50 ms would hand a client that asked for seconds a
+    // `timeout` it cannot explain. A 400 names the mistake.
+    let mut cluster = Cluster::start(Duration::from_secs(30)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    for bad in ["abc", "-1", "2.5", ""] {
+        let response = cluster
+            .post_with("echo", "acme", &[("X-Nebula-Deadline-Ms", bad)], b"x")
+            .await;
+        assert_eq!(response.status, 400, "accepted deadline {bad:?}");
+        assert_eq!(response.header("x-nebula-fault"), Some("invalid_deadline"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_failure_names_its_own_cause() {
+    // A client — an LLM tool wrapper especially — has to branch on *why*. Status
+    // codes collide: 503 is both "no worker" and "worker shed", 500 is both a
+    // guest trap and a memory ceiling.
+    let mut cluster = Cluster::start(Duration::from_secs(30)).await;
+
+    // Before any worker exists.
+    cluster.publish("echo", ECHO).await;
+    let no_worker = cluster.post("echo", "acme", b"x").await;
+    assert_eq!(no_worker.status, 503);
+    assert_eq!(
+        no_worker.header("x-nebula-fault"),
+        Some("no_healthy_worker")
+    );
+    assert_eq!(no_worker.header("retry-after"), Some("1"));
+
+    cluster.add_worker(2, 4).await;
+    cluster.publish("hog", MEMORY_HOG).await;
+    cluster.publish("trap", TRAPPER).await;
+
+    for (function, status, fault) in [
+        ("hog", 500, "memory_limit"),
+        ("trap", 500, "trap"),
+        ("missing", 404, "unknown_function"),
+    ] {
+        let response = cluster.post(function, "acme", b"x").await;
+        assert_eq!(response.status, status, "{function}");
+        assert_eq!(response.header("x-nebula-fault"), Some(fault), "{function}");
+    }
+
+    let anonymous = http(&cluster.http_addr, "POST", "/execute/echo", None, &[], b"x").await;
+    assert_eq!(anonymous.status, 401);
+    assert_eq!(anonymous.header("x-nebula-fault"), Some("unauthorized"));
 }
 
 // ---------------------------------------------------------------------------

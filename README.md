@@ -720,14 +720,56 @@ on the path to any goal in §1.
 POST /execute/{function_id}
   Authorization: Bearer <tenant-token>
   Content-Type: application/octet-stream
+  X-Nebula-Deadline-Ms: <opt, 10..5000, default 50>
   X-Nebula-Partition-Key: <opt, reserved for §21>
   Body: <= 1 MiB
   ->  200 <response body>
-      X-Nebula-Request-Id, X-Nebula-Worker, X-Nebula-Cold: true|false
+      X-Nebula-Cold: true|false
       X-Nebula-Exec-Micros: <n>
+      X-Nebula-Deadline-Ms: <the effective budget, after clamping>
+  ->  4xx/5xx
+      X-Nebula-Fault: <machine-readable cause, always present>
+```
+
+**`X-Nebula-Deadline-Ms` exists for tool-calling clients.** The 50 ms default of
+§6.4 suits a web handler and starves an agent asking a sandbox to do real work.
+The value is clamped to `[10, 5000]` and the *effective* budget is echoed on the
+response, so a caller that asked for 60 s learns it got 5 s rather than reading
+the resulting `timeout` fault as a bug in its own code. A malformed header is a
+`400` with `X-Nebula-Fault: invalid_deadline`, not a silent fall back to the
+default — defaulting would hand a client that asked for seconds a 50 ms budget
+and then a timeout it cannot diagnose. The worker clamps independently
+(`MAX_DEADLINE_MS`): a gateway is not a trust boundary the worker relies on.
+
+**`X-Nebula-Fault` is on every non-200 response.** Status codes collide — `503`
+is both "no worker in the ring" and "worker shed", `500` is both a guest trap
+and a memory ceiling — so a client branching on status alone cannot tell them
+apart. The header names the cause:
+
+| Fault | Status | Meaning |
+|---|---|---|
+| `trap` | 500 | Guest trapped; detail in the body |
+| `memory_limit` | 500 | Guest hit its linear-memory ceiling (§6.3) |
+| `timeout` / `fuel_exhausted` | 504 | Guest exceeded its budget (§6.1–6.2) |
+| `internal` | 500 | Host-side failure; detail withheld (§12) |
+| `unknown_function` | 404 | Nothing deployed under that id |
+| `module_not_found` | 404 | Deployed, but the artifact is missing from the registry |
+| `unauthorized` | 401 | Missing or malformed bearer token |
+| `invalid_deadline` / `invalid_request` | 400 | Caller's request is malformed |
+| `no_healthy_worker` | 503 | The ring is empty |
+| `no_reachable_worker` | 503 | No candidate accepted a connection; nothing ran |
+| `cluster_at_capacity` / `worker_shed` | 503 | Admission control refused (§10.3) |
+| `worker_unreachable` | 502 | Sent, then the connection failed; may or may not have run (§10.2) |
+
+Every `503` carries `Retry-After`. `502` deliberately does not — §10.2 forbids
+retrying a request that may already have executed, and inviting a retry would
+undo that.
+
+```
 
 PUT  /functions/{function_id}      # deploy: body is the .wasm artifact
-     -> 201 { "content_hash": "...", "wizened": bool, "compile_micros": n }
+     -> 201 { "content_hash": "...", "wizened": bool }
+     # no compile timing: compilation happens lazily on the worker, not here
 GET  /functions/{function_id}      # metadata
 GET  /healthz                      # gateway liveness
 GET  /cluster                      # node list, ring occupancy, per-node load

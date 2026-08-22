@@ -29,9 +29,32 @@ pub const MAX_REQUEST_BYTES: usize = 1 << 20;
 /// a path, but an unbounded one is still a free allocation for anyone asking.
 pub const MAX_FUNCTION_ID_BYTES: usize = 128;
 
-/// The worker's per-request budget, sent so the worker can size its own
-/// deadline. §6.4's default.
-const DEADLINE_MS: u32 = 50;
+/// Optional per-request budget in milliseconds.
+///
+/// Exists for tool-calling clients: §6.4's 50 ms suits a web handler and is far
+/// too tight for an agent asking a sandbox to do real work. The effective value
+/// is echoed back on the response, so a caller that asked for more than the cap
+/// learns what it actually got instead of wondering why it timed out early.
+pub const DEADLINE_HEADER: &str = "x-nebula-deadline-ms";
+
+/// Set on **every** non-200 response.
+///
+/// A status code is shared by several unrelated failures — 503 is both "no
+/// worker" and "worker shed", 500 is both a guest trap and a memory ceiling. A
+/// client branching on the status cannot tell them apart; this names the reason.
+pub const FAULT_HEADER: &str = "x-nebula-fault";
+
+/// §6.4's default, used when the caller does not ask.
+const DEFAULT_DEADLINE_MS: u32 = 50;
+
+/// Bounds on a caller-supplied deadline.
+///
+/// The ceiling mirrors the worker's own `MAX_DEADLINE_MS`. It is duplicated
+/// rather than shared because the worker clamps independently — a gateway is
+/// not a trust boundary the worker gets to rely on, and the worker is the one
+/// whose execution thread is at stake.
+const MIN_DEADLINE_MS: u32 = 10;
+const MAX_DEADLINE_MS: u32 = 5_000;
 
 pub struct Gateway {
     membership: Arc<Membership>,
@@ -300,7 +323,12 @@ async fn publish(
 #[tracing::instrument(
     name = "request_received",
     skip_all,
-    fields(function_id = %function_id, bytes = body.len(), tenant = tracing::field::Empty)
+    fields(
+        function_id = %function_id,
+        bytes = body.len(),
+        tenant = tracing::field::Empty,
+        deadline_ms = tracing::field::Empty,
+    )
 )]
 async fn execute(
     State(gateway): State<Arc<Gateway>>,
@@ -313,8 +341,21 @@ async fn execute(
     };
     tracing::Span::current().record("tenant", tenant.as_str());
 
+    let Some(deadline_ms) = deadline_of(&headers) else {
+        return fault(
+            StatusCode::BAD_REQUEST,
+            "invalid_deadline",
+            format!("{DEADLINE_HEADER} must be a whole number of milliseconds"),
+        );
+    };
+    tracing::Span::current().record("deadline_ms", deadline_ms);
+
     let Some(content_hash) = gateway.content_hash_of(&function_id) else {
-        return (StatusCode::NOT_FOUND, "unknown function").into_response();
+        return fault(
+            StatusCode::NOT_FOUND,
+            "unknown_function",
+            "no function deployed under that id",
+        );
     };
 
     // Bounded-load ordering (§9.2): the ring's owner leads unless it is above
@@ -322,7 +363,11 @@ async fn execute(
     // The rest of the plan stays in ring order, so failover is unchanged.
     let plan = gateway.membership.route_plan(&function_id);
     if plan.is_empty() {
-        return retry_later(StatusCode::SERVICE_UNAVAILABLE, "no healthy worker");
+        return fault(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_healthy_worker",
+            "no worker is in the ring",
+        );
     }
 
     let request = ExecuteRequest {
@@ -330,7 +375,7 @@ async fn execute(
         content_hash,
         body: body.to_vec(),
         request_id: format!("{function_id}-{}", plan.len()),
-        deadline_ms: DEADLINE_MS,
+        deadline_ms,
         partition_key: None,
         tenant,
     };
@@ -339,7 +384,7 @@ async fn execute(
     let mut last_status = None;
     for (index, (_node, address)) in plan.iter().take(2).enumerate() {
         match gateway.dispatch(address, request.clone()).await {
-            Attempt::Answered(response) => return to_http(response),
+            Attempt::Answered(response) => return to_http(response, deadline_ms),
             Attempt::NotSent => continue,
             Attempt::Failed(status) => {
                 if status.code() == Code::ResourceExhausted && index == 0 {
@@ -354,16 +399,22 @@ async fn execute(
     }
 
     match last_status {
-        Some(status) if status.code() == Code::ResourceExhausted => {
-            retry_later(StatusCode::SERVICE_UNAVAILABLE, "cluster at capacity")
-        }
+        Some(status) if status.code() == Code::ResourceExhausted => fault(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cluster_at_capacity",
+            "every candidate worker shed the request",
+        ),
         Some(status) => from_status(&status),
         // Every candidate refused the connection: nothing ran anywhere.
-        None => retry_later(StatusCode::SERVICE_UNAVAILABLE, "no reachable worker"),
+        None => fault(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_reachable_worker",
+            "no candidate worker accepted a connection",
+        ),
     }
 }
 
-fn to_http(response: ExecuteResponse) -> Response {
+fn to_http(response: ExecuteResponse, deadline_ms: u32) -> Response {
     let outcome = Outcome::try_from(response.outcome).unwrap_or(Outcome::Internal);
 
     let mut headers = HeaderMap::new();
@@ -374,10 +425,15 @@ fn to_http(response: ExecuteResponse) -> Response {
     if let Ok(value) = HeaderValue::from_str(&response.exec_micros.to_string()) {
         headers.insert("x-nebula-exec-micros", value);
     }
+    // The *effective* budget, after clamping. A caller that asked for 60 s and
+    // silently got 5 s would otherwise read a `timeout` fault as a bug.
+    if let Ok(value) = HeaderValue::from_str(&deadline_ms.to_string()) {
+        headers.insert(DEADLINE_HEADER, value);
+    }
 
     // §12. Guest fault detail goes back to the caller — it is their code. The
     // `Internal` arm carries none, because the worker withheld it deliberately.
-    let (status, fault) = match outcome {
+    let (status, kind) = match outcome {
         Outcome::Ok => {
             return (StatusCode::OK, headers, response.body).into_response();
         }
@@ -389,36 +445,76 @@ fn to_http(response: ExecuteResponse) -> Response {
         Outcome::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     };
 
-    headers.insert("x-nebula-fault", HeaderValue::from_static(fault));
+    headers.insert(FAULT_HEADER, HeaderValue::from_static(kind));
     (status, headers, response.fault_detail).into_response()
 }
 
 fn from_status(status: &tonic::Status) -> Response {
     match status.code() {
-        Code::ResourceExhausted => retry_later(StatusCode::SERVICE_UNAVAILABLE, "worker shed"),
-        Code::InvalidArgument => {
-            (StatusCode::BAD_REQUEST, status.message().to_string()).into_response()
-        }
+        Code::ResourceExhausted => fault(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker_shed",
+            "worker at capacity",
+        ),
+        Code::InvalidArgument => fault(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            status.message().to_string(),
+        ),
         // The request reached a worker and then the connection failed. It may
         // have executed, so this is reported, not retried (§10.2).
-        Code::Unavailable | Code::Cancelled | Code::DeadlineExceeded => (
+        Code::Unavailable | Code::Cancelled | Code::DeadlineExceeded => fault(
             StatusCode::BAD_GATEWAY,
-            "worker became unreachable mid-request",
-        )
-            .into_response(),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "dispatch failed").into_response(),
+            "worker_unreachable",
+            "worker became unreachable mid-request; the call may or may not have run",
+        ),
+        _ => fault(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "dispatch_failed",
+            "dispatch failed",
+        ),
     }
 }
 
-fn retry_later(status: StatusCode, message: &'static str) -> Response {
-    (status, [("retry-after", "1")], message).into_response()
+/// A non-200 response that names its own cause.
+///
+/// `Retry-After` rides along with 503 because that status *means* "try again" —
+/// not a special case, just the definition.
+fn fault(status: StatusCode, kind: &'static str, detail: impl Into<String>) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(FAULT_HEADER, HeaderValue::from_static(kind));
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    (status, headers, detail.into()).into_response()
 }
 
 fn unauthorized() -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(FAULT_HEADER, HeaderValue::from_static("unauthorized"));
+    headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
     (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
+        headers,
         "missing or malformed bearer token",
     )
         .into_response()
+}
+
+/// Reads [`DEADLINE_HEADER`], clamped to `[MIN_DEADLINE_MS, MAX_DEADLINE_MS]`.
+///
+/// A malformed value is a 400 rather than a silent fall back to the default.
+/// Defaulting would hand a client asking for 5 s a 50 ms budget and then a
+/// `timeout` fault, which is the most confusing failure this endpoint could
+/// produce — and the one a tool-calling agent is least able to diagnose.
+/// `None` means the header was present and unparseable — an absent header
+/// yields the default, so the two cases never blur.
+fn deadline_of(headers: &HeaderMap) -> Option<u32> {
+    let Some(raw) = headers.get(DEADLINE_HEADER) else {
+        return Some(DEFAULT_DEADLINE_MS);
+    };
+    raw.to_str()
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map(|ms| ms.clamp(MIN_DEADLINE_MS, MAX_DEADLINE_MS))
 }
