@@ -1146,9 +1146,12 @@ nebula/
 │   │   └── tests/{sandbox,host,cache,interpreter}_tests.rs, wizer_bench.rs
 │   ├── nebula-control/         # bin: gateway + ring + registry + membership + wizer
 │   │   └── src/{gateway,ring,registry,membership,server,wizer}.rs
-│   └── nebula-worker/          # bin: gRPC server wrapping nebula-runtime
-│       ├── src/{server,exec_pool,heartbeat}.rs
-│       └── tests/{mesh,gateway,scale}_tests.rs
+│   ├── nebula-worker/          # bin: gRPC server wrapping nebula-runtime
+│   │   ├── src/{server,exec_pool,heartbeat}.rs
+│   │   └── tests/{mesh,gateway,scale}_tests.rs
+│   └── nebula-mcp/             # bin: Model Context Protocol adapter (§22.3)
+│       ├── src/{lib,gateway,main}.rs
+│       └── tests/mcp_tests.rs
 └── guests/
     ├── build.sh                # builds every guest and its wizened twin
     ├── examples/heavy_init/    # the §4.3 pre-initialization demonstration
@@ -1447,9 +1450,9 @@ rest is scoped here.
 
 The ranking is the point: items 22.1–22.3 are what "works with agents" actually
 means, and the rest are sharp edges agent traffic will find in a system tuned
-for web handlers. **§22.1 is built** — the JavaScript interpreter guest ships,
-along with the stdin/stdout plumbing it needed. The rest is scoped, not
-written.
+for web handlers. **§22.1 and §22.3 are built** — the JavaScript interpreter
+guest and the MCP server, which together are the difference between a sandbox
+and a tool an agent can call. The rest is scoped, not written.
 
 ### 22.1 Interpreter guests — the prerequisite for everything else
 
@@ -1581,6 +1584,11 @@ starts from the constraint instead of discovering it.
 
 ### 22.2 Tool metadata — an agent cannot call what it cannot describe
 
+**Status: not built, and no longer blocking.** §22.3 ships with a single
+constant descriptor for the interpreter, so `tools/list` has an answer without
+this. What follows is the story for *purpose-built* wasm tools — a deployed
+module that is not "run this JavaScript" — which still needs it.
+
 `PUT /functions/{id}` stores bytes. An agent loop needs a name, a description,
 and a JSON Schema for the arguments, because that is the payload every model
 provider's tool-calling API expects.
@@ -1608,32 +1616,109 @@ opinion about the guest's ABI.
 
 ### 22.3 MCP — the actual interoperability standard
 
+**Status: built.** `crates/nebula-mcp`, tested in `tests/mcp_tests.rs`.
+
 The Model Context Protocol is how agent runtimes discover and call tools
 without bespoke glue per host. An MCP surface is the difference between "an
 HTTP API an agent could be taught to call" and "a tool server any MCP client
 already knows how to call."
 
-It is a thin adapter, not a new system — every MCP method maps onto something
+```
+$ NEBULA_GATEWAY_ADDR=127.0.0.1:8080 NEBULA_JS_FUNCTION=js cargo run -p nebula-mcp
+nebula-mcp: POST http://127.0.0.1:8090/mcp -> gateway 127.0.0.1:8080, interpreter `js`
+```
+
+It is a thin adapter, not a new system — every method maps onto something
 §11.1 already does:
 
 | MCP method | Nebula |
 |---|---|
 | `initialize` | Static capability advertisement |
-| `tools/list` | `GET /tools` (§22.2) |
-| `tools/call` | `POST /execute/{id}`, arguments as the body |
-| Error result | `X-Nebula-Fault` mapped to an MCP error, verbatim |
+| `tools/list` | One tool descriptor, see below |
+| `tools/call` | `POST /execute/{id}`, the script as the body |
+| `ping` | Answered locally; it asks about this server, not the cluster |
 
-That last row is the one that earns the section. An agent that gets `timeout`
-can shorten its work; one that gets `memory_limit` can shrink its data; one
-that gets a bare `500` can only give up or retry forever. The fault taxonomy of
-§12 was built for a dashboard and turns out to be exactly what an agent needs
-to self-correct — surfacing it through MCP costs a match statement.
+#### One tool, not one per function
 
-**It belongs in a separate `nebula-mcp` crate, not in `nebula-control`.** The
-control plane owns routing, membership, and the registry; a protocol adapter
-that speaks to the outside world does not belong on the same node as the thing
-that must not fall over. This is the same boundary the architecture guard in
-`nebula-control/src/lib.rs` enforces for the compiler, applied one layer out.
+§22.2 scoped a per-function descriptor because `tools/list` needed something to
+return. §22.1 then landed, and the agent-facing surface collapsed to a single
+tool — `run_javascript(source, timeout_ms)` — because an agent sends source, it
+does not deploy a module per snippet. **That took §22.2 off the critical path
+entirely.** It is still wanted, for purpose-built wasm tools that are not "run
+this JavaScript"; it is no longer a prerequisite for anything.
+
+The descriptor is a constant. The `timeout_ms` argument exists because §11.1's
+50 ms default suits a web handler and starves an agent; this adapter asks for
+1 s and clamps at the gateway's 5 s ceiling. It clamps *before* the call as well
+as at the gateway, so the number quoted in a timeout message is the number that
+was actually applied — a schema is a suggestion to a model, not a constraint on
+it.
+
+#### Faults become instructions
+
+This is the row that earns the section, and it is where `X-Nebula-Fault` pays
+for itself. An agent that reads `timeout` can shorten its work; one that reads
+`memory_limit` can process less at a time; one that reads a bare `500` can only
+retry forever or give up.
+
+| Fault | What the model is told |
+|---|---|
+| `timeout` / `fuel_exhausted` | Ran past its budget — do less, or raise `timeout_ms` |
+| `memory_limit` | Hit the memory ceiling — process smaller pieces |
+| `unknown_function` / `unauthorized` | Server-side misconfiguration; **retrying will not help** |
+| `worker_shed` / `cluster_at_capacity` / `no_healthy_worker` | **Nothing ran**; retrying shortly is reasonable |
+| `worker_unreachable` | **May or may not have run** (§10.2); retry only if that is safe |
+| anything unrecognised | Named verbatim, with the detail, rather than diagnosed |
+
+The last two rows matter most. §10.2 refuses to retry a dispatched request
+because it may already have executed — a rule the agent one layer up will break
+unless it is told, and the wording is the only place it can be told until
+idempotency keys land (§22.4). And an adapter one version behind the fault
+taxonomy must pass an unknown fault through by name; inventing a diagnosis is
+worse than admitting ignorance.
+
+**A failed script is a `result` with `isError: true`, never a JSON-RPC error.**
+This is §11.2's rule one level further out. There, a guest trap is an `Outcome`
+inside a successful RPC rather than a gRPC status, because a tenant's infinite
+loop is not a transport failure. Here, the reason is sharper: a JSON-RPC error
+is handled by the client's plumbing and never reaches the model, so an error
+that the model could have corrected becomes one it never sees. JSON-RPC errors
+are reserved for the client's own mistakes — unknown method, unknown tool,
+missing `source`.
+
+Note where that puts an ordinary JavaScript exception: it is a `200` from the
+gateway (§22.1) and therefore *not* an error here at all. The model sees
+`Uncaught TypeError: ...` as tool output and fixes its code, which is exactly
+what it would do in a REPL.
+
+#### What it is not
+
+ponytail: Streamable HTTP only — `POST /mcp`, JSON responses, no SSE, no
+session ids, no batching. The spec permits answering with `application/json`
+rather than an event stream, and with no streaming results (§22.8 item 9) there
+is nothing to stream. Batching was removed from the protocol in the 2025-06-18
+revision, so its absence is compliance rather than a shortcut. Sessions become
+worth having when §22.5 does.
+
+**It carries no dependency on `nebula-control`.** It reaches the cluster over
+the HTTP gateway like any other client, which keeps a protocol adapter facing
+the open internet off the node that owns routing, membership and the registry —
+the same boundary the architecture guard enforces for the compiler, one layer
+out. The client is forty lines of `TcpStream`: every request sends
+`Connection: close`, so "read to EOF" is the whole response framing. The
+ceiling is one connection per tool call, which is nothing next to a sandboxed
+script, and the upgrade path is a pooled client.
+
+The one thing it does borrow is two header *names*. They are duplicated rather
+than imported, and a dev-dependency test asserts they still match the
+gateway's — duplication without a check is a bug with a delay on it.
+
+#### Before pointing it at anything untrusted
+
+An MCP endpoint is by construction the thing you hand to something that loops.
+Per-tenant rate limiting (§21, §22.8 item 7) is not optional once this is
+exposed, and v1 auth is still a static bearer token that doubles as the tenant
+id (§13). Both are known; neither is built.
 
 ### 22.4 Idempotency keys — because agent frameworks retry by default
 
@@ -1726,8 +1811,8 @@ refusal the guest can handle, not a trap.
 | # | Item | Unlocks | Cost | Verdict |
 |---|---|---|---|---|
 | 1 | **Interpreter guests** (§22.1) | Agents can use Nebula *at all* | One guest crate, plus stdin/stdout as the request channel | **Built.** Everything else was decoration without it |
-| 2 | **Tool metadata + `GET /tools`** (§22.2) | Discovery; prerequisite for MCP | A registry field and a version bump | Do |
-| 3 | **MCP server** (§22.3) | Any MCP client, no glue | A new thin crate | Do |
+| 2 | **Tool metadata + `GET /tools`** (§22.2) | Describing purpose-built wasm tools | A registry field and a version bump | Do — but §22.3 took it off the critical path |
+| 3 | **MCP server** (§22.3) | Any MCP client, no glue | A thin crate, no control-plane dependency | **Built.** The step where an off-the-shelf agent connects |
 | 4 | **Idempotency keys** (§22.4) | Safe retries; fixes the `502` trap | ~40 lines, one bounded map | Do — smallest payoff-to-effort ratio in the table |
 | 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse | Do |
 | 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | Do, and say plainly that it is best-effort |

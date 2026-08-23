@@ -1294,6 +1294,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nebula-mcp"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "nebula-control",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nebula-proto"
 version = "0.1.0"
 dependencies = [
