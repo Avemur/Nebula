@@ -796,3 +796,38 @@ async fn a_malformed_key_is_refused_rather_than_silently_dropped() {
     let response = cluster.post("echo", "acme", b"payload").await;
     assert_eq!(response.status, 200);
 }
+
+#[tokio::test]
+async fn a_client_that_disconnects_does_not_wedge_its_own_key() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("slow", SLOW).await;
+
+    // Send a keyed request and hang up before it can answer. This is the exact
+    // scenario the key exists for: the client lost the answer and will retry.
+    {
+        let mut stream = TcpStream::connect(&cluster.http_addr).await.unwrap();
+        let head = "POST /execute/slow HTTP/1.1\r\nHost: nebula\r\nConnection: close\r\n\
+                    Authorization: Bearer acme\r\nIdempotency-Key: dropped\r\n\
+                    X-Nebula-Deadline-Ms: 2000\r\nContent-Length: 0\r\n\r\n";
+        stream.write_all(head.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = stream.shutdown().await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The retry must run. A slot left claimed by a request nobody is waiting
+    // for would answer 409 for the whole TTL, which would make the key a
+    // liability in precisely the case it was added to serve.
+    let headers = [
+        ("Idempotency-Key", "dropped"),
+        ("X-Nebula-Deadline-Ms", "2000"),
+    ];
+    let retry = cluster.post_with("slow", "acme", &headers, b"").await;
+    assert_eq!(
+        retry.status, 200,
+        "a retry after a disconnect must run, not hit a wedged slot"
+    );
+}

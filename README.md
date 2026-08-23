@@ -1777,9 +1777,15 @@ the first is still running gets `409 idempotency_in_flight`.
 
 That is a refusal rather than an answer, because there is no answer yet: the
 first request has not finished. Telling the caller to wait is the only option
-that neither runs the script twice nor invents a result. An in-flight marker
-older than the TTL is reclaimed, so a gateway that died mid-request does not
-leave a slot poisoned.
+that neither runs the script twice nor invents a result.
+
+**A claim is a drop guard, and that is not a detail.** A client that hangs up
+mid-request has its handler future dropped, so the answer never arrives — and a
+slot left claimed answers `409` for the whole minute, to the very retry the key
+exists to serve. The first cut had exactly that bug; a test now pins it: hang up
+mid-request, retry with the same key, and the retry must run. As a backstop for
+the one case no guard covers — a gateway killed between the claim and the answer
+— an in-flight marker older than the TTL is reclaimed.
 
 #### The honest limit: this does not fix `502`
 
@@ -1803,12 +1809,23 @@ the key in `ExecuteRequest` and a second store on the data plane. Worth doing
 when a measured `502` rate makes it worth doing; not worth doing on the
 strength of an argument.
 
-ponytail: one `HashMap` behind a `Mutex`, capped at 10,000 entries with an O(n)
-expiry sweep that runs only when the map is full. A full store lets the request
-through *unkeyed* rather than rejecting it — losing replay protection under
-pressure is bad, refusing to run the caller's code is worse. The upgrade is a
-min-heap keyed by deadline, and it earns itself when the sweep shows up in a
-profile.
+#### Two caps, because one is not a bound
+
+The store is capped at **10,000 entries and 64 MiB**. The byte budget is not
+belt-and-braces: a response body is capped at 1 MiB (§7.2), so a count cap alone
+would let any client willing to send keys hold ten gigabytes of gateway memory
+for a minute. The first cut had only the count cap. An answer that does not fit
+the remaining budget is not stored and the retry re-runs — the guarantee that
+existed before the key, rather than letting one caller's large responses evict
+everyone else's.
+
+Hitting either cap makes the request run **unkeyed** rather than rejecting it:
+losing replay protection under pressure is bad, refusing to run the caller's
+code is worse.
+
+ponytail: one `HashMap` behind a `Mutex`, with an O(n) expiry sweep that runs
+only when a cap is reached. The upgrade is a min-heap keyed by deadline, and it
+earns itself when the sweep shows up in a profile.
 
 The key is not bound to the request body. Reusing one key with two different
 payloads returns the first answer, which is what an idempotency key *means*;

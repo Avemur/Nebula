@@ -408,11 +408,13 @@ async fn execute(
             "a request with this Idempotency-Key is already running",
         )
         .into_response(),
-        idempotency::Claim::Proceed => {
+        // The claim is a guard: if this future is dropped — a client that hung
+        // up mid-request, which is precisely the case the key exists for — the
+        // slot is released rather than left answering 409 until the TTL runs
+        // out.
+        idempotency::Claim::Proceed(claim) => {
             let answer = run(&gateway, &function_id, tenant, deadline_ms, body).await;
-            gateway
-                .idempotency
-                .finish(&slot, &answer, answer.replayable());
+            claim.finish(&answer, answer.replayable(), answer.weight());
             answer.into_response()
         }
     }
@@ -601,6 +603,15 @@ impl Answer {
             self.fault,
             None | Some("trap") | Some("timeout") | Some("fuel_exhausted") | Some("memory_limit")
         )
+    }
+
+    /// What this costs the idempotency store, for its byte budget.
+    ///
+    /// The body dominates and is capped at 1 MiB (§7.2); the constant is a
+    /// nod to the `Slot` strings and the map entry, so a flood of tiny answers
+    /// is still charged for something.
+    fn weight(&self) -> usize {
+        self.body.len() + 128
     }
 }
 
