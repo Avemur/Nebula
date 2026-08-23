@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Builds the heavy_init guest and its Wizer-preinitialized twin (README.md §4.3).
+# Builds the guests and their Wizer-preinitialized twins.
+#
+#   examples/heavy_init    — the §4.3 demonstration
+#   interpreters/js        — the JavaScript interpreter of §22.1
 #
 # Requires: rustup target add wasm32-wasip1
 #           cargo install wizer --all-features
@@ -26,3 +29,21 @@ wizer --allow-wasi --init-func _initialize \
   -o "$dist/initialized.wasm" "$dist/heavy_init.wasm"
 
 ls -l "$dist"
+
+# --- The JavaScript interpreter (§22.1) --------------------------------------
+#
+# Same recipe, and for a much better reason: an interpreter's boot *is* building
+# its realm — every intrinsic, before a line of user code runs. Un-wizened, this
+# guest would spend most of a tool call constructing `Object` and `JSON`.
+js="$here/interpreters/js"
+js_dist="$js/dist"
+
+mkdir -p "$js_dist"
+
+cargo build --release --target wasm32-wasip1 --manifest-path "$js/Cargo.toml"
+cp "$js/target/wasm32-wasip1/release/nebula_js.wasm" "$js_dist/nebula_js.wasm"
+
+wizer --allow-wasi --init-func _initialize \
+  -o "$js_dist/initialized.wasm" "$js_dist/nebula_js.wasm"
+
+ls -l "$js_dist"

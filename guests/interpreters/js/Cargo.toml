@@ -1,0 +1,20 @@
+[package]
+name = "nebula_js"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace on purpose: this builds for wasm32-wasip1, not the host,
+# so it must not be a member of the nebula workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# A pure-Rust engine, chosen over QuickJS for one reason: QuickJS is C, and
+# compiling C to wasm32-wasip1 needs wasi-sdk in the build path. This needs
+# nothing but the target rustup already installs.
+boa_engine = { version = "0.20", default-features = false }
+
+[profile.release]
+opt-level = 3

@@ -153,7 +153,7 @@ fn classify(result: wasmtime::Result<HostCtx>) -> ExecuteResponse {
     match result {
         Ok(ctx) => ExecuteResponse {
             outcome: Outcome::Ok as i32,
-            body: ctx.response,
+            body: ctx.output(),
             ..Default::default()
         },
         Err(err) => {

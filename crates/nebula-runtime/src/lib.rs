@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use wasmtime::{Engine, Linker, Result, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
-use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::WasiCtxBuilder;
 
 use crate::cache::Cache;
@@ -79,10 +79,16 @@ impl HostCtx {
         let stdout_pipe = MemoryOutputPipe::new(host::MAX_STDIO_BYTES);
         let stderr_pipe = MemoryOutputPipe::new(host::MAX_STDIO_BYTES);
 
-        // §7.1. The builder's defaults already give no preopens, no env, no
-        // args, and closed stdin; sockets are switched off explicitly rather
-        // than relying on "allowed but every address denied".
+        // §7.1. The builder's defaults already give no preopens, no env and no
+        // args; sockets are switched off explicitly rather than relying on
+        // "allowed but every address denied".
+        //
+        // stdin carries the request body. A guest that must survive Wizer can
+        // import nothing but WASI (R2), which rules out `nebula.request_read` —
+        // so the interpreter guests of §22.1 read their source from here. The
+        // clone is one memcpy of a body already capped at 1 MiB.
         let wasi = WasiCtxBuilder::new()
+            .stdin(MemoryInputPipe::new(request.clone()))
             .stdout(stdout_pipe.clone())
             .stderr(stderr_pipe.clone())
             .allow_tcp(false)
@@ -106,6 +112,22 @@ impl HostCtx {
     /// Bytes the guest wrote to WASI stdout. Captured, never inherited.
     pub fn stdout(&self) -> Vec<u8> {
         self.stdout_pipe.contents().to_vec()
+    }
+
+    /// The response body: what the guest wrote through `nebula.response_write`,
+    /// or its stdout when it wrote nothing there.
+    ///
+    /// The fallback exists for the same reason stdin carries the request: a
+    /// wizenable guest cannot import `nebula.response_write` (R2), so the
+    /// interpreter guests of §22.1 answer on stdout. It is a fallback rather
+    /// than a merge because two output channels that both land in the body
+    /// would interleave by flush order, which is not a contract anyone can use.
+    pub fn output(self) -> Vec<u8> {
+        if self.response.is_empty() {
+            self.stdout()
+        } else {
+            self.response
+        }
     }
 
     /// Bytes the guest wrote to WASI stderr.

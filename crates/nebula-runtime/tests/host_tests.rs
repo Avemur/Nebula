@@ -45,6 +45,80 @@ fn wasi_stdout_is_captured_not_inherited() {
     assert!(ctx.stderr().is_empty());
 }
 
+/// stdin carries the request body (§7.1).
+///
+/// This is the channel the interpreter guests of §22.1 depend on: a guest that
+/// must survive Wizer imports nothing but WASI, so it cannot call
+/// `nebula.request_read` and reads its source from here instead.
+#[test]
+fn wasi_stdin_carries_the_request_body() {
+    let ctx = run_as(
+        "wasi-stdin",
+        r#"
+        (module
+          (import "wasi_snapshot_preview1" "fd_read"
+            (func $fd_read (param i32 i32 i32 i32) (result i32)))
+          (import "nebula" "response_write"
+            (func $response_write (param i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "run")
+            (i32.store (i32.const 0) (i32.const 64))    ;; iovec.buf
+            (i32.store (i32.const 4) (i32.const 64))    ;; iovec.buf_len
+            (drop (call $fd_read
+              (i32.const 0)        ;; fd 0 = stdin
+              (i32.const 0)        ;; iovs
+              (i32.const 1)        ;; iovs_len
+              (i32.const 8)))      ;; nread
+            (drop (call $response_write
+              (i32.const 64)
+              (i32.load (i32.const 8))))))
+        "#,
+        b"source from stdin".to_vec(),
+    )
+    .expect("reading stdin is allowed");
+
+    assert_eq!(ctx.response, b"source from stdin");
+}
+
+/// A guest that answers on stdout gets stdout as its body; one that uses
+/// `response_write` gets that instead. Same reason as the test above — the
+/// wizenable guests have no `nebula.response_write` to call.
+#[test]
+fn the_response_body_falls_back_to_stdout_only_when_nothing_was_written() {
+    const PRINTER: &str = r#"
+        (module
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+          (import "nebula" "response_write"
+            (func $response_write (param i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 100) "on stdout")
+          (data (i32.const 200) "explicit")
+          (func $say (param $ptr i32) (param $len i32)
+            (i32.store (i32.const 0) (local.get $ptr))
+            (i32.store (i32.const 4) (local.get $len))
+            (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8))))
+          (func (export "run")
+            (call $say (i32.const 100) (i32.const 9)))
+          (func (export "both")
+            (call $say (i32.const 100) (i32.const 9))
+            (drop (call $response_write (i32.const 200) (i32.const 8)))))
+        "#;
+
+    let ctx = run_as("output-stdout", PRINTER, Vec::new()).expect("guest runs");
+    assert_eq!(ctx.output(), b"on stdout");
+
+    let ctx = common::runtime()
+        .execute(PRINTER.as_bytes(), "both", "output-explicit", Vec::new())
+        .expect("guest runs");
+    assert_eq!(
+        ctx.output(),
+        b"explicit",
+        "an explicit response must win; merging two channels would interleave \
+         by flush order, which is not a contract a caller can rely on"
+    );
+}
+
 #[test]
 fn wasi_exposes_no_preopened_directories() {
     // fd 3 is the first preopen slot. With no preopens configured,

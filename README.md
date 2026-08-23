@@ -28,6 +28,7 @@
 19. [Benchmark Methodology & Success Criteria](#19-benchmark-methodology--success-criteria)
 20. [Risks & Open Questions](#20-risks--open-questions)
 21. [Deferred Work](#21-deferred-work)
+22. [Agent Ecosystem Integration](#22-agent-ecosystem-integration)
 
 ---
 
@@ -444,7 +445,9 @@ WASI preview 1 via `wasmtime-wasi`, with a deliberately minimal `WasiCtx`:
 
 - **stdout / stderr:** captured to per-request in-memory buffers, surfaced as
   structured log fields. Never inherited from the host.
-- **stdin:** empty.
+- **stdin:** the request body. A guest that must survive Wizer imports
+  nothing but WASI (R2) and so cannot call `nebula.request_read`; the
+  interpreter guests of §22.1 read their source from here.
 - **Filesystem:** no preopened directories. Every path operation fails.
 - **Clocks:** coarse monotonic and wall clock. See §13 on timing.
 - **Random:** host CSPRNG.
@@ -476,6 +479,13 @@ you can believe one tenant cannot spell its way into another's namespace, and a
 tuple needs none. It exists to exercise host-call plumbing and memory
 translation, not to be a database. Guests must not assume a value written on one
 request is visible on the next.
+
+The response body is what the guest wrote through `response_write`, or its
+captured **stdout** when it wrote nothing there — the same reason stdin carries
+the request. It is a fallback rather than a merge because two channels landing
+in one body would interleave by flush order, which is not a contract a caller
+can use. stdout is capped at 64 KiB, so that is the ceiling on a stdout-answered
+response.
 
 Integer returns across the `nebula` namespace follow one convention: a
 non-negative count on success, `-1` on refusal. A refusal (store full, item
@@ -770,9 +780,13 @@ undo that.
 PUT  /functions/{function_id}      # deploy: body is the .wasm artifact
      -> 201 { "content_hash": "...", "wizened": bool }
      # no compile timing: compilation happens lazily on the worker, not here
-GET  /functions/{function_id}      # metadata
 GET  /healthz                      # gateway liveness
 GET  /cluster                      # node list, ring occupancy, per-node load
+
+# Designed, not built. Recorded rather than deleted because all three are
+# wanted and none is blocked -- they are simply not yet earned by a caller.
+GET  /functions/{function_id}      # metadata
+GET  /tools                        # tool descriptors for agent clients (§22.2)
 GET  /metrics                      # Prometheus exposition
 ```
 
@@ -1069,6 +1083,12 @@ against the sandbox in CI **from Phase 1 onward**. Each asserts a specific
 The determinism assertion is real: `fuel_burn.wat` must report the **identical**
 `fuel_used` across runs, or fuel is not delivering what it costs.
 
+**The corpus is hand-written `.wat`, and §22.1 opened a second front it does not
+cover.** An interpreter guest makes the *request body* attacker-authored source
+rather than the module, so hostility arrives as JavaScript: deep recursion,
+pathological regex, allocation storms in guest code. `interpreter_tests.rs`
+carries a first pair of these; a corpus of them belongs here.
+
 ### Other layers
 
 - **Unit** — ring distribution (chi-square across 10⁶ keys), ring failover and
@@ -1117,22 +1137,31 @@ algorithm (§9.1).
 ```
 nebula/
 ├── Cargo.toml                  # workspace
-├── DESIGN.md
-├── proto/
-│   └── nebula.proto
+├── README.md                   # this document
+├── proto/nebula.proto
 ├── crates/
-│   ├── nebula-proto/           # tonic-build output, isolated for build times
-│   ├── nebula-runtime/         # lib: engine, limits, host fns, cache, execute
-│   │   ├── src/{engine,limits,host,cache,exec,config}.rs
-│   │   └── tests/adversarial.rs
-│   ├── nebula-control/         # bin: gateway + scheduler + registry + membership
-│   │   └── src/{gateway,scheduler,ring,registry,membership}.rs
-│   ├── nebula-worker/          # bin: gRPC server wrapping nebula-runtime
-│   └── nebula-bench/           # bin: cold/hot latency harness (Phase 4)
+│   ├── nebula-proto/           # tonic-prost-build output, isolated for build times
+│   ├── nebula-runtime/         # lib: engine, limits, host fns, KV, cache, execute
+│   │   ├── src/{engine,host,kv,cache}.rs
+│   │   └── tests/{sandbox,host,cache,interpreter}_tests.rs, wizer_bench.rs
+│   ├── nebula-control/         # bin: gateway + ring + registry + membership + wizer
+│   │   └── src/{gateway,ring,registry,membership,server,wizer}.rs
+│   └── nebula-worker/          # bin: gRPC server wrapping nebula-runtime
+│       ├── src/{server,exec_pool,heartbeat}.rs
+│       └── tests/{mesh,gateway,scale}_tests.rs
 └── guests/
-    ├── adversarial/            # hostile .wat corpus (§15)
-    └── examples/               # echo, json-transform, heavy-init (wizer target)
+    ├── build.sh                # builds every guest and its wizened twin
+    ├── examples/heavy_init/    # the §4.3 pre-initialization demonstration
+    └── interpreters/js/        # the JavaScript interpreter of §22.1
 ```
+
+The hostile corpus of §15 is inline `.wat` inside the test files rather than a
+`guests/adversarial/` directory — a two-line module is more legible next to the
+assertion that explains it than in a file of its own.
+
+Guest crates are **standalone workspaces**, not workspace members: they build
+for `wasm32-wasip1`, and a member would be built for the host on every
+`cargo test`.
 
 `nebula-runtime` having no networking dependency is load-bearing: the sandbox
 tests and the benchmark harness both link it directly, so G1 and G3 can be
@@ -1339,6 +1368,8 @@ numbers clearing the bar is marketing.
    idea in the original spec and also the largest scope risk — they invert the
    "fresh instance per request" invariant that makes §13 easy to reason about.
    As written they are deferred. Overrideable.
+   Agent workloads are the demand that would otherwise force them; §22.5 argues
+   that demand is met by session *state* without pinning a live *instance*.
 2. **Is a static bearer token enough for v1 auth**, or should per-function
    signing keys land in Phase 3?
 3. **Is loopback-only benchmarking acceptable** for the headline numbers, or is
@@ -1398,5 +1429,317 @@ v1, they replace Phase 4 — they do not fit alongside it.
 | mTLS on internal gRPC | Before any deployment on an untrusted network |
 | Multi-instance control plane | When the SPOF matters more than the simplicity |
 | WASI preview 2 / component model | When guest toolchains emit components as reliably as p1 modules |
-| Outbound HTTP host function | When a guest needs it — it is the single largest new attack surface (SSRF, egress policy) and needs its own threat model |
-| Per-tenant rate limiting at the gateway | Before multi-tenant exposure to untrusted callers |
+| Outbound HTTP host function | When a guest needs it — the largest new attack surface (SSRF, egress policy). Agent workloads will ask; §22.7 sets the terms |
+| Per-tenant rate limiting at the gateway | Before multi-tenant exposure to untrusted callers — an agent in a retry loop is one (§22.8) |
+
+---
+
+## 22. Agent Ecosystem Integration
+
+Phases 1–4 built a **sandbox**. An LLM agent needs a **tool**, and the gap
+between those two words is this section.
+
+The gap is not sandboxing — that part is done and is the hard part. It is that
+an agent cannot use what it cannot discover, cannot target a runtime whose only
+input format is a compiled `wasm32-wasip1` artifact, and cannot recover from a
+failure it cannot name. §11.1's `X-Nebula-Fault` closed the third of those. The
+rest is scoped here.
+
+The ranking is the point: items 22.1–22.3 are what "works with agents" actually
+means, and the rest are sharp edges agent traffic will find in a system tuned
+for web handlers. **§22.1 is built** — the JavaScript interpreter guest ships,
+along with the stdin/stdout plumbing it needed. The rest is scoped, not
+written.
+
+### 22.1 Interpreter guests — the prerequisite for everything else
+
+**Status: built.** `guests/interpreters/js`, tested in
+`crates/nebula-runtime/tests/interpreter_tests.rs`. Its artifacts are *not*
+committed — 7 MiB each, and a rebuild writes a fresh pair — so build them with
+`bash guests/build.sh`; without them those tests skip with a pointer rather than
+failing.
+
+**An agent writes Python and JavaScript. It does not write Rust and it cannot
+run `cargo build --target wasm32-wasip1`.** The deploy path takes a compiled
+artifact, which means every agent-authored snippet would otherwise need a
+toolchain, a deploy round trip, a new `function_id`, and a cold start. That is
+the wrong shape by an order of magnitude.
+
+The right shape inverts it: **deploy the interpreter once, and make the agent's
+source code the request body.**
+
+| | Snippet-as-deployment | Snippet-as-payload |
+|---|---|---|
+| Per-snippet cost | Compile toolchain + `PUT` + cold start | One `POST`, hot path (§4.2) |
+| Registry growth | One entry per snippet, unbounded | Fixed: one entry per language |
+| Cache behaviour | Every snippet is a cache miss | Every snippet is a cache **hit** |
+| Agent-side glue | A build system | `requests.post(url, data=src)` |
+
+#### The interface
+
+The guest imports **nothing but WASI**, and that is a constraint rather than a
+preference: Wizer must instantiate the module to run `_initialize`, so every
+import has to be satisfiable at build time (R2). `nebula.request_read` and
+`nebula.response_write` are therefore unavailable to it. So:
+
+- **stdin** carries the source to evaluate (§7.1).
+- **stdout** carries the answer, and becomes the response body when the guest
+  wrote nothing through `response_write` (§7.2).
+
+`console.log` and friends are shimmed onto stdout, and values render through
+`JSON.stringify` with a `String` fallback — `[object Object]` tells an agent
+nothing. A script's completion value is printed when it is not `undefined`, so
+the smallest useful tool call is a bare expression.
+
+**An uncaught exception is a `200`, not a fault.** The sandbox did its job; the
+tenant's program ran and threw, and the text comes back exactly as `node -e`
+would print it, prefixed `Uncaught`. `X-Nebula-Fault` (§11.1) stays reserved for
+*Nebula* failing — a timeout, a memory ceiling, an unreachable worker — because
+those are the ones an agent must handle differently from "my code has a bug in
+it". This is the §11.2 rule about guest faults, one level further out.
+
+#### Why Boa, and what it costs
+
+The engine is [Boa](https://github.com/boa-dev/boa), a pure-Rust interpreter,
+chosen over QuickJS for one reason: QuickJS is C, and compiling C to
+`wasm32-wasip1` puts wasi-sdk in the build path. Boa needs nothing but the
+target `rustup` already installs.
+
+The bill for that convenience is **artifact size**, and size turns out to be
+the thing that matters. Measured on the development machine:
+
+| Module | Size | Instantiate + call |
+|---|---|---|
+| Trivial `.wat` | 30 B | 5 µs |
+| `heavy_init`, wizened | 425 KiB | 1.3 ms |
+| JS interpreter | 7 MiB | ~3.9 ms |
+
+Instantiation tracks artifact size, and a 7 MiB module costs ~4 ms before it
+evaluates a single character. That is 8% of the 50 ms default deadline and
+noise against the multi-second deadline an agent tool actually uses (§11.1) —
+so it is fine, and it is also the lever. A QuickJS build is roughly an order of
+magnitude smaller, and *that* is what would make a JS tool call faster.
+`instantiation_cost_tracks_artifact_size` pins the finding so the guidance can
+be re-checked rather than re-argued.
+
+#### Wizer: it works, and it buys almost nothing here
+
+This section previously claimed Wizer was what made interpreter guests viable —
+that an interpreter's boot is the §4.3 cost in its purest form. **That was a
+prediction, and the measurement contradicts it.** Recorded rather than quietly
+dropped:
+
+| | Median execution |
+|---|---|
+| Raw (`_initialize` runs per request) | ~3.9 ms |
+| Wizened (realm restored from the snapshot) | ~3.9 ms |
+
+The snapshot demonstrably takes — the wizened artifact no longer exports
+`_initialize`, and a `realm_probe` export reports the realm already built, which
+has no other possible cause. It simply does not help, for two compounding
+reasons: Boa constructs a realm in well under a millisecond, and the snapshot
+*adds* ~150 KiB to an artifact whose instantiation cost is dominated by size.
+The saving and the penalty are the same order of magnitude.
+
+Two consequences, and neither is "remove the initializer":
+
+1. **The guest keeps `_initialize`.** It is what makes the artifact correct
+   whether or not it was wizened, it costs nothing, and the control plane's
+   deploy pipeline wizens anything that exports it anyway. An interpreter whose
+   boot *is* expensive — CPython, whose startup genuinely is tens of
+   milliseconds — plugs into the same machinery unchanged.
+2. **§4.3's ~80× stands, and is narrower than it looked.** It was measured on a
+   guest built to have an expensive boot, and it is honest for that guest. Wizer
+   pays when boot is expensive relative to instantiation; here it is not.
+
+#### It is still a guest
+
+The interpreter parses attacker-authored source on every request, which makes
+the guest a compiler. This does not weaken the threat model — it is inside the
+same linear-memory ceiling (§6.3), the same epoch deadline (§6.1), and the same
+import allowlist as anything else, and
+`the_interpreter_is_bounded_by_the_same_ceilings_as_any_other_guest` asserts
+exactly that with a JS infinite loop and a JS allocation storm. Isolation is
+structural for the same reason it always was: the snapshot is mapped
+copy-on-write into a *fresh instance per request* (§4.2), so a script that
+writes to `globalThis` writes to its own private copy and it dies with the
+instance.
+
+What it does change is §15: the adversarial corpus is hand-written `.wat`, and
+interpreter-level hostility — deep recursion, pathological regex, allocation
+storms in guest source rather than in bytecode — is a different shape of input
+that deserves its own entries.
+
+#### Python is not built, and why
+
+CPython for `wasm32-wasip1` needs a preopened directory to find its standard
+library, and §7.1 grants no preopens. That is a real conflict rather than a
+missing afternoon: the fix is either to bundle the stdlib into the module or to
+give the guest a read-only in-memory filesystem, and both are their own piece of
+work with their own threat-model paragraph. Recorded here so the next person
+starts from the constraint instead of discovering it.
+
+### 22.2 Tool metadata — an agent cannot call what it cannot describe
+
+`PUT /functions/{id}` stores bytes. An agent loop needs a name, a description,
+and a JSON Schema for the arguments, because that is the payload every model
+provider's tool-calling API expects.
+
+This is a registry field, not a subsystem: extend `Deployments` (§11.1) with an
+optional per-function descriptor, bump `DEPLOYMENTS_VERSION`, and accept it on
+deploy. The existing on-disk versioning already refuses an unrecognised
+version rather than shrugging, so the migration is a version bump and nothing
+else.
+
+```
+PUT /functions/{id}
+  X-Nebula-Tool-Schema: <opt, JSON, <= 16 KiB>
+  ->  201 { "content_hash": "...", "wizened": bool, "described": bool }
+
+GET /tools
+  ->  200 [ { "name", "description", "input_schema" }, ... ]
+```
+
+`GET /tools` returns the array in the shape the Anthropic and OpenAI tool APIs
+already take, so wiring an agent is a paste rather than a translation layer.
+Schema *validation* stays out: the guest already has to defend against
+arbitrary bytes (§7.3), and a gateway that validates is a gateway that has an
+opinion about the guest's ABI.
+
+### 22.3 MCP — the actual interoperability standard
+
+The Model Context Protocol is how agent runtimes discover and call tools
+without bespoke glue per host. An MCP surface is the difference between "an
+HTTP API an agent could be taught to call" and "a tool server any MCP client
+already knows how to call."
+
+It is a thin adapter, not a new system — every MCP method maps onto something
+§11.1 already does:
+
+| MCP method | Nebula |
+|---|---|
+| `initialize` | Static capability advertisement |
+| `tools/list` | `GET /tools` (§22.2) |
+| `tools/call` | `POST /execute/{id}`, arguments as the body |
+| Error result | `X-Nebula-Fault` mapped to an MCP error, verbatim |
+
+That last row is the one that earns the section. An agent that gets `timeout`
+can shorten its work; one that gets `memory_limit` can shrink its data; one
+that gets a bare `500` can only give up or retry forever. The fault taxonomy of
+§12 was built for a dashboard and turns out to be exactly what an agent needs
+to self-correct — surfacing it through MCP costs a match statement.
+
+**It belongs in a separate `nebula-mcp` crate, not in `nebula-control`.** The
+control plane owns routing, membership, and the registry; a protocol adapter
+that speaks to the outside world does not belong on the same node as the thing
+that must not fall over. This is the same boundary the architecture guard in
+`nebula-control/src/lib.rs` enforces for the compiler, applied one layer out.
+
+### 22.4 Idempotency keys — because agent frameworks retry by default
+
+§10.2 refuses to retry a request that has already been dispatched, since the
+worker may have executed it before the connection failed. That is correct and
+it is also a trap: LangGraph, LlamaIndex, and every other agent framework
+retries failed tool calls automatically, so the guarantee holds inside Nebula
+and is then broken by the caller one layer up.
+
+An `Idempotency-Key` header plus a short-lived (`~60 s`) result cache at the
+gateway turns "may have executed" into a safe retry: a repeated key returns the
+stored response instead of dispatching again. Roughly forty lines and one
+bounded map, and it converts the most confusing failure mode in the system
+(`502`, which today means *you cannot know*) into an answer.
+
+It also unlocks the header §11.1 currently withholds — a `502` could then carry
+`Retry-After` for keyed requests, because the retry would be provably safe.
+
+### 22.5 Session continuity — the 80% of §21 that costs 5%
+
+Agents work in steps: define something in step one, use it in step two. The KV
+shim is explicit that this does not work — "guests must not assume a value
+written on one request is visible on the next" (§7.2) — because there is no
+guarantee the second request lands on the same worker.
+
+§21 solves this properly with actor pins and correctly defers it: live instance
+pinning needs ownership leases and fencing tokens, which is a consensus-shaped
+problem, not a routing tweak. **But the REPL pattern does not need a live
+instance. It needs the data to still be there.**
+
+That is a much smaller thing:
+
+| | Actor pins (§21) | Session state (here) |
+|---|---|---|
+| What survives a request | A live, instantiated `Store` | Bytes in the KV shim |
+| Routes by | `partition_key` through the ring | The same, already reserved |
+| Needs eviction policy change | Yes — pinned instances cannot be evicted | No |
+| Needs leases + fencing | Yes — two workers can both claim a key | **No** — a rebalance loses state, and losing state is a normal, recoverable outcome |
+| Breaks "fresh instance per request" (§4.2) | Yes | **No** |
+
+Concretely: route on `X-Nebula-Partition-Key` (already reserved in both the
+header and the proto), namespace the KV shim by `(tenant, session, key)`
+instead of `(tenant, key)`, and give session entries a TTL. Every §6 budget
+stays per-request, §13 stays as easy to reason about, and a ring rebalance
+degrades to a cold session rather than to a correctness bug.
+
+The honest limit: this is best-effort, not durable. It is right for a
+scratchpad and wrong for anything that must not be lost — and the design should
+say so in the response rather than let a caller discover it during a rebalance.
+
+### 22.6 Trace context — stitching Nebula's spans into the agent's trace
+
+§14 produces a real span tree, and today it is an island. An agent run is
+already traced end to end by LangSmith, Langfuse, or a plain OTel collector,
+and the interesting question is always "which step was slow" — which nobody can
+answer if the tool call is an opaque 800 ms gap in the parent trace.
+
+Accepting the W3C `traceparent` header and using it as the parent of the
+`request_received` span closes that gap. `tracing` already supports an explicit
+parent, and the worker already propagates a `Span` across the thread-pool
+boundary by hand (§14), so the plumbing exists — this only extends it one hop
+outward to the caller. It is a header parse and a span attribute, and it does
+not require the OpenTelemetry collector §14 deliberately avoids.
+
+### 22.7 Egress — the one every agent workload asks for, and the one to gate
+
+"Fetch this URL and summarise it" is the second thing anyone asks a code
+sandbox to do. §21 already defers an outbound HTTP host function on the grounds
+that it is the single largest new attack surface in the system, and agent
+demand does not change that analysis — it only guarantees the request will
+arrive.
+
+If it is built, the constraints are not negotiable and belong in §13 before any
+code:
+
+- A **per-tenant allowlist** of hosts. Not a denylist; a denylist of private
+  address ranges is a game of whack-a-mole against DNS rebinding.
+- Resolve first, then check the **resolved IP** against the allowlist and
+  against RFC 1918 / link-local / loopback. Checking the hostname alone is an
+  SSRF with extra steps.
+- **No redirect following.** A 302 to `169.254.169.254` is the entire attack.
+- Time spent in egress is **charged against the request deadline**, not added
+  to it. Otherwise the epoch deadline of §6.1 stops being a bound.
+
+The `-1`-on-refusal convention of §7.2 extends naturally: a blocked host is a
+refusal the guest can handle, not a trap.
+
+### 22.8 Ranked, with what each one costs
+
+| # | Item | Unlocks | Cost | Verdict |
+|---|---|---|---|---|
+| 1 | **Interpreter guests** (§22.1) | Agents can use Nebula *at all* | One guest crate, plus stdin/stdout as the request channel | **Built.** Everything else was decoration without it |
+| 2 | **Tool metadata + `GET /tools`** (§22.2) | Discovery; prerequisite for MCP | A registry field and a version bump | Do |
+| 3 | **MCP server** (§22.3) | Any MCP client, no glue | A new thin crate | Do |
+| 4 | **Idempotency keys** (§22.4) | Safe retries; fixes the `502` trap | ~40 lines, one bounded map | Do — smallest payoff-to-effort ratio in the table |
+| 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse | Do |
+| 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | Do, and say plainly that it is best-effort |
+| 7 | **Per-tenant rate limits** (§21) | Survival | A token bucket per tenant | Before any untrusted caller — an agent in a retry loop *is* a load test |
+| 8 | **Egress** (§22.7) | Network-using tools | Its own threat model | Gate behind §13 review, never ship it casually |
+| 9 | Streaming responses | Incremental output | Reworks `response_write` into a flushing channel | Defer — buffered output is correct, just less pretty |
+| 10 | Actor pins (§21) | True stateful sessions | Leases, fencing, eviction rework | Stays deferred; §22.5 covers the demand that would otherwise force it |
+
+**The thread running through 1–6: they are all adapters over things that already
+exist.** Wizer is built, the fault taxonomy is built, the span tree is built,
+`partition_key` is already reserved in both the header and the proto. That is
+not an accident of luck — it is what the reserved plumbing in §21 was for. The
+work here is exposure, not architecture, and the moment an item on this list
+requires changing §4.2's fresh-instance invariant or §6's per-request budgets,
+it has left this section and belongs in §21.
