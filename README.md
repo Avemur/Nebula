@@ -732,6 +732,7 @@ POST /execute/{function_id}
   Content-Type: application/octet-stream
   X-Nebula-Deadline-Ms: <opt, 10..5000, default 50>
   X-Nebula-Partition-Key: <opt, reserved for §21>
+  Idempotency-Key: <opt, 1..=255 bytes; replays an answer for 60s, §22.4>
   Body: <= 1 MiB
   ->  200 <response body>
       X-Nebula-Cold: true|false
@@ -765,7 +766,8 @@ apart. The header names the cause:
 | `unknown_function` | 404 | Nothing deployed under that id |
 | `module_not_found` | 404 | Deployed, but the artifact is missing from the registry |
 | `unauthorized` | 401 | Missing or malformed bearer token |
-| `invalid_deadline` / `invalid_request` | 400 | Caller's request is malformed |
+| `invalid_deadline` / `invalid_request` / `invalid_idempotency_key` | 400 | Caller's request is malformed |
+| `idempotency_in_flight` | 409 | A request with this `Idempotency-Key` is still running (§22.4) |
 | `no_healthy_worker` | 503 | The ring is empty |
 | `no_reachable_worker` | 503 | No candidate accepted a connection; nothing ran |
 | `cluster_at_capacity` / `worker_shed` | 503 | Admission control refused (§10.3) |
@@ -773,7 +775,9 @@ apart. The header names the cause:
 
 Every `503` carries `Retry-After`. `502` deliberately does not — §10.2 forbids
 retrying a request that may already have executed, and inviting a retry would
-undo that.
+undo that. An `Idempotency-Key` does **not** change this: the gateway never
+received an answer to replay, so the retry is exactly as unsafe as before
+(§22.4).
 
 ```
 
@@ -1145,7 +1149,7 @@ nebula/
 │   │   ├── src/{engine,host,kv,cache}.rs
 │   │   └── tests/{sandbox,host,cache,interpreter}_tests.rs, wizer_bench.rs
 │   ├── nebula-control/         # bin: gateway + ring + registry + membership + wizer
-│   │   └── src/{gateway,ring,registry,membership,server,wizer}.rs
+│   │   └── src/{gateway,ring,registry,membership,server,wizer,idempotency}.rs
 │   ├── nebula-worker/          # bin: gRPC server wrapping nebula-runtime
 │   │   ├── src/{server,exec_pool,heartbeat}.rs
 │   │   └── tests/{mesh,gateway,scale}_tests.rs
@@ -1450,9 +1454,9 @@ rest is scoped here.
 
 The ranking is the point: items 22.1–22.3 are what "works with agents" actually
 means, and the rest are sharp edges agent traffic will find in a system tuned
-for web handlers. **§22.1 and §22.3 are built** — the JavaScript interpreter
-guest and the MCP server, which together are the difference between a sandbox
-and a tool an agent can call. The rest is scoped, not written.
+for web handlers. **§22.1, §22.3 and §22.4 are built** — the JavaScript
+interpreter guest, the MCP server, and idempotency keys. The rest is scoped,
+not written.
 
 ### 22.1 Interpreter guests — the prerequisite for everything else
 
@@ -1672,8 +1676,11 @@ retry forever or give up.
 
 The last two rows matter most. §10.2 refuses to retry a dispatched request
 because it may already have executed — a rule the agent one layer up will break
-unless it is told, and the wording is the only place it can be told until
-idempotency keys land (§22.4). And an adapter one version behind the fault
+unless it is told, and the wording is the only place it can be told. §22.4 has
+since landed and does not help here: an `Idempotency-Key` protects a caller that
+retries *the same* keyed HTTP request, while an MCP client retries by issuing a
+fresh `tools/call` this adapter cannot recognise as a repeat. And an adapter one
+version behind the fault
 taxonomy must pass an unknown fault through by name; inventing a diagnosis is
 worse than admitting ignorance.
 
@@ -1722,20 +1729,91 @@ id (§13). Both are known; neither is built.
 
 ### 22.4 Idempotency keys — because agent frameworks retry by default
 
+**Status: built.** `crates/nebula-control/src/idempotency.rs`, with the
+end-to-end behaviour in `nebula-worker/tests/gateway_tests.rs`.
+
 §10.2 refuses to retry a request that has already been dispatched, since the
 worker may have executed it before the connection failed. That is correct and
 it is also a trap: LangGraph, LlamaIndex, and every other agent framework
 retries failed tool calls automatically, so the guarantee holds inside Nebula
 and is then broken by the caller one layer up.
 
-An `Idempotency-Key` header plus a short-lived (`~60 s`) result cache at the
-gateway turns "may have executed" into a safe retry: a repeated key returns the
-stored response instead of dispatching again. Roughly forty lines and one
-bounded map, and it converts the most confusing failure mode in the system
-(`502`, which today means *you cannot know*) into an answer.
+```
+POST /execute/{function_id}
+  Idempotency-Key: <opt, 1..=255 printable ASCII>
+  ->  200 <the original answer>
+      X-Nebula-Idempotent-Replay: true      # only on a replay
+  ->  409 X-Nebula-Fault: idempotency_in_flight
+  ->  400 X-Nebula-Fault: invalid_idempotency_key
+```
 
-It also unlocks the header §11.1 currently withholds — a `502` could then carry
-`Retry-After` for keyed requests, because the retry would be provably safe.
+An answer is held for **60 s**, keyed by `(tenant, function_id, key)`. A repeat
+inside that window returns the stored answer without invoking the guest at all,
+and says so with `X-Nebula-Idempotent-Replay` — a client should be able to tell
+"it ran again" from "it did not need to".
+
+**The tenant in that tuple is a security boundary, not a scoping convenience.**
+Without it, an `Idempotency-Key` is an oracle: send a plausible key and read
+whatever another tenant named the same thing. The function id is there for a
+duller reason — an agent reusing one key across two tools should get two
+entries rather than one wrong answer.
+
+#### What replays, and what deliberately does not
+
+| Outcome | Stored? | Why |
+|---|---|---|
+| `200`, and guest faults (`trap`, `timeout`, `memory_limit`, `fuel_exhausted`) | **Yes** | The script ran and produced this. Running it again produces it again — and a retrying client should not re-execute every failing script. |
+| `503` (`no_healthy_worker`, `worker_shed`, `cluster_at_capacity`) | No | Nothing ran. Storing it would pin a transient failure for the whole TTL and make the key *worse* than not sending one. |
+| `502 worker_unreachable` | No | There is no answer to store. See below. |
+| `4xx` client errors | No | The request never became work. |
+
+#### A claim is written before dispatch, not after
+
+Two identical requests arriving at once would both miss a store that only
+records completions, both execute, and both write — an idempotency key that
+permits exactly the double execution it was sent to prevent. So the slot is
+claimed *before* the request is dispatched, and a duplicate that arrives while
+the first is still running gets `409 idempotency_in_flight`.
+
+That is a refusal rather than an answer, because there is no answer yet: the
+first request has not finished. Telling the caller to wait is the only option
+that neither runs the script twice nor invents a result. An in-flight marker
+older than the TTL is reclaimed, so a gateway that died mid-request does not
+leave a slot poisoned.
+
+#### The honest limit: this does not fix `502`
+
+An earlier draft of this section claimed a key would let `502` carry
+`Retry-After`, "because the retry would be provably safe". **That is wrong and
+is retracted.** A `502` means the request reached a worker and then the
+connection failed — the gateway never received a result, so it has nothing to
+store and nothing to replay. A retry is exactly as unsafe as it was before, and
+`502` still carries no `Retry-After` (§11.1).
+
+What the key actually covers is the loss the gateway *can* see:
+
+| Where the answer was lost | Covered? |
+|---|---|
+| Between client and gateway — client timeout, dropped connection, agent framework retry | **Yes.** The gateway completed the work and stored it; the retry gets it back. |
+| Between gateway and worker (`502`) | No. Nobody has the answer. |
+
+The first row is the common case and the one agent frameworks actually
+generate. The second needs the *worker* to dedupe by key, which means carrying
+the key in `ExecuteRequest` and a second store on the data plane. Worth doing
+when a measured `502` rate makes it worth doing; not worth doing on the
+strength of an argument.
+
+ponytail: one `HashMap` behind a `Mutex`, capped at 10,000 entries with an O(n)
+expiry sweep that runs only when the map is full. A full store lets the request
+through *unkeyed* rather than rejecting it — losing replay protection under
+pressure is bad, refusing to run the caller's code is worse. The upgrade is a
+min-heap keyed by deadline, and it earns itself when the sweep shows up in a
+profile.
+
+The key is not bound to the request body. Reusing one key with two different
+payloads returns the first answer, which is what an idempotency key *means*;
+detecting the mismatch and reporting it (as Stripe does) needs a body hash and
+buys a better error message rather than a better guarantee.
 
 ### 22.5 Session continuity — the 80% of §21 that costs 5%
 
@@ -1813,7 +1891,7 @@ refusal the guest can handle, not a trap.
 | 1 | **Interpreter guests** (§22.1) | Agents can use Nebula *at all* | One guest crate, plus stdin/stdout as the request channel | **Built.** Everything else was decoration without it |
 | 2 | **Tool metadata + `GET /tools`** (§22.2) | Describing purpose-built wasm tools | A registry field and a version bump | Do — but §22.3 took it off the critical path |
 | 3 | **MCP server** (§22.3) | Any MCP client, no glue | A thin crate, no control-plane dependency | **Built.** The step where an off-the-shelf agent connects |
-| 4 | **Idempotency keys** (§22.4) | Safe retries; fixes the `502` trap | ~40 lines, one bounded map | Do — smallest payoff-to-effort ratio in the table |
+| 4 | **Idempotency keys** (§22.4) | Safe retries when the *client* lost the answer | One bounded map | **Built.** It does not fix `502` — §22.4 retracts that claim |
 | 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse | Do |
 | 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | Do, and say plainly that it is best-effort |
 | 7 | **Per-tenant rate limits** (§21) | Survival | A token bucket per tenant | Before any untrusted caller — an agent in a retry loop *is* a load test |

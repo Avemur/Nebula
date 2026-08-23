@@ -8,6 +8,7 @@
 //! the HTTP gateway of §11.1 that clients speak.
 
 pub mod gateway;
+pub mod idempotency;
 pub mod membership;
 pub mod registry;
 pub mod ring;

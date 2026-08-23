@@ -603,3 +603,196 @@ async fn a_paused_worker_leaves_the_ring_after_the_liveness_timeout() {
     let response = cluster.post("echo", "acme", b"after the pause").await;
     assert_eq!(response.status, 503);
 }
+
+// ---------------------------------------------------------------------------
+// Idempotency keys (§22.4)
+// ---------------------------------------------------------------------------
+
+/// A guest that counts its executions in the KV shim and answers with the
+/// count. Anything that runs twice says so.
+const COUNTER: &str = r#"
+    (module
+      (import "nebula" "kv_get" (func $get (param i32 i32 i32 i32) (result i32)))
+      (import "nebula" "kv_set" (func $set (param i32 i32 i32 i32) (result i32)))
+      (import "nebula" "response_write" (func $write (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 0) "n")
+      (data (i32.const 16) "1")
+      (data (i32.const 32) "2")
+      (func (export "run")
+        (if (i32.eq (call $get (i32.const 0) (i32.const 1) (i32.const 256) (i32.const 16))
+                    (i32.const -1))
+          (then
+            (drop (call $set (i32.const 0) (i32.const 1) (i32.const 16) (i32.const 1)))
+            (drop (call $write (i32.const 16) (i32.const 1))))
+          (else
+            (drop (call $write (i32.const 32) (i32.const 1)))))))
+    "#;
+
+#[tokio::test]
+async fn a_repeated_key_replays_instead_of_running_again() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("counter", COUNTER).await;
+
+    let key = [("Idempotency-Key", "call-1")];
+    let first = cluster.post_with("counter", "acme", &key, b"").await;
+    assert_eq!(first.status, 200);
+    assert_eq!(first.text(), "1", "the first call must actually run");
+    assert!(first.header("x-nebula-idempotent-replay").is_none());
+
+    // The whole point: the guest is *not* invoked a second time. Without the
+    // store this would answer "2", because the KV entry from the first run is
+    // still there — which is exactly the double execution §10.2 warns about
+    // and every agent framework causes by retrying.
+    let second = cluster.post_with("counter", "acme", &key, b"").await;
+    assert_eq!(second.status, 200);
+    assert_eq!(
+        second.text(),
+        "1",
+        "a repeated key must not re-run the guest"
+    );
+    assert_eq!(second.header("x-nebula-idempotent-replay"), Some("true"));
+
+    // A different key is a different request.
+    let other = [("Idempotency-Key", "call-2")];
+    let third = cluster.post_with("counter", "acme", &other, b"").await;
+    assert_eq!(third.text(), "2", "a fresh key must run the guest again");
+}
+
+#[tokio::test]
+async fn a_replay_reproduces_the_original_answer_exactly() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+    cluster.publish("trapper", TRAPPER).await;
+
+    // A guest fault replays too: the script ran and produced this outcome, so
+    // running it again would produce the same one. Not replaying it would mean
+    // a retrying client re-executes every failing script.
+    let key = [("Idempotency-Key", "fault-1")];
+    let first = cluster.post_with("trapper", "acme", &key, b"").await;
+    assert_eq!(first.status, 500);
+    assert_eq!(first.header("x-nebula-fault"), Some("trap"));
+
+    let second = cluster.post_with("trapper", "acme", &key, b"").await;
+    assert_eq!(second.status, first.status);
+    assert_eq!(second.text(), first.text());
+    assert_eq!(second.header("x-nebula-fault"), Some("trap"));
+    assert_eq!(second.header("x-nebula-idempotent-replay"), Some("true"));
+
+    // Informational headers come back as recorded rather than regenerated: a
+    // replay that reported a fresh `cold` or a new exec time would be
+    // reporting a measurement of something that never happened.
+    let key = [("Idempotency-Key", "echo-1")];
+    let first = cluster.post_with("echo", "acme", &key, b"payload").await;
+    let second = cluster.post_with("echo", "acme", &key, b"payload").await;
+    assert_eq!(second.text(), "payload");
+    assert_eq!(
+        second.header("x-nebula-exec-micros"),
+        first.header("x-nebula-exec-micros")
+    );
+    assert_eq!(
+        second.header("x-nebula-cold"),
+        first.header("x-nebula-cold")
+    );
+}
+
+#[tokio::test]
+async fn one_tenants_key_cannot_read_anothers_answer() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    // Not a nicety. Without the tenant in the slot, an `Idempotency-Key` is an
+    // oracle for whatever another tenant happened to name the same thing —
+    // which would make this feature a cross-tenant read primitive.
+    let key = [("Idempotency-Key", "shared-name")];
+    let acme = cluster
+        .post_with("echo", "acme", &key, b"acme secret")
+        .await;
+    assert_eq!(acme.text(), "acme secret");
+
+    let other = cluster
+        .post_with("echo", "globex", &key, b"globex data")
+        .await;
+    assert_eq!(other.text(), "globex data");
+    assert!(
+        other.header("x-nebula-idempotent-replay").is_none(),
+        "a second tenant must never be served the first tenant's answer"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_that_never_ran_leaves_the_key_free_for_a_real_retry() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.publish("echo", ECHO).await;
+
+    // No workers yet: nothing ran, so there is no answer worth keeping.
+    let key = [("Idempotency-Key", "retry-me")];
+    let first = cluster.post_with("echo", "acme", &key, b"payload").await;
+    assert_eq!(first.status, 503);
+    assert_eq!(first.header("x-nebula-fault"), Some("no_healthy_worker"));
+
+    // Storing that 503 would pin a transient failure for the whole TTL and
+    // make the key actively worse than not sending one.
+    cluster.add_worker(2, 4).await;
+    let second = cluster.post_with("echo", "acme", &key, b"payload").await;
+    assert_eq!(second.status, 200);
+    assert_eq!(second.text(), "payload");
+    assert!(second.header("x-nebula-idempotent-replay").is_none());
+}
+
+#[tokio::test]
+async fn a_duplicate_arriving_mid_flight_is_refused_rather_than_run() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("slow", SLOW).await;
+
+    // SLOW runs ~100 ms; both requests are keyed the same and overlap. Serving
+    // the second by running it would be the exact double execution the key was
+    // sent to prevent, and there is no stored answer to replay yet.
+    let headers = [
+        ("Idempotency-Key", "concurrent"),
+        ("X-Nebula-Deadline-Ms", "2000"),
+    ];
+    let first = cluster.post_with("slow", "acme", &headers, b"");
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cluster.post_with("slow", "acme", &headers, b"").await
+    };
+    let (first, second) = tokio::join!(first, second);
+
+    assert_eq!(first.status, 200);
+    assert_eq!(second.status, 409);
+    assert_eq!(
+        second.header("x-nebula-fault"),
+        Some("idempotency_in_flight")
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_key_is_refused_rather_than_silently_dropped() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    // A client that sent a key meant to be protected. Ignoring the header and
+    // running unkeyed is the worst of the three options: it looks like it
+    // worked and silently removes the guarantee that was asked for.
+    let long = "k".repeat(300);
+    for bad in ["", "   ", long.as_str()] {
+        let response = cluster
+            .post_with("echo", "acme", &[("Idempotency-Key", bad)], b"payload")
+            .await;
+        assert_eq!(response.status, 400, "key {bad:?} should be refused");
+        assert_eq!(
+            response.header("x-nebula-fault"),
+            Some("invalid_idempotency_key")
+        );
+    }
+
+    // And an unkeyed request is entirely unaffected.
+    let response = cluster.post("echo", "acme", b"payload").await;
+    assert_eq!(response.status, 200);
+}

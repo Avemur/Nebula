@@ -18,6 +18,7 @@ use nebula_proto::{ExecuteRequest, ExecuteResponse, Outcome};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Code;
 
+use crate::idempotency;
 use crate::membership::Membership;
 use crate::registry::{Deployments, Registry, MAX_ARTIFACT_BYTES};
 use crate::wizer;
@@ -43,6 +44,16 @@ pub const DEADLINE_HEADER: &str = "x-nebula-deadline-ms";
 /// worker" and "worker shed", 500 is both a guest trap and a memory ceiling. A
 /// client branching on the status cannot tell them apart; this names the reason.
 pub const FAULT_HEADER: &str = "x-nebula-fault";
+
+/// Opt-in replay of an already-answered request (§22.4).
+///
+/// Present because agent frameworks retry automatically, which quietly breaks
+/// the §10.2 rule against retrying a dispatched request.
+pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
+
+/// Set when a response came from the idempotency store rather than a fresh
+/// execution, so a caller can tell "it ran again" from "it did not need to".
+pub const REPLAY_HEADER: &str = "x-nebula-idempotent-replay";
 
 /// §6.4's default, used when the caller does not ask.
 const DEFAULT_DEADLINE_MS: u32 = 50;
@@ -71,6 +82,8 @@ pub struct Gateway {
     /// implementable: a failure from `connect` proves the request was never
     /// sent, while a failure from a live channel proves nothing.
     workers: Mutex<HashMap<String, NebulaWorkerClient<Channel>>>,
+    /// Answers to already-served keyed requests (§22.4).
+    idempotency: idempotency::Store<Answer>,
 }
 
 /// The result of a successful deploy.
@@ -123,6 +136,7 @@ impl Gateway {
             registry,
             functions: Mutex::new(functions),
             workers: Mutex::new(HashMap::new()),
+            idempotency: idempotency::Store::new(),
         })
     }
 
@@ -294,7 +308,7 @@ async fn publish(
     body: Bytes,
 ) -> Response {
     if tenant_of(&headers).is_none() {
-        return unauthorized();
+        return unauthorized().into_response();
     }
     match gateway.publish(&function_id, &body).await {
         Ok(published) => (
@@ -337,7 +351,7 @@ async fn execute(
     body: Bytes,
 ) -> Response {
     let Some(tenant) = tenant_of(&headers) else {
-        return unauthorized();
+        return unauthorized().into_response();
     };
     tracing::Span::current().record("tenant", tenant.as_str());
 
@@ -346,11 +360,72 @@ async fn execute(
             StatusCode::BAD_REQUEST,
             "invalid_deadline",
             format!("{DEADLINE_HEADER} must be a whole number of milliseconds"),
-        );
+        )
+        .into_response();
     };
     tracing::Span::current().record("deadline_ms", deadline_ms);
 
-    let Some(content_hash) = gateway.content_hash_of(&function_id) else {
+    // Unkeyed is the common path and stays exactly as it was.
+    let key = match idempotency_key_of(&headers) {
+        None => {
+            return run(&gateway, &function_id, tenant, deadline_ms, body)
+                .await
+                .into_response()
+        }
+        Some(Err(())) => {
+            return fault(
+                StatusCode::BAD_REQUEST,
+                "invalid_idempotency_key",
+                format!(
+                    "{IDEMPOTENCY_HEADER} must be 1..={} printable ASCII bytes",
+                    idempotency::MAX_KEY_BYTES
+                ),
+            )
+            .into_response()
+        }
+        Some(Ok(key)) => key,
+    };
+
+    let slot = idempotency::Slot {
+        tenant: tenant.clone(),
+        function_id: function_id.clone(),
+        key,
+    };
+
+    match gateway.idempotency.claim(&slot) {
+        idempotency::Claim::Replay(mut answer) => {
+            tracing::info!(status = answer.status.as_u16(), "replayed a keyed request");
+            answer.replayed = true;
+            answer.into_response()
+        }
+        // §22.4: a duplicate arriving while the first is still running is told
+        // to wait, not served a second execution. Returning the *original*
+        // request's answer is impossible — it does not exist yet — and running
+        // the script again is the exact thing the key was sent to prevent.
+        idempotency::Claim::InFlight => fault(
+            StatusCode::CONFLICT,
+            "idempotency_in_flight",
+            "a request with this Idempotency-Key is already running",
+        )
+        .into_response(),
+        idempotency::Claim::Proceed => {
+            let answer = run(&gateway, &function_id, tenant, deadline_ms, body).await;
+            gateway
+                .idempotency
+                .finish(&slot, &answer, answer.replayable());
+            answer.into_response()
+        }
+    }
+}
+
+async fn run(
+    gateway: &Gateway,
+    function_id: &str,
+    tenant: String,
+    deadline_ms: u32,
+    body: Bytes,
+) -> Answer {
+    let Some(content_hash) = gateway.content_hash_of(function_id) else {
         return fault(
             StatusCode::NOT_FOUND,
             "unknown_function",
@@ -361,7 +436,7 @@ async fn execute(
     // Bounded-load ordering (§9.2): the ring's owner leads unless it is above
     // 1.25x mean cluster load, in which case the walk starts at the next node.
     // The rest of the plan stays in ring order, so failover is unchanged.
-    let plan = gateway.membership.route_plan(&function_id);
+    let plan = gateway.membership.route_plan(function_id);
     if plan.is_empty() {
         return fault(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -371,7 +446,7 @@ async fn execute(
     }
 
     let request = ExecuteRequest {
-        function_id: function_id.clone(),
+        function_id: function_id.to_string(),
         content_hash,
         body: body.to_vec(),
         request_id: format!("{function_id}-{}", plan.len()),
@@ -414,42 +489,59 @@ async fn execute(
     }
 }
 
-fn to_http(response: ExecuteResponse, deadline_ms: u32) -> Response {
+fn to_http(response: ExecuteResponse, deadline_ms: u32) -> Answer {
     let outcome = Outcome::try_from(response.outcome).unwrap_or(Outcome::Internal);
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-nebula-cold",
-        HeaderValue::from_static(if response.cold { "true" } else { "false" }),
-    );
-    if let Ok(value) = HeaderValue::from_str(&response.exec_micros.to_string()) {
-        headers.insert("x-nebula-exec-micros", value);
-    }
-    // The *effective* budget, after clamping. A caller that asked for 60 s and
-    // silently got 5 s would otherwise read a `timeout` fault as a bug.
-    if let Ok(value) = HeaderValue::from_str(&deadline_ms.to_string()) {
-        headers.insert(DEADLINE_HEADER, value);
-    }
 
     // §12. Guest fault detail goes back to the caller — it is their code. The
     // `Internal` arm carries none, because the worker withheld it deliberately.
-    let (status, kind) = match outcome {
-        Outcome::Ok => {
-            return (StatusCode::OK, headers, response.body).into_response();
-        }
-        Outcome::Trap => (StatusCode::INTERNAL_SERVER_ERROR, "trap"),
-        Outcome::Timeout => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
-        Outcome::FuelExhausted => (StatusCode::GATEWAY_TIMEOUT, "fuel_exhausted"),
-        Outcome::MemoryLimit => (StatusCode::INTERNAL_SERVER_ERROR, "memory_limit"),
-        Outcome::ModuleNotFound => (StatusCode::NOT_FOUND, "module_not_found"),
-        Outcome::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    let (status, fault, body) = match outcome {
+        Outcome::Ok => (StatusCode::OK, None, response.body),
+        Outcome::Trap => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some("trap"),
+            response.fault_detail.into_bytes(),
+        ),
+        Outcome::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Some("timeout"),
+            response.fault_detail.into_bytes(),
+        ),
+        Outcome::FuelExhausted => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Some("fuel_exhausted"),
+            response.fault_detail.into_bytes(),
+        ),
+        Outcome::MemoryLimit => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some("memory_limit"),
+            response.fault_detail.into_bytes(),
+        ),
+        Outcome::ModuleNotFound => (
+            StatusCode::NOT_FOUND,
+            Some("module_not_found"),
+            response.fault_detail.into_bytes(),
+        ),
+        Outcome::Internal => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some("internal"),
+            response.fault_detail.into_bytes(),
+        ),
     };
 
-    headers.insert(FAULT_HEADER, HeaderValue::from_static(kind));
-    (status, headers, response.fault_detail).into_response()
+    Answer {
+        status,
+        fault,
+        body,
+        cold: Some(response.cold),
+        exec_micros: Some(response.exec_micros),
+        // The *effective* budget, after clamping. A caller that asked for 60 s
+        // and silently got 5 s would otherwise read a `timeout` fault as a bug.
+        deadline_ms: Some(deadline_ms),
+        replayed: false,
+    }
 }
 
-fn from_status(status: &tonic::Status) -> Response {
+fn from_status(status: &tonic::Status) -> Answer {
     match status.code() {
         Code::ResourceExhausted => fault(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -476,29 +568,118 @@ fn from_status(status: &tonic::Status) -> Response {
     }
 }
 
-/// A non-200 response that names its own cause.
+/// A finished answer, in a form that can be stored and replayed (§22.4).
 ///
-/// `Retry-After` rides along with 503 because that status *means* "try again" —
-/// not a special case, just the definition.
-fn fault(status: StatusCode, kind: &'static str, detail: impl Into<String>) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(FAULT_HEADER, HeaderValue::from_static(kind));
-    if status == StatusCode::SERVICE_UNAVAILABLE {
-        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-    }
-    (status, headers, detail.into()).into_response()
+/// The handler builds one of these rather than a `Response` directly, because
+/// an `axum::Response` body is a stream and cannot be cloned into the
+/// idempotency store. Everything the caller sees is here, so a replay is
+/// byte-identical to the original rather than a reconstruction of it.
+#[derive(Clone, Debug)]
+pub struct Answer {
+    status: StatusCode,
+    /// `None` on success; every non-200 names its cause (§11.1).
+    fault: Option<&'static str>,
+    body: Vec<u8>,
+    /// Informational headers, carried so a replay reports the same numbers the
+    /// original did rather than a fresh, misleading set.
+    cold: Option<bool>,
+    exec_micros: Option<u64>,
+    deadline_ms: Option<u32>,
+    /// Set on a replay so a caller can tell one from a fresh execution.
+    replayed: bool,
 }
 
-fn unauthorized() -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(FAULT_HEADER, HeaderValue::from_static("unauthorized"));
-    headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-    (
+impl Answer {
+    /// Whether a retry with the same key should receive this verbatim (§22.4).
+    ///
+    /// A completed execution is replayable whether it succeeded or the guest
+    /// faulted — the script ran, and running it again would produce the same
+    /// thing. Everything else means "no answer exists", and storing it would
+    /// pin a transient failure for the whole TTL.
+    fn replayable(&self) -> bool {
+        matches!(
+            self.fault,
+            None | Some("trap") | Some("timeout") | Some("fuel_exhausted") | Some("memory_limit")
+        )
+    }
+}
+
+impl IntoResponse for Answer {
+    fn into_response(self) -> Response {
+        let mut headers = HeaderMap::new();
+        if let Some(kind) = self.fault {
+            headers.insert(FAULT_HEADER, HeaderValue::from_static(kind));
+        }
+        // `Retry-After` rides along with 503 because that status *means* "try
+        // again" — not a special case, just the definition. 502 still does not
+        // get one: §22.4 explains why a key does not make that safe either.
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        if self.status == StatusCode::UNAUTHORIZED {
+            headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        if let Some(cold) = self.cold {
+            headers.insert(
+                "x-nebula-cold",
+                HeaderValue::from_static(if cold { "true" } else { "false" }),
+            );
+        }
+        if let Some(value) = self
+            .exec_micros
+            .and_then(|n| HeaderValue::from_str(&n.to_string()).ok())
+        {
+            headers.insert("x-nebula-exec-micros", value);
+        }
+        if let Some(value) = self
+            .deadline_ms
+            .and_then(|n| HeaderValue::from_str(&n.to_string()).ok())
+        {
+            headers.insert(DEADLINE_HEADER, value);
+        }
+        if self.replayed {
+            headers.insert(REPLAY_HEADER, HeaderValue::from_static("true"));
+        }
+
+        (self.status, headers, self.body).into_response()
+    }
+}
+
+/// A non-200 answer that names its own cause.
+fn fault(status: StatusCode, kind: &'static str, detail: impl Into<String>) -> Answer {
+    Answer {
+        status,
+        fault: Some(kind),
+        body: detail.into().into_bytes(),
+        cold: None,
+        exec_micros: None,
+        deadline_ms: None,
+        replayed: false,
+    }
+}
+
+fn unauthorized() -> Answer {
+    fault(
         StatusCode::UNAUTHORIZED,
-        headers,
+        "unauthorized",
         "missing or malformed bearer token",
     )
-        .into_response()
+}
+
+/// Reads `Idempotency-Key`.
+///
+/// `None` means absent — the request runs unkeyed. An over-long or non-ASCII
+/// key is `Some(Err)`: a client that sent one meant to be protected, and
+/// silently dropping the protection is the worst of the three options.
+#[allow(clippy::result_unit_err)]
+fn idempotency_key_of(headers: &HeaderMap) -> Option<Result<String, ()>> {
+    let raw = headers.get(IDEMPOTENCY_HEADER)?;
+    Some(match raw.to_str() {
+        Ok(key) if !key.trim().is_empty() && key.len() <= idempotency::MAX_KEY_BYTES => {
+            Ok(key.trim().to_string())
+        }
+        _ => Err(()),
+    })
 }
 
 /// Reads [`DEADLINE_HEADER`], clamped to `[MIN_DEADLINE_MS, MAX_DEADLINE_MS]`.
