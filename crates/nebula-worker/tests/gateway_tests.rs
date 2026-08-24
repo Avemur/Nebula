@@ -1134,3 +1134,169 @@ async fn a_rate_limited_request_still_reports_its_trace() {
     assert_eq!(refused.status, 429);
     assert_eq!(refused.header("x-nebula-trace-id"), Some(CALLER_TRACE_ID));
 }
+
+// ---------------------------------------------------------------------------
+// Session continuity (§22.5)
+// ---------------------------------------------------------------------------
+
+/// Appends the request body to a session-scoped key and answers with the whole
+/// accumulated value. A guest with no memory of its own would only ever say
+/// what it was just sent.
+const NOTEPAD: &str = r#"
+    (module
+      (import "nebula" "request_len" (func $len (result i32)))
+      (import "nebula" "request_read" (func $read (param i32 i32) (result i32)))
+      (import "nebula" "kv_get" (func $get (param i32 i32 i32 i32) (result i32)))
+      (import "nebula" "kv_set" (func $set (param i32 i32 i32 i32) (result i32)))
+      (import "nebula" "response_write" (func $write (param i32 i32) (result i32)))
+      (memory (export "memory") 4)
+      (data (i32.const 0) "notes")
+      (func (export "run")
+        (local $held i32)
+        (local $added i32)
+        ;; Existing value into 1024, its length into $held (-1 becomes 0).
+        (local.set $held
+          (call $get (i32.const 0) (i32.const 5) (i32.const 1024) (i32.const 4096)))
+        (if (i32.lt_s (local.get $held) (i32.const 0))
+          (then (local.set $held (i32.const 0))))
+        ;; Request body appended straight after it.
+        (local.set $added (call $len))
+        (drop (call $read (i32.add (i32.const 1024) (local.get $held)) (local.get $added)))
+        (local.set $held (i32.add (local.get $held) (local.get $added)))
+        (drop (call $set (i32.const 0) (i32.const 5) (i32.const 1024) (local.get $held)))
+        (drop (call $write (i32.const 1024) (local.get $held)))))
+    "#;
+
+#[tokio::test]
+async fn a_session_carries_state_from_one_request_to_the_next() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    // Several workers, so sticky routing has something to get wrong: without
+    // it the second request lands wherever the ring sends it and the notepad
+    // is empty.
+    for _ in 0..3 {
+        cluster.add_worker(2, 4).await;
+    }
+    cluster.publish("notepad", NOTEPAD).await;
+
+    let session = [("X-Nebula-Partition-Key", "chat-1")];
+    assert_eq!(
+        cluster
+            .post_with("notepad", "acme", &session, b"a")
+            .await
+            .text(),
+        "a"
+    );
+    assert_eq!(
+        cluster
+            .post_with("notepad", "acme", &session, b"b")
+            .await
+            .text(),
+        "ab"
+    );
+    assert_eq!(
+        cluster
+            .post_with("notepad", "acme", &session, b"c")
+            .await
+            .text(),
+        "abc"
+    );
+}
+
+#[tokio::test]
+async fn a_second_session_starts_from_nothing() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    for _ in 0..3 {
+        cluster.add_worker(2, 4).await;
+    }
+    cluster.publish("notepad", NOTEPAD).await;
+
+    cluster
+        .post_with(
+            "notepad",
+            "acme",
+            &[("X-Nebula-Partition-Key", "chat-1")],
+            b"private",
+        )
+        .await;
+
+    // Two conversations of one tenant will pick the same key names, so the
+    // separation has to come from the session rather than from the guest being
+    // careful.
+    let other = cluster
+        .post_with(
+            "notepad",
+            "acme",
+            &[("X-Nebula-Partition-Key", "chat-2")],
+            b"fresh",
+        )
+        .await;
+    assert_eq!(other.text(), "fresh");
+
+    // And a request with no partition key is its own namespace, not a window
+    // into someone's conversation.
+    let unscoped = cluster.post("notepad", "acme", b"anon").await;
+    assert_eq!(unscoped.text(), "anon");
+}
+
+#[tokio::test]
+async fn a_malformed_partition_key_is_refused_rather_than_ignored() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("notepad", NOTEPAD).await;
+
+    // A caller that sent a key is expecting its state back. Quietly dropping
+    // the header would route the request somewhere else and look, from the
+    // outside, exactly like the state vanishing.
+    let long = "s".repeat(200);
+    for bad in ["", "   ", long.as_str()] {
+        let response = cluster
+            .post_with("notepad", "acme", &[("X-Nebula-Partition-Key", bad)], b"x")
+            .await;
+        assert_eq!(response.status, 400, "key {bad:?} should be refused");
+        assert_eq!(
+            response.header("x-nebula-fault"),
+            Some("invalid_partition_key")
+        );
+    }
+}
+
+#[tokio::test]
+async fn sessions_of_one_function_spread_across_workers() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    for _ in 0..3 {
+        cluster.add_worker(2, 4).await;
+    }
+    cluster.publish("notepad", NOTEPAD).await;
+
+    // The test the two above cannot be: consistent hashing already pins one
+    // *function* to one worker, so a notepad accumulates correctly even if the
+    // partition key is ignored for routing entirely. What only partition
+    // routing produces is *spread* — different sessions of one function landing
+    // on different nodes.
+    //
+    // `X-Nebula-Cold` makes that observable: a worker reports cold the first
+    // time it has to fetch a module. Route by function id and exactly one
+    // worker ever sees this module, so exactly one response is cold.
+    let mut cold = 0;
+    for n in 0..12 {
+        let key = format!("chat-{n}");
+        let response = cluster
+            .post_with("notepad", "acme", &[("X-Nebula-Partition-Key", &key)], b"x")
+            .await;
+        assert_eq!(response.status, 200);
+        if response.header("x-nebula-cold") == Some("true") {
+            cold += 1;
+        }
+    }
+
+    assert!(
+        cold > 1,
+        "every session landed on one worker, so the partition key is not \
+         reaching the ring — {cold} cold start(s) across 3 workers"
+    );
+
+    // And the cost of that spread, stated rather than hidden: each worker pays
+    // its own compile. That is the trade §22.5 makes — state affinity instead
+    // of cache affinity — and it is only paid by callers who ask for it.
+    assert!(cold <= 3, "more cold starts than workers: {cold}");
+}

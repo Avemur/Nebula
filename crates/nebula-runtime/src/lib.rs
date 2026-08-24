@@ -75,6 +75,12 @@ pub struct HostCtx {
     /// Response accumulated through `nebula.response_write`.
     pub response: Vec<u8>,
     pub tenant: String,
+    /// The caller's `X-Nebula-Partition-Key`, or `""` (§22.5).
+    ///
+    /// Namespaces the KV shim so two conversations with one tenant cannot read
+    /// each other's scratchpad. Empty is its own namespace rather than a shared
+    /// one, so an unscoped request never sees a session's state by accident.
+    pub session: String,
     kv: Arc<Kv>,
     /// Outbound HTTP policy (§22.8). Shared, immutable, and off by default.
     egress: Arc<egress::Policy>,
@@ -95,6 +101,7 @@ pub struct HostCtx {
 impl HostCtx {
     fn new(
         tenant: String,
+        session: String,
         request: Vec<u8>,
         kv: Arc<Kv>,
         egress: Arc<egress::Policy>,
@@ -125,6 +132,7 @@ impl HostCtx {
             request,
             response: Vec::new(),
             tenant,
+            session,
             kv,
             stdout_pipe,
             stderr_pipe,
@@ -267,7 +275,14 @@ impl Runtime {
         tenant: &str,
         request: Vec<u8>,
     ) -> Result<HostCtx> {
-        self.execute_with_deadline(wasm, entry, tenant, request, engine::DEFAULT_DEADLINE_TICKS)
+        self.execute_with_deadline(
+            wasm,
+            entry,
+            tenant,
+            "",
+            request,
+            engine::DEFAULT_DEADLINE_TICKS,
+        )
     }
 
     /// As [`Runtime::execute`], with an explicit epoch budget in ticks.
@@ -280,13 +295,14 @@ impl Runtime {
         wasm: &[u8],
         entry: &str,
         tenant: &str,
+        session: &str,
         request: Vec<u8>,
         deadline_ticks: u64,
     ) -> Result<HostCtx> {
         let cached = self
             .cache
             .get_or_compile(&self.engine, &self.linker, wasm)?;
-        let mut store = self.new_store(tenant, request, deadline_ticks);
+        let mut store = self.new_store(tenant, session, request, deadline_ticks);
 
         // Run the guest through a closure so the store's borrow ends before the
         // context is taken back. The context has to be readable even on failure:
@@ -322,10 +338,17 @@ impl Runtime {
     ///
     /// Both are set here rather than at the call site so there is no path to a
     /// `Store` that runs guest code without them (§13, invariant 3).
-    fn new_store(&self, tenant: &str, request: Vec<u8>, deadline_ticks: u64) -> Store<HostCtx> {
+    fn new_store(
+        &self,
+        tenant: &str,
+        session: &str,
+        request: Vec<u8>,
+        deadline_ticks: u64,
+    ) -> Store<HostCtx> {
         let ticks = deadline_ticks.max(1);
         let ctx = HostCtx::new(
             tenant.to_string(),
+            session.to_string(),
             request,
             self.kv.clone(),
             self.egress.clone(),

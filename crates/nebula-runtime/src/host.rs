@@ -149,7 +149,7 @@ pub fn add_to_linker(linker: &mut Linker<HostCtx>) -> Result<()> {
             }
             let key = guest_slice(&mut caller, kptr, klen)?.to_vec();
             let ctx = caller.data();
-            let Some(value) = ctx.kv().get(&ctx.tenant, &key) else {
+            let Some(value) = ctx.kv().get(&ctx.tenant, &ctx.session, &key) else {
                 return Ok(-1);
             };
             let dst = guest_slice(&mut caller, vptr, vlen)?;
@@ -177,10 +177,12 @@ pub fn add_to_linker(linker: &mut Linker<HostCtx>) -> Result<()> {
             let key = guest_slice(&mut caller, kptr, klen)?.to_vec();
             let value = guest_slice(&mut caller, vptr, vlen)?.to_vec();
             let ctx = caller.data();
-            Ok(match ctx.kv().set(&ctx.tenant, &key, &value) {
-                Ok(()) => 0,
-                Err(kv::Rejected) => -1,
-            })
+            Ok(
+                match ctx.kv().set(&ctx.tenant, &ctx.session, &key, &value) {
+                    Ok(()) => 0,
+                    Err(kv::Rejected) => -1,
+                },
+            )
         },
     )?;
 

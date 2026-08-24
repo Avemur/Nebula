@@ -352,3 +352,109 @@ fn an_allowed_host_comes_back_to_the_script_whole() {
     );
     assert_eq!(answer, "hello, agent!");
 }
+
+// ---------------------------------------------------------------------------
+// Session state (§22.5)
+// ---------------------------------------------------------------------------
+
+/// Evaluates with an explicit session, the way a partitioned request arrives.
+///
+/// A deliberately generous deadline. These tests are about what survives
+/// between requests, not about latency, and the default 50 ms is tight enough
+/// that a machine running the whole suite in parallel can trip it — which shows
+/// up as a state test failing for a reason that has nothing to do with state.
+/// `instantiation_cost_tracks_artifact_size` is where timing is asserted.
+const SESSION_DEADLINE_TICKS: u64 = 2_000;
+
+fn eval_in(runtime: &Runtime, wasm: &[u8], session: &str, source: &str) -> String {
+    let ctx = runtime
+        .execute_with_deadline(
+            wasm,
+            "run",
+            "js",
+            session,
+            source.as_bytes().to_vec(),
+            SESSION_DEADLINE_TICKS,
+        )
+        .expect("interpreter runs");
+    String::from_utf8(ctx.output())
+        .expect("utf-8")
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn a_script_can_read_back_what_an_earlier_step_wrote() {
+    let Some(wasm) = interpreter() else {
+        return skip("session state");
+    };
+    let runtime = Runtime::new(common::temp_dir("js-session")).expect("runtime");
+
+    // The REPL pattern, which is what an agent doing multi-step work actually
+    // needs and what §7.2 previously said would not work.
+    assert_eq!(
+        eval_in(&runtime, &wasm, "chat-1", "session.set('total', 40); 'ok'"),
+        "ok"
+    );
+    assert_eq!(
+        eval_in(
+            &runtime,
+            &wasm,
+            "chat-1",
+            "Number(session.get('total')) + 2"
+        ),
+        "42"
+    );
+}
+
+#[test]
+fn one_conversations_scratchpad_is_invisible_to_another() {
+    let Some(wasm) = interpreter() else {
+        return skip("session isolation");
+    };
+    let runtime = Runtime::new(common::temp_dir("js-session-iso")).expect("runtime");
+
+    eval_in(&runtime, &wasm, "chat-1", "session.set('secret', 'mine')");
+
+    // `null`, not `''` — a script has to tell "never written" from "written
+    // empty", or the second step of every conversation guesses.
+    assert_eq!(
+        eval_in(&runtime, &wasm, "chat-2", "String(session.get('secret'))"),
+        "null"
+    );
+    assert_eq!(
+        eval_in(&runtime, &wasm, "", "String(session.get('secret'))"),
+        "null"
+    );
+    assert_eq!(
+        eval_in(&runtime, &wasm, "chat-1", "session.get('secret')"),
+        "mine"
+    );
+}
+
+#[test]
+fn session_state_survives_a_fresh_instance_but_globals_do_not() {
+    let Some(wasm) = interpreter() else {
+        return skip("session vs globals");
+    };
+    let runtime = Runtime::new(common::temp_dir("js-session-vs-globals")).expect("runtime");
+
+    // The distinction §22.5 rests on: state is *data* in the host's store, not
+    // a live instance pinned to a worker. `globalThis` still dies with the
+    // instance, so §4.2's fresh-instance invariant is untouched — which is why
+    // this costs a KV namespace instead of leases and fencing tokens (§21).
+    eval_in(
+        &runtime,
+        &wasm,
+        "chat-1",
+        "globalThis.inMemory = 'gone'; session.set('kept', 'here')",
+    );
+    assert_eq!(
+        eval_in(&runtime, &wasm, "chat-1", "typeof globalThis.inMemory"),
+        "undefined"
+    );
+    assert_eq!(
+        eval_in(&runtime, &wasm, "chat-1", "session.get('kept')"),
+        "here"
+    );
+}

@@ -47,6 +47,17 @@ pub const DEADLINE_HEADER: &str = "x-nebula-deadline-ms";
 /// client branching on the status cannot tell them apart; this names the reason.
 pub const FAULT_HEADER: &str = "x-nebula-fault";
 
+/// Routes a request to a stable worker and namespaces its scratchpad (§22.5).
+///
+/// Reserved in §21 for actor pins and used here for the far cheaper half of
+/// that idea: state that survives between steps, without a live instance to
+/// pin, a lease to hold, or a fencing token to reason about.
+pub const PARTITION_HEADER: &str = "x-nebula-partition-key";
+
+/// Bound on a caller-supplied partition key. It is a ring key and a map key,
+/// not a path; an unbounded one is a free allocation for anyone asking.
+pub const MAX_PARTITION_KEY_BYTES: usize = 128;
+
 /// Opt-in replay of an already-answered request (§22.4).
 ///
 /// Present because agent frameworks retry automatically, which quietly breaks
@@ -416,6 +427,19 @@ async fn answer_for(
     };
     tracing::Span::current().record("tenant", tenant.as_str());
 
+    let partition = match partition_key_of(headers) {
+        Ok(key) => key,
+        Err(()) => {
+            return fault(
+                StatusCode::BAD_REQUEST,
+                "invalid_partition_key",
+                format!(
+                "{PARTITION_HEADER} must be 1..={MAX_PARTITION_KEY_BYTES} printable ASCII bytes"
+            ),
+            )
+        }
+    };
+
     // Before the deployment lookup, the ring walk, and the idempotency claim:
     // a refused request should cost a hash and nothing else, or the limiter
     // becomes its own load amplifier.
@@ -434,7 +458,18 @@ async fn answer_for(
 
     // Unkeyed is the common path and stays exactly as it was.
     let key = match idempotency_key_of(headers) {
-        None => return run(gateway, function_id, tenant, deadline_ms, body, trace).await,
+        None => {
+            return run(
+                gateway,
+                function_id,
+                tenant,
+                partition,
+                deadline_ms,
+                body,
+                trace,
+            )
+            .await
+        }
         Some(Err(())) => {
             return fault(
                 StatusCode::BAD_REQUEST,
@@ -474,7 +509,16 @@ async fn answer_for(
         // slot is released rather than left answering 409 until the TTL runs
         // out.
         idempotency::Claim::Proceed(claim) => {
-            let answer = run(gateway, function_id, tenant, deadline_ms, body, trace).await;
+            let answer = run(
+                gateway,
+                function_id,
+                tenant,
+                partition,
+                deadline_ms,
+                body,
+                trace,
+            )
+            .await;
             claim.finish(&answer, answer.replayable(), answer.weight());
             answer
         }
@@ -485,6 +529,7 @@ async fn run(
     gateway: &Gateway,
     function_id: &str,
     tenant: String,
+    partition: Option<String>,
     deadline_ms: u32,
     body: Bytes,
     trace: &trace::TraceContext,
@@ -500,7 +545,13 @@ async fn run(
     // Bounded-load ordering (§9.2): the ring's owner leads unless it is above
     // 1.25x mean cluster load, in which case the walk starts at the next node.
     // The rest of the plan stays in ring order, so failover is unchanged.
-    let plan = gateway.membership.route_plan(function_id);
+    // §22.5. A partition key routes by *session* rather than by function, which
+    // trades cache affinity for state affinity: two sessions of one function
+    // land on different workers and each compiles it once. That is the price of
+    // reading back what you wrote, and it is paid only by callers who ask.
+    let plan = gateway
+        .membership
+        .route_plan(partition.as_deref().unwrap_or(function_id));
     if plan.is_empty() {
         return fault(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -518,7 +569,7 @@ async fn run(
         // the only property that makes a request id worth having.
         request_id: trace.trace_id.clone(),
         deadline_ms,
-        partition_key: None,
+        partition_key: partition,
         tenant,
     };
 
@@ -794,6 +845,24 @@ fn unauthorized() -> Answer {
         "unauthorized",
         "missing or malformed bearer token",
     )
+}
+
+/// Reads [`PARTITION_HEADER`].
+///
+/// `Ok(None)` is absent. An over-long or non-ASCII key is an error rather than
+/// a silent drop: a caller that sent one is expecting its state back, and
+/// quietly routing it somewhere else would look like the state vanished.
+#[allow(clippy::result_unit_err)]
+fn partition_key_of(headers: &HeaderMap) -> Result<Option<String>, ()> {
+    let Some(raw) = headers.get(PARTITION_HEADER) else {
+        return Ok(None);
+    };
+    match raw.to_str() {
+        Ok(key) if !key.trim().is_empty() && key.len() <= MAX_PARTITION_KEY_BYTES => {
+            Ok(Some(key.trim().to_string()))
+        }
+        _ => Err(()),
+    }
 }
 
 /// Reads `Idempotency-Key`.

@@ -473,13 +473,20 @@ Registered on the `Linker` under the `nebula` module namespace:
 | `nebula.log` | `(level: i32, ptr, len)` | Emit a structured log line |
 | `nebula.http_get` | `(uptr, ulen, optr, olen) -> i32` | Outbound HTTP, allowlisted and off by default (§22.8) |
 
+The interpreter guest wraps the last three as `session.get`, `session.set`, and
+`httpGet` (§22.1).
+
 The KV shim is **node-local and non-durable** — a `DashMap` keyed by
-`(tenant, key)` *tuples*, not by a concatenated prefix, and bounded per §6.4.
-The tuple matters: a delimiter scheme needs an argument about escaping before
-you can believe one tenant cannot spell its way into another's namespace, and a
-tuple needs none. It exists to exercise host-call plumbing and memory
-translation, not to be a database. Guests must not assume a value written on one
-request is visible on the next.
+`(tenant, session, key)` *tuples*, not by a concatenated prefix, and bounded per
+§6.4. The tuple matters: a delimiter scheme needs an argument about escaping
+before you can believe one tenant cannot spell its way into another's namespace,
+and a tuple needs none.
+
+A guest may only assume a write is visible on the next request when the caller
+sends the same `X-Nebula-Partition-Key` (§22.5), which is what routes both
+requests to the same worker. Without one, the session is `""` and the old rule
+stands: do not assume. Entries expire after 10 minutes, refreshed on write —
+caps without an expiry are caps that become permanent.
 
 The response body is what the guest wrote through `response_write`, or its
 captured **stdout** when it wrote nothing there — the same reason stdin carries
@@ -732,7 +739,7 @@ POST /execute/{function_id}
   Authorization: Bearer <tenant-token>
   Content-Type: application/octet-stream
   X-Nebula-Deadline-Ms: <opt, 10..5000, default 50>
-  X-Nebula-Partition-Key: <opt, reserved for §21>
+  X-Nebula-Partition-Key: <opt, routes and namespaces a session, §22.5>
   Idempotency-Key: <opt, 1..=255 bytes; replays an answer for 60s, §22.4>
   traceparent: <opt, W3C trace context; adopted or minted, §22.6>
   Body: <= 1 MiB
@@ -769,7 +776,7 @@ apart. The header names the cause:
 | `unknown_function` | 404 | Nothing deployed under that id |
 | `module_not_found` | 404 | Deployed, but the artifact is missing from the registry |
 | `unauthorized` | 401 | Missing or malformed bearer token |
-| `invalid_deadline` / `invalid_request` / `invalid_idempotency_key` | 400 | Caller's request is malformed |
+| `invalid_deadline` / `invalid_request` / `invalid_idempotency_key` / `invalid_partition_key` | 400 | Caller's request is malformed |
 | `idempotency_in_flight` | 409 | A request with this `Idempotency-Key` is still running (§22.4) |
 | `rate_limited` | 429 | This tenant is ahead of its own budget; carries `Retry-After` (§22.7) |
 | `no_healthy_worker` | 503 | The ring is empty |
@@ -1466,9 +1473,9 @@ rest is scoped here.
 
 The ranking is the point: items 22.1–22.3 are what "works with agents" actually
 means, and the rest are sharp edges agent traffic will find in a system tuned
-for web handlers. **Everything except §22.2 and §22.5 is built** — the
-JavaScript interpreter guest, the MCP server, idempotency keys, W3C trace
-context, per-tenant rate limits, and gated outbound HTTP.
+for web handlers. **Everything except §22.2 is built** — the JavaScript
+interpreter guest, the MCP server, idempotency keys, session continuity, W3C
+trace context, per-tenant rate limits, and gated outbound HTTP.
 
 ### 22.1 Interpreter guests — the prerequisite for everything else
 
@@ -1856,35 +1863,83 @@ buys a better error message rather than a better guarantee.
 
 ### 22.5 Session continuity — the 80% of §21 that costs 5%
 
-Agents work in steps: define something in step one, use it in step two. The KV
-shim is explicit that this does not work — "guests must not assume a value
-written on one request is visible on the next" (§7.2) — because there is no
-guarantee the second request lands on the same worker.
+**Status: built.** `X-Nebula-Partition-Key`, the session dimension in
+`crates/nebula-runtime/src/kv.rs`, and `session.get/set` in the interpreter.
 
-§21 solves this properly with actor pins and correctly defers it: live instance
-pinning needs ownership leases and fencing tokens, which is a consensus-shaped
-problem, not a routing tweak. **But the REPL pattern does not need a live
-instance. It needs the data to still be there.**
+Agents work in steps: define something in step one, use it in step two. §7.2
+used to say plainly that this did not work — "guests must not assume a value
+written on one request is visible on the next" — because nothing guaranteed the
+second request landed on the same worker.
 
-That is a much smaller thing:
+```
+POST /execute/{function_id}
+  X-Nebula-Partition-Key: chat-1
+```
+
+```js
+session.set('total', 40);          // step one
+Number(session.get('total')) + 2   // step two, same partition key -> 42
+```
+
+§21 solves this properly with actor pins and correctly defers it: pinning a live
+instance needs ownership leases and fencing tokens, because during a rebalance
+two workers can both believe they own a key. **The REPL pattern does not need a
+live instance. It needs the data to still be there.**
 
 | | Actor pins (§21) | Session state (here) |
 |---|---|---|
 | What survives a request | A live, instantiated `Store` | Bytes in the KV shim |
-| Routes by | `partition_key` through the ring | The same, already reserved |
+| Routes by | `partition_key` through the ring | The same |
 | Needs eviction policy change | Yes — pinned instances cannot be evicted | No |
-| Needs leases + fencing | Yes — two workers can both claim a key | **No** — a rebalance loses state, and losing state is a normal, recoverable outcome |
+| Needs leases + fencing | Yes — two workers can both claim a key | **No** — a rebalance loses state, which is recoverable |
 | Breaks "fresh instance per request" (§4.2) | Yes | **No** |
 
-Concretely: route on `X-Nebula-Partition-Key` (already reserved in both the
-header and the proto), namespace the KV shim by `(tenant, session, key)`
-instead of `(tenant, key)`, and give session entries a TTL. Every §6 budget
-stays per-request, §13 stays as easy to reason about, and a ring rebalance
-degrades to a cold session rather than to a correctness bug.
+That last row is the load-bearing one, and there is a test for it:
+`globalThis` still dies with the instance while `session` survives. State is
+*data in the host's store*, not an instance pinned to a worker, so §13 stays as
+easy to reason about as it was.
 
-The honest limit: this is best-effort, not durable. It is right for a
-scratchpad and wrong for anything that must not be lost — and the design should
-say so in the response rather than let a caller discover it during a rebalance.
+#### Three things that are not obvious
+
+**The key namespaces the store, not just the routing.** KV keys became
+`(tenant, session, key)` tuples. Two conversations belonging to one tenant will
+pick the same key names — an agent chooses `"draft"` every time — so separation
+has to come from the session rather than from the guest being careful. A request
+with no partition key gets `""` as its own namespace rather than a shared one,
+so an unscoped call never reads a conversation's scratchpad by accident.
+
+**`session.get` returns `null` for a key never written**, which is
+distinguishable from the empty string a key deliberately set to `""` holds. A
+script stepping through a conversation has to tell "not yet" from "nothing", and
+conflating them makes the second step of every conversation a guess.
+
+**The KV shim now has a TTL** (10 minutes, refreshed on write). It had none, and
+without one the caps are permanent: the node fills once and refuses every write
+for the life of the process. The sweep runs when a write is refused rather than
+on a timer — a scan is expensive and the common path should not pay for the rare
+one. It cannot run inside the write itself, because `retain` touches every shard
+and would deadlock against the `entry` lock held there.
+
+#### The cost, stated
+
+Routing by session rather than by function trades **cache affinity for state
+affinity**. Two sessions of one function land on different workers and each
+compiles the module once. That is the trade, it is only paid by callers who send
+a key, and it is what `sessions_of_one_function_spread_across_workers` measures —
+by counting `X-Nebula-Cold` responses, because consistent hashing already pins
+one *function* to one worker and a notepad would accumulate correctly even if
+the partition key were ignored for routing entirely. Without spread that test
+sees exactly one cold start; the two tests either side of it would both still
+pass, which is why it exists.
+
+#### The honest limit
+
+**This is best-effort, not durable.** A ring rebalance sends the next request to
+a different worker and the session starts empty. That is a recoverable outcome
+rather than a correctness bug — which is precisely why this costs a KV namespace
+and §21 costs a consensus protocol. It is right for a scratchpad and wrong for
+anything that must not be lost, and a caller should be told that rather than
+discover it during a rebalance.
 
 ### 22.6 Trace context — stitching Nebula's spans into the agent's trace
 
@@ -2188,7 +2243,7 @@ snapshot was worth nothing on this artifact. The interpreter now exports no
 | 3 | **MCP server** (§22.3) | Any MCP client, no glue | A thin crate, no control-plane dependency | **Built.** The step where an off-the-shelf agent connects |
 | 4 | **Idempotency keys** (§22.4) | Safe retries when the *client* lost the answer | One bounded map | **Built.** It does not fix `502` — §22.4 retracts that claim |
 | 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse, forwarded through the mesh | **Built.** Also fixed a `request_id` that named a function, not a request |
-| 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | Do, and say plainly that it is best-effort |
+| 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | **Built.** Best-effort by design; a rebalance loses it |
 | 7 | **Per-tenant rate limits** (§22.7) | Survival, and fairness §10.3 cannot provide | A token bucket per tenant | **Built.** An agent in a retry loop *is* a load test |
 | 8 | **Egress** (§22.8) | Network-using tools | Its own threat model | **Built, and off by default.** HTTP and HTTPS |
 | 9 | Streaming responses | Incremental output | Reworks `response_write` into a flushing channel | Defer — buffered output is correct, just less pretty |

@@ -12,6 +12,9 @@
 //! * **stdin** — the source to evaluate. The runtime pipes the request body in.
 //! * **stdout** — the response body: whatever `console.log` printed, followed by
 //!   the completion value when it is not `undefined`.
+//! * **`session.get/set`** — state that survives between requests sharing a
+//!   partition key (§22.5).
+//! * **`httpGet(url)`** — the network, when an operator allows it (§22.8).
 //!
 //! The request arrives on stdin rather than through `nebula.request_read`
 //! because that is what a wizenable guest can do — and this guest is no longer
@@ -52,11 +55,16 @@ use boa_engine::{
 #[link(wasm_import_module = "nebula")]
 extern "C" {
     fn http_get(url_ptr: *const u8, url_len: u32, out_ptr: *mut u8, out_len: u32) -> i32;
+    fn kv_get(kptr: *const u8, klen: u32, vptr: *mut u8, vlen: u32) -> i32;
+    fn kv_set(kptr: *const u8, klen: u32, vptr: *const u8, vlen: u32) -> i32;
 }
 
 /// Matches the host's own cap (§22.8), so the only truncation that can happen
 /// is the one the host already refused.
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
+
+/// Matches the host's per-value cap (§6.4).
+const MAX_VALUE_BYTES: usize = 64 << 10;
 
 // A thread local rather than a `static`: `Context` is `!Sync`, and
 // `wasm32-wasip1` is single-threaded, so this compiles down to a plain
@@ -79,6 +87,10 @@ globalThis.__nebula_fmt = (v) => {
   catch (e) { return String(v); }
 };
 globalThis.httpGet = (url) => __nebula_http_get(String(url));
+globalThis.session = {
+  get: (k) => __nebula_kv_get(String(k)),
+  set: (k, v) => __nebula_kv_set(String(k), typeof v === 'string' ? v : JSON.stringify(v)),
+};
 globalThis.console = {
   log:   (...a) => __nebula_print(a.map(__nebula_fmt).join(' ')),
   info:  (...a) => __nebula_print(a.map(__nebula_fmt).join(' ')),
@@ -129,6 +141,63 @@ fn fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVal
     Ok(js_string!(String::from_utf8_lossy(&buffer[..written]).as_ref()).into())
 }
 
+/// Backs `session.get`. Returns `null` for a key that was never written, which
+/// a script needs in order to tell "not yet" from "nothing".
+fn session_get(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let key = args
+        .first()
+        .cloned()
+        .unwrap_or_default()
+        .to_string(ctx)?
+        .to_std_string_escaped();
+
+    let mut buffer = vec![0u8; MAX_VALUE_BYTES];
+    let length = unsafe {
+        kv_get(
+            key.as_ptr(),
+            key.len() as u32,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    };
+    if length < 0 {
+        return Ok(JsValue::null());
+    }
+
+    let length = (length as usize).min(buffer.len());
+    Ok(js_string!(String::from_utf8_lossy(&buffer[..length]).as_ref()).into())
+}
+
+/// Backs `session.set`. Returns `true` when the store accepted it.
+///
+/// A refusal is a boolean rather than an exception: a full node is a condition
+/// the script can work around, and §7.2's convention is that recoverable
+/// refusals are values.
+fn session_set(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let key = args
+        .first()
+        .cloned()
+        .unwrap_or_default()
+        .to_string(ctx)?
+        .to_std_string_escaped();
+    let value = args
+        .get(1)
+        .cloned()
+        .unwrap_or_default()
+        .to_string(ctx)?
+        .to_std_string_escaped();
+
+    let accepted = unsafe {
+        kv_set(
+            key.as_ptr(),
+            key.len() as u32,
+            value.as_ptr(),
+            value.len() as u32,
+        )
+    };
+    Ok(JsValue::from(accepted >= 0))
+}
+
 fn build() -> Context {
     let mut ctx = Context::default();
     ctx.register_global_callable(
@@ -143,6 +212,18 @@ fn build() -> Context {
         NativeFunction::from_fn_ptr(fetch),
     )
     .expect("register __nebula_http_get");
+    ctx.register_global_callable(
+        js_string!("__nebula_kv_get"),
+        1,
+        NativeFunction::from_fn_ptr(session_get),
+    )
+    .expect("register __nebula_kv_get");
+    ctx.register_global_callable(
+        js_string!("__nebula_kv_set"),
+        2,
+        NativeFunction::from_fn_ptr(session_set),
+    )
+    .expect("register __nebula_kv_set");
     // Panicking here is deliberate: a realm whose console or `httpGet` failed
     // to register is one where every script fails in a way that looks like the
     // script's fault. Better to trap on the first request than to mislead every

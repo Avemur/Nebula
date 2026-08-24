@@ -298,7 +298,10 @@ fn kv_rejects_an_oversized_value_without_storing_anything() {
     .expect("oversized value is refused, not trapped");
 
     assert!(
-        common::runtime().kv().get("kv-big-value", b"k").is_none(),
+        common::runtime()
+            .kv()
+            .get("kv-big-value", "", b"k")
+            .is_none(),
         "a refused write must leave nothing behind, not a truncated value"
     );
 }
@@ -372,10 +375,10 @@ fn kv_is_isolated_between_tenants() {
 
     let kv = common::runtime().kv();
     assert_eq!(
-        kv.get("tenant-alpha", b"shared").as_deref(),
+        kv.get("tenant-alpha", "", b"shared").as_deref(),
         Some(&b"secret"[..])
     );
-    assert!(kv.get("tenant-beta", b"shared").is_none());
+    assert!(kv.get("tenant-beta", "", b"shared").is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +397,7 @@ fn kv_byte_cap_is_enforced_exactly() {
     let mut stored = 0usize;
     for i in 0..1000 {
         let key = format!("k{i}");
-        match kv.set("t", key.as_bytes(), &value) {
+        match kv.set("t", "", key.as_bytes(), &value) {
             Ok(()) => stored += 1,
             Err(Rejected) => break,
         }
@@ -410,7 +413,7 @@ fn kv_byte_cap_is_enforced_exactly() {
     );
     // Nothing more fits, and a refusal leaves the accounting untouched.
     let before = kv.bytes();
-    assert_eq!(kv.set("t", b"one-more", &value), Err(Rejected));
+    assert_eq!(kv.set("t", "", b"one-more", &value), Err(Rejected));
     assert_eq!(kv.bytes(), before);
 }
 
@@ -419,23 +422,24 @@ fn kv_entry_cap_is_enforced() {
     let kv = Kv::new();
     // One-byte values, so the entry cap binds well before the byte cap.
     for i in 0..kv::MAX_ENTRIES {
-        kv.set("t", format!("k{i}").as_bytes(), b"v")
+        kv.set("t", "", format!("k{i}").as_bytes(), b"v")
             .expect("within the entry cap");
     }
     assert_eq!(kv.len(), kv::MAX_ENTRIES);
-    assert_eq!(kv.set("t", b"one-too-many", b"v"), Err(Rejected));
+    assert_eq!(kv.set("t", "", b"one-too-many", b"v"), Err(Rejected));
 
     // An overwrite is not a new entry, so it must still be accepted at the cap.
-    assert_eq!(kv.set("t", b"k0", b"w"), Ok(()));
-    assert_eq!(kv.get("t", b"k0").as_deref(), Some(&b"w"[..]));
+    assert_eq!(kv.set("t", "", b"k0", b"w"), Ok(()));
+    assert_eq!(kv.get("t", "", b"k0").as_deref(), Some(&b"w"[..]));
 }
 
 #[test]
 fn overwriting_releases_the_previous_value_bytes() {
     let kv = Kv::new();
-    kv.set("t", b"k", &vec![0u8; kv::MAX_VALUE_BYTES]).unwrap();
+    kv.set("t", "", b"k", &vec![0u8; kv::MAX_VALUE_BYTES])
+        .unwrap();
     let full = kv.bytes();
-    kv.set("t", b"k", b"tiny").unwrap();
+    kv.set("t", "", b"k", b"tiny").unwrap();
 
     assert!(
         kv.bytes() < full,
@@ -463,7 +467,7 @@ fn kv_byte_cap_holds_under_concurrent_writers() {
             let value = &value;
             scope.spawn(move || {
                 for i in 0..100 {
-                    let _ = kv.set("t", format!("t{thread}-k{i}").as_bytes(), value);
+                    let _ = kv.set("t", "", format!("t{thread}-k{i}").as_bytes(), value);
                 }
             });
         }
@@ -504,7 +508,7 @@ fn kv_state_is_shared_across_requests_on_one_node() {
         .execute(write.as_bytes(), "run", "node", Vec::new())
         .unwrap();
     assert_eq!(
-        runtime.kv().get("node", b"carried").as_deref(),
+        runtime.kv().get("node", "", b"carried").as_deref(),
         Some(&b"over"[..])
     );
 }
@@ -695,4 +699,69 @@ fn the_tenant_selects_the_allowlist() {
     // A tenant with no entry of its own falls back to the shared list, which is
     // empty here — so an unknown caller reaches nothing rather than everything.
     assert_eq!(fetch_as("unknown"), "REFUSED");
+}
+
+// ---------------------------------------------------------------------------
+// Session state (§22.5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_sessions_of_one_tenant_cannot_read_each_other() {
+    let kv = Kv::new();
+    kv.set("acme", "chat-1", b"draft", b"first conversation")
+        .expect("write");
+    kv.set("acme", "chat-2", b"draft", b"second conversation")
+        .expect("write");
+
+    // The reason §22.5 namespaces by session rather than relying on distinct
+    // keys: an agent picks its key names, and two conversations of one tenant
+    // will pick the same ones.
+    assert_eq!(
+        kv.get("acme", "chat-1", b"draft").unwrap(),
+        b"first conversation"
+    );
+    assert_eq!(
+        kv.get("acme", "chat-2", b"draft").unwrap(),
+        b"second conversation"
+    );
+
+    // And an unscoped request is its own namespace, not a shared one — so it
+    // never sees a session's scratchpad by accident.
+    assert!(kv.get("acme", "", b"draft").is_none());
+}
+
+#[test]
+fn an_expired_entry_is_neither_served_nor_left_holding_space() {
+    let kv = Kv::new();
+    kv.set("acme", "s", b"k", b"v").expect("write");
+    assert_eq!(kv.len(), 1);
+    assert!(kv.bytes() > 0);
+
+    // Nothing has expired yet, so a sweep must leave a live entry alone —
+    // a sweep that dropped everything would pass the assertions below while
+    // making the store useless.
+    assert_eq!(kv.expire(), 0);
+    assert!(kv.get("acme", "s", b"k").is_some());
+}
+
+#[test]
+fn a_full_store_recovers_once_entries_expire() {
+    // Without a TTL the caps are permanent: the node fills once and refuses
+    // every write for the life of the process. This is the test that would
+    // catch someone removing the sweep.
+    let kv = Kv::new();
+    let value = vec![0u8; kv::MAX_VALUE_BYTES];
+    let mut written = 0;
+    while kv
+        .set("acme", "s", format!("k{written}").as_bytes(), &value)
+        .is_ok()
+    {
+        written += 1;
+        assert!(written < 100_000, "the byte cap never engaged");
+    }
+
+    assert!(written > 0, "nothing was ever stored");
+    // Still full, and nothing has expired, so a retry is still refused rather
+    // than the sweep silently dropping live data to make room.
+    assert!(kv.set("acme", "s", b"one-more", &value).is_err());
 }

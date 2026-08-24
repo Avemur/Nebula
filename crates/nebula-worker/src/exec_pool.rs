@@ -40,6 +40,8 @@ pub struct Admitted(OwnedSemaphorePermit);
 struct Job {
     wasm: Arc<Vec<u8>>,
     tenant: String,
+    /// The caller's partition key, namespacing the KV shim (§22.5).
+    session: String,
     body: Vec<u8>,
     deadline_ticks: u64,
     reply: oneshot::Sender<wasmtime::Result<HostCtx>>,
@@ -118,6 +120,7 @@ impl ExecPool {
                     let Job {
                         wasm,
                         tenant,
+                        session,
                         body,
                         deadline_ticks,
                         reply,
@@ -140,6 +143,7 @@ impl ExecPool {
                             &wasm,
                             HANDLER_EXPORT,
                             &tenant,
+                            &session,
                             body,
                             deadline_ticks,
                         )
@@ -187,6 +191,7 @@ impl ExecPool {
         admitted: Admitted,
         wasm: Arc<Vec<u8>>,
         tenant: String,
+        session: String,
         body: Vec<u8>,
         deadline_ticks: u64,
     ) -> Result<wasmtime::Result<HostCtx>, PoolError> {
@@ -194,6 +199,7 @@ impl ExecPool {
         let job = Job {
             wasm,
             tenant,
+            session,
             body,
             deadline_ticks,
             reply,
@@ -269,6 +275,7 @@ mod tests {
                 admitted,
                 Arc::new(ECHO.as_bytes().to_vec()),
                 "tenant".to_string(),
+                String::new(),
                 b"round trip".to_vec(),
                 50,
             )
@@ -307,6 +314,7 @@ mod tests {
                 admitted,
                 Arc::new(SPIN.as_bytes().to_vec()),
                 "tenant".to_string(),
+                String::new(),
                 Vec::new(),
                 50,
             )

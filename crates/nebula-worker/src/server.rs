@@ -291,9 +291,22 @@ impl NebulaWorker for WorkerService {
             requested => requested.min(MAX_DEADLINE_MS) as u64,
         };
 
+        // §22.5. The gateway routed this request to *this* worker because of the
+        // partition key, so the session's scratchpad is in this process's KV
+        // shim — that is the whole mechanism, and it is why the state is
+        // best-effort: a ring rebalance sends the next request elsewhere.
+        let session = request.partition_key.unwrap_or_default();
+
         let result = match self
             .pool
-            .run(admitted, wasm, tenant, request.body, deadline_ticks)
+            .run(
+                admitted,
+                wasm,
+                tenant,
+                session,
+                request.body,
+                deadline_ticks,
+            )
             .await
         {
             Ok(result) => result,
