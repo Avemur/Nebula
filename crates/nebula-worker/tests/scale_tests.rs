@@ -112,8 +112,20 @@ impl Cluster {
                 .await;
         });
 
-        let gateway =
-            Arc::new(Gateway::open(membership.clone(), registry.clone()).expect("gateway"));
+        let gateway = Arc::new(
+            Gateway::open(membership.clone(), registry.clone())
+                .expect("gateway")
+                // These tests fire a thousand requests as one tenant, which
+                // is precisely what §22.7 exists to refuse. Opting out is
+                // stated rather than sidestepped with a generous default: a
+                // load test that silently measures the rate limiter is
+                // measuring the wrong thing, and one tuned to stay under it
+                // is worse.
+                .with_limits(
+                    nebula_control::ratelimit::Limit::NONE,
+                    nebula_control::ratelimit::Limit::NONE,
+                ),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = listener.local_addr().unwrap().to_string();
         let state = gateway.clone();

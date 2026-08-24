@@ -10,6 +10,7 @@
 pub mod gateway;
 pub mod idempotency;
 pub mod membership;
+pub mod ratelimit;
 pub mod registry;
 pub mod ring;
 pub mod server;

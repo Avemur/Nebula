@@ -20,6 +20,7 @@ use tonic::Code;
 
 use crate::idempotency;
 use crate::membership::Membership;
+use crate::ratelimit::{Decision, Limit, Limiter};
 use crate::registry::{Deployments, Registry, MAX_ARTIFACT_BYTES};
 use crate::trace;
 use crate::wizer;
@@ -85,6 +86,10 @@ pub struct Gateway {
     workers: Mutex<HashMap<String, NebulaWorkerClient<Channel>>>,
     /// Answers to already-served keyed requests (§22.4).
     idempotency: idempotency::Store<Answer>,
+    /// Per-tenant fairness (§22.7). Two buckets, because a deploy runs Wizer
+    /// and an execution does not.
+    execute_limit: Limiter,
+    deploy_limit: Limiter,
 }
 
 /// The result of a successful deploy.
@@ -138,7 +143,20 @@ impl Gateway {
             functions: Mutex::new(functions),
             workers: Mutex::new(HashMap::new()),
             idempotency: idempotency::Store::new(),
+            execute_limit: Limiter::new(Limit::EXECUTE),
+            deploy_limit: Limiter::new(Limit::DEPLOY),
         })
+    }
+
+    /// Replaces the default rate limits.
+    ///
+    /// Exists for tests, which cannot wait out a 50/s bucket without becoming
+    /// slow and flaky — and a limiter nobody can test at its edges is a limiter
+    /// nobody knows the edges of.
+    pub fn with_limits(mut self, execute: Limit, deploy: Limit) -> Self {
+        self.execute_limit = Limiter::new(execute);
+        self.deploy_limit = Limiter::new(deploy);
+        self
     }
 
     pub fn content_hash_of(&self, function_id: &str) -> Option<String> {
@@ -319,8 +337,14 @@ async fn publish(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if tenant_of(&headers).is_none() {
+    let Some(tenant) = tenant_of(&headers) else {
         return unauthorized().into_response();
+    };
+    // Checked before `publish`, which is where Wizer runs the caller's guest
+    // code in a subprocess (§11.1) — the single most expensive thing this
+    // endpoint can be asked to do.
+    if let Decision::Limited { retry_after } = gateway.deploy_limit.check(&tenant) {
+        return rate_limited(retry_after).into_response();
     }
     match gateway.publish(&function_id, &body).await {
         Ok(published) => (
@@ -391,6 +415,13 @@ async fn answer_for(
         return unauthorized();
     };
     tracing::Span::current().record("tenant", tenant.as_str());
+
+    // Before the deployment lookup, the ring walk, and the idempotency claim:
+    // a refused request should cost a hash and nothing else, or the limiter
+    // becomes its own load amplifier.
+    if let Decision::Limited { retry_after } = gateway.execute_limit.check(&tenant) {
+        return rate_limited(retry_after);
+    }
 
     let Some(deadline_ms) = deadline_of(headers) else {
         return fault(
@@ -582,6 +613,7 @@ fn to_http(response: ExecuteResponse, deadline_ms: u32) -> Answer {
         deadline_ms: Some(deadline_ms),
         replayed: false,
         trace_id: None,
+        retry_after: None,
     }
 }
 
@@ -635,6 +667,9 @@ pub struct Answer {
     /// caller can find a rejected request in its own trace — those are the ones
     /// it most wants to find.
     trace_id: Option<String>,
+    /// Whole seconds, when the answer can say something more useful than the
+    /// flat `Retry-After: 1` that 503 carries (§22.7).
+    retry_after: Option<u64>,
 }
 
 impl Answer {
@@ -675,11 +710,18 @@ impl IntoResponse for Answer {
         if let Some(kind) = self.fault {
             headers.insert(FAULT_HEADER, HeaderValue::from_static(kind));
         }
-        // `Retry-After` rides along with 503 because that status *means* "try
-        // again" — not a special case, just the definition. 502 still does not
-        // get one: §22.4 explains why a key does not make that safe either.
+        // `Retry-After` rides along with 503 and 429 because both statuses
+        // *mean* "try again" — not a special case, just the definition. 502
+        // still does not get one: §22.4 explains why a key does not make that
+        // safe either.
         if self.status == StatusCode::SERVICE_UNAVAILABLE {
             headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        if let Some(value) = self
+            .retry_after
+            .and_then(|s| HeaderValue::from_str(&s.to_string()).ok())
+        {
+            headers.insert(header::RETRY_AFTER, value);
         }
         if self.status == StatusCode::UNAUTHORIZED {
             headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
@@ -728,6 +770,21 @@ fn fault(status: StatusCode, kind: &'static str, detail: impl Into<String>) -> A
         deadline_ms: None,
         replayed: false,
         trace_id: None,
+        retry_after: None,
+    }
+}
+
+/// §22.7. A `429` rather than a `503`: the cluster is fine, this caller is
+/// simply ahead of its own budget, and telling it "service unavailable" would
+/// point it at the wrong problem.
+fn rate_limited(retry_after: std::time::Duration) -> Answer {
+    Answer {
+        retry_after: Some(retry_after.as_secs().max(1)),
+        ..fault(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "tenant rate limit exceeded",
+        )
     }
 }
 

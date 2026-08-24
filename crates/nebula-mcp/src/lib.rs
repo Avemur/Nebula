@@ -24,7 +24,7 @@
 //!
 //! Streamable HTTP, `POST /mcp`, JSON responses. The spec permits answering
 //! with `application/json` instead of an SSE stream, and without streaming
-//! results (§22.8 item 9) there is nothing to stream.
+//! results (§22.9 item 9) there is nothing to stream.
 //!
 //! ponytail: no session ids, no SSE, no batching. Batching was removed from the
 //! protocol in the 2025-06-18 revision, so its absence is compliance rather
@@ -316,6 +316,17 @@ fn explain(reply: &crate::gateway::Reply, timeout_ms: u32, function_id: &str) ->
         "worker_unreachable" => "The connection to the sandbox dropped after the script was sent. \
              It may or may not have run. Retry only if running it twice is safe."
             .to_string(),
+        // §22.7. The one fault whose cause is the agent's own behaviour rather
+        // than its code, so it is the one where "retry in a moment" and "retry
+        // immediately" are opposite instructions.
+        "rate_limited" => format!(
+            "This tool is being called faster than its rate limit allows. Nothing ran.              Wait {} before calling it again, and avoid retrying in a tight loop.",
+            match reply.retry_after {
+                Some(1) => "a second".to_string(),
+                Some(seconds) => format!("{seconds} seconds"),
+                None => "a moment".to_string(),
+            }
+        ),
         "no_healthy_worker" | "no_reachable_worker" | "cluster_at_capacity" | "worker_shed" => {
             "Nebula has no capacity to run the script right now. Nothing ran. \
              Retrying in a moment is reasonable."

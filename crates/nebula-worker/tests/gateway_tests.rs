@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use nebula_control::gateway::{self, Gateway};
 use nebula_control::membership::{self, Membership};
+use nebula_control::ratelimit::Limit;
 use nebula_control::registry::Registry;
 use nebula_control::server::ControlService;
 use nebula_proto::nebula_control_server::NebulaControlServer;
@@ -197,6 +198,14 @@ struct Worker {
 
 impl Cluster {
     async fn start(liveness: Duration) -> Self {
+        // Existing tests predate the limiter and are not about it; leaving them
+        // subject to the real defaults would make an unrelated failure look
+        // like a routing bug.
+        Self::with_limits(liveness, Limit::NONE, Limit::NONE).await
+    }
+
+    /// A cluster with real rate limits, for the tests that are about them.
+    async fn with_limits(liveness: Duration, execute: Limit, deploy: Limit) -> Self {
         // Quiet unless NEBULA_LOG says otherwise.
         nebula_worker::init_tracing_with_default("off");
         let membership = Arc::new(Membership::new(liveness));
@@ -212,8 +221,11 @@ impl Cluster {
                 .await;
         });
 
-        let gateway =
-            Arc::new(Gateway::open(membership.clone(), registry.clone()).expect("gateway"));
+        let gateway = Arc::new(
+            Gateway::open(membership.clone(), registry.clone())
+                .expect("gateway")
+                .with_limits(execute, deploy),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = listener.local_addr().unwrap().to_string();
         let state = gateway.clone();
@@ -961,4 +973,164 @@ async fn a_replayed_answer_reports_the_trace_that_asked_for_it() {
         .header("x-nebula-trace-id")
         .expect("a replay is still a request");
     assert_ne!(replayed, CALLER_TRACE_ID);
+}
+
+// ---------------------------------------------------------------------------
+// Per-tenant rate limiting (§22.7)
+// ---------------------------------------------------------------------------
+
+/// Two requests up front, then one every ten seconds — so within a test, the
+/// third request is refused and stays refused.
+const TWO_THEN_NOTHING: Limit = Limit {
+    per_second: 0.1,
+    burst: 2.0,
+};
+
+#[tokio::test]
+async fn a_tenant_over_its_budget_is_told_so_and_told_when_to_return() {
+    let mut cluster = Cluster::with_limits(
+        Duration::from_secs(5),
+        TWO_THEN_NOTHING,
+        nebula_control::ratelimit::Limit::NONE,
+    )
+    .await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    assert_eq!(cluster.post("echo", "acme", b"a").await.status, 200);
+    assert_eq!(cluster.post("echo", "acme", b"b").await.status, 200);
+
+    let refused = cluster.post("echo", "acme", b"c").await;
+    // A 429 rather than a 503: the cluster is fine, this caller is ahead of its
+    // own budget, and "service unavailable" would send it looking at the wrong
+    // problem entirely.
+    assert_eq!(refused.status, 429);
+    assert_eq!(refused.header("x-nebula-fault"), Some("rate_limited"));
+    assert!(
+        refused.header("retry-after").is_some(),
+        "a refusal with no advice on when to come back invites a hot loop"
+    );
+}
+
+#[tokio::test]
+async fn a_noisy_tenant_does_not_spend_a_quiet_ones_budget() {
+    let mut cluster = Cluster::with_limits(
+        Duration::from_secs(5),
+        TWO_THEN_NOTHING,
+        nebula_control::ratelimit::Limit::NONE,
+    )
+    .await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    // This is the whole reason the limiter is per-tenant rather than global.
+    // §10.3 sheds when the *cluster* is busy and cannot tell a noisy neighbour
+    // from a busy day; a global limiter would make every tenant pay for one.
+    for _ in 0..4 {
+        cluster.post("echo", "noisy", b"x").await;
+    }
+    assert_eq!(cluster.post("echo", "noisy", b"x").await.status, 429);
+
+    let quiet = cluster.post("echo", "polite", b"x").await;
+    assert_eq!(quiet.status, 200);
+    assert_eq!(quiet.text(), "x");
+}
+
+#[tokio::test]
+async fn a_refused_request_never_reaches_a_worker() {
+    let mut cluster = Cluster::with_limits(
+        Duration::from_secs(5),
+        TWO_THEN_NOTHING,
+        nebula_control::ratelimit::Limit::NONE,
+    )
+    .await;
+    cluster.add_worker(2, 4).await;
+
+    // Deliberately *not* deployed. A refused request must be rejected before
+    // the deployment lookup and the ring walk, so a limiter under attack costs
+    // a hash rather than becoming its own load amplifier. If the check moved
+    // below the lookup, these would be 404 and the ordering bug would be
+    // invisible.
+    for _ in 0..2 {
+        assert_eq!(
+            cluster.post("never-deployed", "acme", b"x").await.status,
+            404
+        );
+    }
+    let refused = cluster.post("never-deployed", "acme", b"x").await;
+    assert_eq!(refused.status, 429);
+    assert_eq!(refused.header("x-nebula-fault"), Some("rate_limited"));
+}
+
+#[tokio::test]
+async fn deploys_are_limited_far_harder_than_executions() {
+    let mut cluster = Cluster::with_limits(
+        Duration::from_secs(5),
+        nebula_control::ratelimit::Limit::NONE,
+        Limit {
+            per_second: 0.01,
+            burst: 2.0,
+        },
+    )
+    .await;
+    cluster.add_worker(2, 4).await;
+
+    // `PUT /functions/{id}` runs Wizer, which spawns a subprocess and executes
+    // the caller's guest code on the control plane (§11.1). An unlimited deploy
+    // endpoint is a far cheaper way to hurt this process than an unlimited
+    // execute endpoint, which at least has §10.3 behind it.
+    for n in 0..2 {
+        let response = http(
+            &cluster.http_addr,
+            "PUT",
+            &format!("/functions/deploy-{n}"),
+            Some("acme"),
+            &[],
+            ECHO.as_bytes(),
+        )
+        .await;
+        assert_eq!(response.status, 201);
+    }
+
+    let refused = http(
+        &cluster.http_addr,
+        "PUT",
+        "/functions/deploy-3",
+        Some("acme"),
+        &[],
+        ECHO.as_bytes(),
+    )
+    .await;
+    assert_eq!(refused.status, 429);
+    assert_eq!(refused.header("x-nebula-fault"), Some("rate_limited"));
+
+    // Executions are untouched by the deploy bucket: two limits, two budgets.
+    cluster.publish("echo", ECHO).await;
+    assert_eq!(cluster.post("echo", "acme", b"x").await.status, 200);
+}
+
+#[tokio::test]
+async fn a_rate_limited_request_still_reports_its_trace() {
+    let mut cluster = Cluster::with_limits(
+        Duration::from_secs(5),
+        Limit {
+            per_second: 0.1,
+            burst: 1.0,
+        },
+        nebula_control::ratelimit::Limit::NONE,
+    )
+    .await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    cluster.post("echo", "acme", b"x").await;
+    let refused = cluster
+        .post_with("echo", "acme", &[("traceparent", TRACEPARENT)], b"x")
+        .await;
+
+    // §22.6: a throttled call is one an agent very much wants to find in its
+    // own trace, because it explains a latency spike that has nothing to do
+    // with the code it ran.
+    assert_eq!(refused.status, 429);
+    assert_eq!(refused.header("x-nebula-trace-id"), Some(CALLER_TRACE_ID));
 }

@@ -770,14 +770,15 @@ apart. The header names the cause:
 | `unauthorized` | 401 | Missing or malformed bearer token |
 | `invalid_deadline` / `invalid_request` / `invalid_idempotency_key` | 400 | Caller's request is malformed |
 | `idempotency_in_flight` | 409 | A request with this `Idempotency-Key` is still running (§22.4) |
+| `rate_limited` | 429 | This tenant is ahead of its own budget; carries `Retry-After` (§22.7) |
 | `no_healthy_worker` | 503 | The ring is empty |
 | `no_reachable_worker` | 503 | No candidate accepted a connection; nothing ran |
 | `cluster_at_capacity` / `worker_shed` | 503 | Admission control refused (§10.3) |
 | `worker_unreachable` | 502 | Sent, then the connection failed; may or may not have run (§10.2) |
 
-Every `503` carries `Retry-After`. `502` deliberately does not — §10.2 forbids
-retrying a request that may already have executed, and inviting a retry would
-undo that. An `Idempotency-Key` does **not** change this: the gateway never
+Every `503` and `429` carries `Retry-After`. `502` deliberately does not —
+§10.2 forbids retrying a request that may already have executed, and inviting a
+retry would undo that. An `Idempotency-Key` does **not** change this: the gateway never
 received an answer to replay, so the retry is exactly as unsafe as before
 (§22.4).
 
@@ -1151,7 +1152,7 @@ nebula/
 │   │   ├── src/{engine,host,kv,cache}.rs
 │   │   └── tests/{sandbox,host,cache,interpreter}_tests.rs, wizer_bench.rs
 │   ├── nebula-control/         # bin: gateway + ring + registry + membership + wizer
-│   │   └── src/{gateway,ring,registry,membership,server,wizer,idempotency,trace}.rs
+│   │   └── src/{gateway,ring,registry,membership,server,wizer,idempotency,trace,ratelimit}.rs
 │   ├── nebula-worker/          # bin: gRPC server wrapping nebula-runtime
 │   │   ├── src/{server,exec_pool,heartbeat}.rs
 │   │   └── tests/{mesh,gateway,scale}_tests.rs
@@ -1438,8 +1439,8 @@ v1, they replace Phase 4 — they do not fit alongside it.
 | mTLS on internal gRPC | Before any deployment on an untrusted network |
 | Multi-instance control plane | When the SPOF matters more than the simplicity |
 | WASI preview 2 / component model | When guest toolchains emit components as reliably as p1 modules |
-| Outbound HTTP host function | When a guest needs it — the largest new attack surface (SSRF, egress policy). Agent workloads will ask; §22.7 sets the terms |
-| Per-tenant rate limiting at the gateway | Before multi-tenant exposure to untrusted callers — an agent in a retry loop is one (§22.8) |
+| Outbound HTTP host function | When a guest needs it — the largest new attack surface (SSRF, egress policy). Agent workloads will ask; §22.8 sets the terms |
+| Per-tenant rate limiting at the gateway | Before multi-tenant exposure to untrusted callers — an agent in a retry loop is one. **Built**, §22.7 |
 
 ---
 
@@ -1456,9 +1457,9 @@ rest is scoped here.
 
 The ranking is the point: items 22.1–22.3 are what "works with agents" actually
 means, and the rest are sharp edges agent traffic will find in a system tuned
-for web handlers. **§22.1, §22.3, §22.4 and §22.6 are built** — the JavaScript
-interpreter guest, the MCP server, idempotency keys, and W3C trace context. The
-rest is scoped, not written.
+for web handlers. **§22.1, §22.3, §22.4, §22.6 and §22.7 are built** — the
+JavaScript interpreter guest, the MCP server, idempotency keys, W3C trace
+context, and per-tenant rate limits. The rest is scoped, not written.
 
 ### 22.1 Interpreter guests — the prerequisite for everything else
 
@@ -1704,7 +1705,7 @@ what it would do in a REPL.
 
 ponytail: Streamable HTTP only — `POST /mcp`, JSON responses, no SSE, no
 session ids, no batching. The spec permits answering with `application/json`
-rather than an event stream, and with no streaming results (§22.8 item 9) there
+rather than an event stream, and with no streaming results (§22.9 item 9) there
 is nothing to stream. Batching was removed from the protocol in the 2025-06-18
 revision, so its absence is compliance rather than a shortcut. Sessions become
 worth having when §22.5 does.
@@ -1725,9 +1726,9 @@ gateway's — duplication without a check is a bug with a delay on it.
 #### Before pointing it at anything untrusted
 
 An MCP endpoint is by construction the thing you hand to something that loops.
-Per-tenant rate limiting (§21, §22.8 item 7) is not optional once this is
-exposed, and v1 auth is still a static bearer token that doubles as the tenant
-id (§13). Both are known; neither is built.
+Per-tenant rate limiting (§22.7) landed for exactly this reason. v1 auth is
+still a static bearer token that doubles as the tenant id (§13), and that one is
+known and not built.
 
 ### 22.4 Idempotency keys — because agent frameworks retry by default
 
@@ -1942,7 +1943,95 @@ is a correlation handle, nothing authorizes on it, and a collision costs two
 requests sharing a line in a log viewer. If that ever stops being true it needs
 a real RNG, and the comment in `trace.rs` says so.
 
-### 22.7 Egress — the one every agent workload asks for, and the one to gate
+### 22.7 Per-tenant rate limits — the thing §10.3 cannot do
+
+**Status: built.** `crates/nebula-control/src/ratelimit.rs`.
+
+§10.3 sheds load at the *worker* when the cluster is saturated. That protects
+the cluster and says nothing about **who** caused the saturation: one tenant in
+a retry loop consumes every admission slot, and every other tenant sees `503`.
+Shedding cannot tell a noisy neighbour from a busy day, because by the time a
+request reaches admission control the only fact left is that the queue is full.
+
+An MCP endpoint (§22.3) is by construction the thing you hand to something that
+loops, so this stopped being optional the moment that landed.
+
+```
+POST /execute/{function_id}
+  ->  429 X-Nebula-Fault: rate_limited
+      Retry-After: <seconds until a token exists>
+```
+
+Token buckets, keyed by tenant, refilled lazily from elapsed time on access —
+a timer per tenant would be a scheduler's worth of machinery for arithmetic
+that fits on one line.
+
+| Bucket | Rate | Burst | Why |
+|---|---|---|---|
+| Execute | 200/s | 400 | §19 targets a 5 ms hot p99, so a legitimate client can drive hundreds per second. A tight limit would make Nebula look slow rather than fair; a runaway loop does thousands and is still caught. |
+| Deploy | 1 per 5 s | 5 | `PUT /functions/{id}` runs **Wizer**, which spawns a subprocess and executes the caller's guest code on the control plane (§11.1). |
+
+**The deploy bucket is three orders of magnitude tighter, and that asymmetry is
+the point.** An unlimited execute endpoint still has §10.3 behind it. An
+unlimited deploy endpoint is a way to make the control plane run arbitrary guest
+code in a subprocess as fast as a client can `PUT`, and nothing downstream would
+slow it down. A `const` assertion holds the two apart, so closing the gap is a
+build failure rather than a test failure an afternoon later.
+
+**`429`, not `503`.** The cluster is fine; this caller is ahead of its own
+budget. Answering "service unavailable" would send it looking at the wrong
+problem — and `x-nebula-fault: rate_limited` is what lets an agent tell "slow
+down" from "Nebula is broken", which are opposite instructions. `Retry-After`
+carries the real wait, rounded up and never zero: a `Retry-After: 0` invites an
+immediate retry into another refusal.
+
+**The check runs before the deployment lookup, the ring walk, and the
+idempotency claim.** A refused request should cost a hash and nothing else, or
+the limiter becomes its own load amplifier. There is a test for the ordering,
+and it works by asking for a function that was never deployed: if the check ever
+slid below the lookup, the refusals would come back `404` and the bug would be
+invisible.
+
+#### The limiter's own state is bounded
+
+v1 auth makes the bearer token *be* the tenant (§13), so a caller can invent
+tenants for free. An unbounded map keyed on an attacker-chosen string would be a
+memory-exhaustion vector created by the very thing meant to prevent one — the
+same mistake §22.4 shipped and had to fix, so it was designed in here rather
+than found later.
+
+The map caps at 10,000 tenants. When full it first drops buckets that have
+refilled to capacity, since a full bucket carries no debt and forgetting it
+changes nothing. If it is still full, **a newcomer is refused rather than waved
+through**: admitting an untracked tenant would hand unlimited capacity to
+exactly the caller that filled the map. Tenants already in the map keep their
+own budgets, so the cost of being wrong is one new tenant waiting while somebody
+looks at why ten thousand are active.
+
+That is the opposite of §22.4's choice, where a full store lets the request
+through unkeyed. The difference is what failing open costs: losing a replay is
+an inconvenience, losing a rate limit under a flood is the flood.
+
+#### Load tests opt out, loudly
+
+`scale_tests.rs` fires a thousand requests as one tenant, which is precisely
+what this refuses. It passes `Limit::NONE` with a comment saying so, rather than
+the two quieter options: raising the default until the test fits under it, or
+tuning the test to stay below the limit. A load test that silently measures the
+rate limiter is measuring the wrong thing, and one shaped to avoid it is worse —
+it looks like a routing result and is really a limiter result.
+
+ponytail: one `HashMap` behind a `Mutex`, checked on the request path. The whole
+module is arithmetic and a lock. Per-function or per-endpoint limits, a
+distributed limiter shared across control planes, and adaptive limits all belong
+to a system that has measured this one being wrong.
+
+**Still not built: authentication worth the name.** A bearer token that *is* the
+tenant means anyone can pick any tenant, so these buckets meter a self-declared
+identity. That is enough to stop an honest client's runaway loop and not enough
+to stop a dishonest one, which is exactly what §13 already says about v1 auth.
+
+### 22.8 Egress — the one every agent workload asks for, and the one to gate
 
 "Fetch this URL and summarise it" is the second thing anyone asks a code
 sandbox to do. §21 already defers an outbound HTTP host function on the grounds
@@ -1965,7 +2054,7 @@ code:
 The `-1`-on-refusal convention of §7.2 extends naturally: a blocked host is a
 refusal the guest can handle, not a trap.
 
-### 22.8 Ranked, with what each one costs
+### 22.9 Ranked, with what each one costs
 
 | # | Item | Unlocks | Cost | Verdict |
 |---|---|---|---|---|
@@ -1975,8 +2064,8 @@ refusal the guest can handle, not a trap.
 | 4 | **Idempotency keys** (§22.4) | Safe retries when the *client* lost the answer | One bounded map | **Built.** It does not fix `502` — §22.4 retracts that claim |
 | 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse, forwarded through the mesh | **Built.** Also fixed a `request_id` that named a function, not a request |
 | 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | Do, and say plainly that it is best-effort |
-| 7 | **Per-tenant rate limits** (§21) | Survival | A token bucket per tenant | Before any untrusted caller — an agent in a retry loop *is* a load test |
-| 8 | **Egress** (§22.7) | Network-using tools | Its own threat model | Gate behind §13 review, never ship it casually |
+| 7 | **Per-tenant rate limits** (§22.7) | Survival, and fairness §10.3 cannot provide | A token bucket per tenant | **Built.** An agent in a retry loop *is* a load test |
+| 8 | **Egress** (§22.8) | Network-using tools | Its own threat model | Gate behind §13 review, never ship it casually |
 | 9 | Streaming responses | Incremental output | Reworks `response_write` into a flushing channel | Defer — buffered output is correct, just less pretty |
 | 10 | Actor pins (§21) | True stateful sessions | Leases, fencing, eviction rework | Stays deferred; §22.5 covers the demand that would otherwise force it |
 

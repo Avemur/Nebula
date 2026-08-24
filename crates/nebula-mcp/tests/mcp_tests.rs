@@ -39,6 +39,7 @@ struct Canned {
     status: StatusCode,
     fault: Option<&'static str>,
     body: &'static str,
+    retry_after: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -74,6 +75,9 @@ async fn stub_execute(
     if let Some(fault) = canned.fault {
         out.insert(FAULT_HEADER, fault.parse().unwrap());
     }
+    if let Some(seconds) = canned.retry_after {
+        out.insert("retry-after", seconds.parse().unwrap());
+    }
     (canned.status, out, canned.body).into_response()
 }
 
@@ -93,6 +97,7 @@ impl Harness {
                 status: StatusCode::OK,
                 fault: None,
                 body: "",
+                retry_after: None,
             })),
         };
 
@@ -145,6 +150,16 @@ impl Harness {
             status,
             fault,
             body,
+            retry_after: None,
+        };
+    }
+
+    fn answer_rate_limited(&self, seconds: &'static str) {
+        *self.stub.canned.lock().unwrap() = Canned {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            fault: Some("rate_limited"),
+            body: "",
+            retry_after: Some(seconds),
         };
     }
 
@@ -539,4 +554,27 @@ async fn an_untraced_call_forwards_nothing_and_a_dangerous_one_is_dropped() {
         )
         .await;
     assert_eq!(harness.last_seen().traceparent, "");
+}
+
+#[tokio::test]
+async fn being_throttled_tells_the_agent_to_slow_down_and_by_how_much() {
+    let harness = Harness::start().await;
+    harness.answer_rate_limited("7");
+
+    // §22.7 is the one fault caused by the agent's own behaviour rather than by
+    // its code. "Nothing ran" and "wait" are both load-bearing: an agent told
+    // only that something failed will retry immediately, which is exactly the
+    // loop that got it throttled.
+    let (text, is_error) = harness.call(json!({"source": "1"})).await;
+    assert!(is_error);
+    assert!(text.contains("7 seconds"), "{text}");
+    assert!(text.contains("Nothing ran"), "{text}");
+    assert!(text.contains("loop"), "{text}");
+
+    // A 429 without a Retry-After still has to say something useful rather
+    // than render "wait None".
+    harness.answer_with(StatusCode::TOO_MANY_REQUESTS, Some("rate_limited"), "");
+    let (text, _) = harness.call(json!({"source": "1"})).await;
+    assert!(text.contains("a moment"), "{text}");
+    assert!(!text.contains("None"), "{text}");
 }

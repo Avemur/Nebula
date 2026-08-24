@@ -38,6 +38,8 @@ pub struct Reply {
     pub status: u16,
     /// `X-Nebula-Fault`, absent on success.
     pub fault: Option<String>,
+    /// `Retry-After` in whole seconds, when the gateway said how long to wait.
+    pub retry_after: Option<u64>,
     pub body: Vec<u8>,
 }
 
@@ -124,6 +126,7 @@ fn parse(raw: &[u8]) -> io::Result<Reply> {
     Ok(Reply {
         status,
         fault: headers.get(FAULT_HEADER).cloned(),
+        retry_after: headers.get("retry-after").and_then(|v| v.parse().ok()),
         body: raw[split + 4..].to_vec(),
     })
 }
