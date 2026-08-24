@@ -793,15 +793,16 @@ received an answer to replay, so the retry is exactly as unsafe as before
 ```
 
 PUT  /functions/{function_id}      # deploy: body is the .wasm artifact
-     -> 201 { "content_hash": "...", "wizened": bool }
+     X-Nebula-Tool-Schema: <opt, JSON descriptor, <= 16 KiB, §22.2>
+     -> 201 { "content_hash": "...", "wizened": bool, "described": bool }
      # no compile timing: compilation happens lazily on the worker, not here
 GET  /healthz                      # gateway liveness
 GET  /cluster                      # node list, ring occupancy, per-node load
-
-# Designed, not built. Recorded rather than deleted because all three are
-# wanted and none is blocked -- they are simply not yet earned by a caller.
-GET  /functions/{function_id}      # metadata
 GET  /tools                        # tool descriptors for agent clients (§22.2)
+
+# Designed, not built. Recorded rather than deleted because both are wanted and
+# neither is blocked -- they are simply not yet earned by a caller.
+GET  /functions/{function_id}      # metadata
 GET  /metrics                      # Prometheus exposition
 ```
 
@@ -1167,7 +1168,8 @@ nebula/
 │   │   ├── src/{engine,host,kv,cache,egress}.rs
 │   │   └── tests/{sandbox,host,cache,interpreter}_tests.rs, wizer_bench.rs
 │   ├── nebula-control/         # bin: gateway + ring + registry + membership + wizer
-│   │   └── src/{gateway,ring,registry,membership,server,wizer,idempotency,trace,ratelimit}.rs
+│   │   └── src/{gateway,ring,registry,membership,server,wizer,
+│   │             idempotency,trace,ratelimit}.rs
 │   ├── nebula-worker/          # bin: gRPC server wrapping nebula-runtime
 │   │   ├── src/{server,exec_pool,heartbeat}.rs
 │   │   └── tests/{mesh,gateway,scale}_tests.rs
@@ -1473,9 +1475,9 @@ rest is scoped here.
 
 The ranking is the point: items 22.1–22.3 are what "works with agents" actually
 means, and the rest are sharp edges agent traffic will find in a system tuned
-for web handlers. **Everything except §22.2 is built** — the JavaScript
-interpreter guest, the MCP server, idempotency keys, session continuity, W3C
-trace context, per-tenant rate limits, and gated outbound HTTP.
+for web handlers. **All of it is built** — the JavaScript interpreter guest,
+tool metadata, the MCP server, idempotency keys, session continuity, W3C trace
+context, per-tenant rate limits, and gated outbound HTTP.
 
 ### 22.1 Interpreter guests — the prerequisite for everything else
 
@@ -1617,35 +1619,74 @@ starts from the constraint instead of discovering it.
 
 ### 22.2 Tool metadata — an agent cannot call what it cannot describe
 
-**Status: not built, and no longer blocking.** §22.3 ships with a single
-constant descriptor for the interpreter, so `tools/list` has an answer without
-this. What follows is the story for *purpose-built* wasm tools — a deployed
-module that is not "run this JavaScript" — which still needs it.
+**Status: built.** The registry carries descriptors, `GET /tools` serves them,
+and §22.3 merges them into `tools/list`.
 
 `PUT /functions/{id}` stores bytes. An agent loop needs a name, a description,
 and a JSON Schema for the arguments, because that is the payload every model
-provider's tool-calling API expects.
-
-This is a registry field, not a subsystem: extend `Deployments` (§11.1) with an
-optional per-function descriptor, bump `DEPLOYMENTS_VERSION`, and accept it on
-deploy. The existing on-disk versioning already refuses an unrecognised
-version rather than shrugging, so the migration is a version bump and nothing
-else.
+provider's tool-calling API expects. Without one, a deployed function exists and
+no agent can find it.
 
 ```
-PUT /functions/{id}
-  X-Nebula-Tool-Schema: <opt, JSON, <= 16 KiB>
-  ->  201 { "content_hash": "...", "wizened": bool, "described": bool }
+PUT /functions/summarise
+  X-Nebula-Tool-Schema: {"description":"Summarises text.",
+                         "input_schema":{"type":"object",
+                                         "properties":{"text":{"type":"string"}}}}
+  ->  201 { "content_hash": "...", "wizened": bool, "described": true }
 
 GET /tools
-  ->  200 [ { "name", "description", "input_schema" }, ... ]
+  ->  200 [ { "name": "summarise", "description": "...", "input_schema": {...} } ]
 ```
 
-`GET /tools` returns the array in the shape the Anthropic and OpenAI tool APIs
-already take, so wiring an agent is a paste rather than a translation layer.
-Schema *validation* stays out: the guest already has to defend against
-arbitrary bytes (§7.3), and a gateway that validates is a gateway that has an
-opinion about the guest's ABI.
+The name is the `function_id` rather than a separate field — one identity is
+easier to reason about than two that can disagree. The array comes back in the
+shape the Anthropic and OpenAI tool APIs already take, so wiring an agent is a
+paste rather than a translation layer.
+
+**Schema validation stays out.** The guest already has to defend itself against
+arbitrary bytes (§7.3), and a gateway that validates schemas is a gateway with
+an opinion about the guest's ABI. The descriptor is stored and served untouched.
+
+#### Four decisions
+
+**A second map, not a richer value type.** Descriptors live in
+`Deployments.tools` beside the existing `function_id → hash` map, behind
+`serde(default)`. That is the entire migration story: a table written before
+tools existed still loads, so there is no version bump. Making the value a
+struct would have been tidier and would have refused **every deployment table
+already on disk**, because an unrecognised version stops startup by design
+(§11.1). A test writes a v1 file and asserts it still loads.
+
+**An undescribed function is deployed but not advertised.** `GET /tools` lists
+only what has a descriptor. A tool a model cannot understand is worse than one
+it cannot see — it will call the first and guess at the arguments.
+
+**A redeploy without a descriptor clears the old one.** A stale description of a
+function that has since changed is how a model gets told confidently wrong
+things about what it is calling.
+
+**An unusable descriptor is a `400`, not a silent drop.** Malformed JSON, a
+missing or blank `description`, or more than 16 KiB. A caller that sent one
+expects an agent to be able to find the function; deploying it undescribed would
+look like success and produce a tool nobody can call.
+
+#### What this changed in §22.3
+
+`tools/list` now returns the interpreter *plus* every described function, with
+the interpreter first — it is what an agent reaches for by default, and a client
+truncating a long list should keep it. `tools/call` dispatches by name:
+`run_javascript` is the one tool whose arguments the adapter understands, and
+everything else has its arguments passed through as the request body, so a newly
+deployed tool needs no change to the adapter at all.
+
+Two consequences worth stating. If the cluster is unreachable, `tools/list`
+returns the interpreter alone rather than an error — failing would leave a
+client with *no* tools, including the built-in one, which is a worse answer.
+And an unrecognised tool name goes to the cluster rather than being refused
+locally: the adapter does not cache `tools/list`, so a name it has never heard
+of and one undeployed a second ago look identical. Asking costs one round trip;
+checking locally would cost two, and the answer names the tool back and points
+at `tools/list`.
 
 ### 22.3 MCP — the actual interoperability standard
 
@@ -1667,18 +1708,18 @@ It is a thin adapter, not a new system — every method maps onto something
 | MCP method | Nebula |
 |---|---|
 | `initialize` | Static capability advertisement |
-| `tools/list` | One tool descriptor, see below |
-| `tools/call` | `POST /execute/{id}`, the script as the body |
+| `tools/list` | The interpreter, plus `GET /tools` (§22.2) |
+| `tools/call` | `POST /execute/{id}`, the script or the arguments as the body |
 | `ping` | Answered locally; it asks about this server, not the cluster |
 
 #### One tool, not one per function
 
 §22.2 scoped a per-function descriptor because `tools/list` needed something to
-return. §22.1 then landed, and the agent-facing surface collapsed to a single
-tool — `run_javascript(source, timeout_ms)` — because an agent sends source, it
-does not deploy a module per snippet. **That took §22.2 off the critical path
-entirely.** It is still wanted, for purpose-built wasm tools that are not "run
-this JavaScript"; it is no longer a prerequisite for anything.
+return. §22.1 then landed, and the *default* surface collapsed to a single tool
+— `run_javascript(source, timeout_ms)` — because an agent sends source rather
+than deploying a module per snippet. That took §22.2 off the critical path, and
+it has since been built: `tools/list` returns the interpreter followed by every
+described function, and `tools/call` dispatches by name.
 
 The descriptor is a constant. The `timeout_ms` argument exists because §11.1's
 50 ms default suits a web handler and starves an agent; this adapter asks for
@@ -2239,7 +2280,7 @@ snapshot was worth nothing on this artifact. The interpreter now exports no
 | # | Item | Unlocks | Cost | Verdict |
 |---|---|---|---|---|
 | 1 | **Interpreter guests** (§22.1) | Agents can use Nebula *at all* | One guest crate, plus stdin/stdout as the request channel | **Built.** Everything else was decoration without it |
-| 2 | **Tool metadata + `GET /tools`** (§22.2) | Describing purpose-built wasm tools | A registry field and a version bump | Do — but §22.3 took it off the critical path |
+| 2 | **Tool metadata + `GET /tools`** (§22.2) | Describing purpose-built wasm tools | A second map in the registry, no version bump | **Built.** §22.3 lists and dispatches them |
 | 3 | **MCP server** (§22.3) | Any MCP client, no glue | A thin crate, no control-plane dependency | **Built.** The step where an off-the-shelf agent connects |
 | 4 | **Idempotency keys** (§22.4) | Safe retries when the *client* lost the answer | One bounded map | **Built.** It does not fix `502` — §22.4 retracts that claim |
 | 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse, forwarded through the mesh | **Built.** Also fixed a `request_id` that named a function, not a request |

@@ -56,6 +56,31 @@ impl Reply {
 }
 
 impl Gateway {
+    /// `GET /tools` — the descriptors of every deployed function that has one
+    /// (§22.2).
+    ///
+    /// Returns an empty list rather than an error when the cluster is
+    /// unreachable: `tools/list` failing would leave a client with *no* tools,
+    /// including the interpreter, which is a worse answer than the built-in one
+    /// on its own.
+    pub async fn tools(&self) -> Vec<serde_json::Value> {
+        let head = format!(
+            "GET /tools HTTP/1.1\r\n\
+             Host: nebula\r\n\
+             Connection: close\r\n\
+             Authorization: Bearer {}\r\n\r\n",
+            self.token
+        );
+
+        let Ok(reply) = self.send(&head, &[]).await else {
+            return Vec::new();
+        };
+        if reply.status != 200 {
+            return Vec::new();
+        }
+        serde_json::from_slice(&reply.body).unwrap_or_default()
+    }
+
     /// `POST /execute/{function_id}` with the script as the body.
     pub async fn execute(
         &self,
@@ -87,6 +112,10 @@ impl Gateway {
             body.len()
         );
 
+        self.send(&head, body).await
+    }
+
+    async fn send(&self, head: &str, body: &[u8]) -> io::Result<Reply> {
         let mut stream = TcpStream::connect(&self.address).await?;
         stream.write_all(head.as_bytes()).await?;
         stream.write_all(body).await?;

@@ -1336,6 +1336,7 @@ dependencies = [
  "nebula-control",
  "nebula-proto",
  "nebula-runtime",
+ "serde_json",
  "tokio",
  "tonic",
  "tracing",

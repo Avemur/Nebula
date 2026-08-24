@@ -60,7 +60,7 @@ pub const MAX_TIMEOUT_MS: u32 = 5_000;
 
 /// What the MCP client is told it can call.
 pub struct Server {
-    gateway: Gateway,
+    pub(crate) gateway: Gateway,
     /// The `function_id` the JavaScript interpreter of §22.1 is deployed under.
     function_id: String,
 }
@@ -192,7 +192,13 @@ async fn handle(State(server): State<Arc<Server>>, headers: HeaderMap, body: Str
             }),
         ),
         "ping" => result(id, json!({})),
-        "tools/list" => result(id, json!({"tools": [server.descriptor()]})),
+        "tools/list" => {
+            // The interpreter first: it is the tool an agent reaches for by
+            // default, and a client that truncates a long list should keep it.
+            let mut tools = vec![server.descriptor()];
+            tools.extend(server.gateway.tools().await);
+            result(id, json!({"tools": tools}))
+        }
         "tools/call" => call_tool(&server, id, rpc.params, traceparent.as_deref()).await,
         other => error(id, METHOD_NOT_FOUND, format!("unknown method `{other}`")),
     }
@@ -208,11 +214,19 @@ async fn call_tool(
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let arguments = params.get("arguments").unwrap_or(&Value::Null);
+
+    // A deployed tool (§22.2) is called by its `function_id`, with the
+    // arguments as the request body. The interpreter is the one tool whose
+    // arguments this adapter understands; everything else is passed through, so
+    // a new tool needs no change here.
     if name != TOOL_NAME {
-        return error(id, INVALID_PARAMS, format!("unknown tool `{name}`"));
+        if name.is_empty() {
+            return error(id, INVALID_PARAMS, "`name` is required");
+        }
+        return call_deployed(server, id, name, arguments, traceparent).await;
     }
 
-    let arguments = params.get("arguments").unwrap_or(&Value::Null);
     let Some(source) = arguments.get("source").and_then(Value::as_str) else {
         return error(
             id,
@@ -278,6 +292,65 @@ async fn call_tool(
         "tool call failed"
     );
     tool_result(id, explain(&reply, timeout_ms, &server.function_id), true)
+}
+
+/// Calls a function deployed with a descriptor (§22.2).
+///
+/// The arguments go over as a JSON body verbatim. This adapter does not
+/// validate them against the tool's own schema: the guest already has to defend
+/// itself against arbitrary bytes (§7.3), and a gateway that validates is a
+/// gateway with an opinion about the guest's ABI.
+async fn call_deployed(
+    server: &Server,
+    id: Value,
+    name: &str,
+    arguments: &Value,
+    traceparent: Option<&str>,
+) -> Response {
+    let body = arguments.to_string();
+    let span = tracing::info_span!("tools/call", tool = name);
+    let _entered = span.enter();
+
+    let reply = match server
+        .gateway
+        .execute(name, DEFAULT_TIMEOUT_MS, traceparent, body.as_bytes())
+        .await
+    {
+        Ok(reply) => reply,
+        Err(err) => {
+            tracing::warn!(%err, "gateway unreachable");
+            return tool_result(
+                id,
+                format!("Nebula is unreachable from this MCP server: {err}. Nothing ran."),
+                true,
+            );
+        }
+    };
+
+    if reply.status == 200 {
+        let text = reply.text();
+        let text = if text.is_empty() {
+            "(the tool produced no output)".to_string()
+        } else {
+            text
+        };
+        return tool_result(id, text, false);
+    }
+
+    // Whether the tool is deployed is a question only the cluster can answer:
+    // this adapter does not cache `tools/list`, so a name it has never heard of
+    // and a name that was undeployed a second ago look identical here. Asking
+    // costs one round trip; checking locally would cost two.
+    if reply.fault_or_unknown() == "unknown_function" {
+        return tool_result(
+            id,
+            format!(
+                "There is no tool named `{name}` on this Nebula cluster. Call                  tools/list to see what is available."
+            ),
+            true,
+        );
+    }
+    tool_result(id, explain(&reply, DEFAULT_TIMEOUT_MS, name), true)
 }
 
 /// Turns `X-Nebula-Fault` into something a model can act on.

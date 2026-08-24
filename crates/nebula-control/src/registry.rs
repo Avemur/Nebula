@@ -130,6 +130,34 @@ pub struct Deployments {
     pub version: u32,
     /// `function_id` to content hash. Ordered so the file has a stable diff.
     pub functions: BTreeMap<String, String>,
+    /// `function_id` to tool descriptor, for the functions that have one
+    /// (§22.2).
+    ///
+    /// A **second map rather than a richer value type**, and that is the whole
+    /// migration story: `serde(default)` means a table written before tools
+    /// existed still loads, so no version bump and no migration path. Making
+    /// the value a struct would have been tidier and would have refused every
+    /// deployment table already on disk, because an unrecognised version stops
+    /// startup by design.
+    #[serde(default)]
+    pub tools: BTreeMap<String, Tool>,
+}
+
+/// What an agent needs before it can call a function (§22.2).
+///
+/// Shaped to match what the Anthropic and OpenAI tool APIs already take, so
+/// wiring an agent is a paste rather than a translation layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    /// Free text for the model. The one field that decides whether a tool gets
+    /// called correctly or at all.
+    pub description: String,
+    /// JSON Schema for the arguments, passed through untouched.
+    ///
+    /// Deliberately not validated here. The guest already has to defend itself
+    /// against arbitrary bytes (§7.3), and a gateway that validates schemas is
+    /// a gateway with an opinion about the guest's ABI.
+    pub input_schema: serde_json::Value,
 }
 
 impl Deployments {
@@ -137,6 +165,7 @@ impl Deployments {
         Self {
             version: DEPLOYMENTS_VERSION,
             functions: BTreeMap::new(),
+            tools: BTreeMap::new(),
         }
     }
 }

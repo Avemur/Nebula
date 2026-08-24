@@ -21,7 +21,7 @@ use tonic::Code;
 use crate::idempotency;
 use crate::membership::Membership;
 use crate::ratelimit::{Decision, Limit, Limiter};
-use crate::registry::{Deployments, Registry, MAX_ARTIFACT_BYTES};
+use crate::registry::{Deployments, Registry, Tool, MAX_ARTIFACT_BYTES};
 use crate::trace;
 use crate::wizer;
 
@@ -46,6 +46,17 @@ pub const DEADLINE_HEADER: &str = "x-nebula-deadline-ms";
 /// worker" and "worker shed", 500 is both a guest trap and a memory ceiling. A
 /// client branching on the status cannot tell them apart; this names the reason.
 pub const FAULT_HEADER: &str = "x-nebula-fault";
+
+/// Describes a deployed function to an agent (§22.2).
+///
+/// A header rather than a multipart body or a second endpoint: the artifact is
+/// already the body, and a tool descriptor is metadata about the request rather
+/// than a second document to negotiate.
+pub const TOOL_SCHEMA_HEADER: &str = "x-nebula-tool-schema";
+
+/// Bound on a tool descriptor. Generous — a real JSON Schema with descriptions
+/// on every property is a few kilobytes — and still a bound.
+pub const MAX_TOOL_SCHEMA_BYTES: usize = 16 << 10;
 
 /// Routes a request to a stable worker and namespaces its scratchpad (§22.5).
 ///
@@ -109,6 +120,8 @@ pub struct Published {
     pub content_hash: String,
     /// Whether Wizer pre-initialized the artifact (§4.3).
     pub wizened: bool,
+    /// Whether a tool descriptor came with it (§22.2).
+    pub described: bool,
 }
 
 #[derive(Debug)]
@@ -116,6 +129,8 @@ pub enum PublishError {
     InvalidId,
     /// The caller's module failed its own initializer. A 400.
     Wizer(String),
+    /// The `X-Nebula-Tool-Schema` header was not usable. A 400.
+    InvalidTool(String),
     Io(std::io::Error),
 }
 
@@ -124,6 +139,7 @@ impl std::fmt::Display for PublishError {
         match self {
             Self::InvalidId => f.write_str("function id must be 1..=128 bytes"),
             Self::Wizer(detail) => write!(f, "pre-initialization failed: {detail}"),
+            Self::InvalidTool(detail) => write!(f, "{TOOL_SCHEMA_HEADER} is unusable: {detail}"),
             Self::Io(err) => write!(f, "{err}"),
         }
     }
@@ -179,6 +195,21 @@ impl Gateway {
             .cloned()
     }
 
+    /// Every deployed function that carries a descriptor (§22.2).
+    ///
+    /// Functions without one are omitted rather than listed with an empty
+    /// description: a tool a model cannot understand is worse than a tool it
+    /// cannot see, because it will call the first one and guess.
+    pub fn tools(&self) -> Vec<(String, Tool)> {
+        let functions = self.functions.lock().unwrap();
+        functions
+            .tools
+            .iter()
+            .filter(|(id, _)| functions.functions.contains_key(*id))
+            .map(|(id, tool)| (id.clone(), tool.clone()))
+            .collect()
+    }
+
     pub fn deployed(&self) -> usize {
         self.functions.lock().unwrap().functions.len()
     }
@@ -190,6 +221,16 @@ impl Gateway {
     /// artifact the cluster stores and every worker compiles is already booted.
     #[tracing::instrument(name = "publish", skip_all, fields(function_id = %function_id, bytes = wasm.len(), wizened = tracing::field::Empty))]
     pub async fn publish(&self, function_id: &str, wasm: &[u8]) -> Result<Published, PublishError> {
+        self.publish_with_tool(function_id, wasm, None).await
+    }
+
+    /// As [`Gateway::publish`], attaching a tool descriptor (§22.2).
+    pub async fn publish_with_tool(
+        &self,
+        function_id: &str,
+        wasm: &[u8],
+        tool: Option<Tool>,
+    ) -> Result<Published, PublishError> {
         if function_id.is_empty() || function_id.len() > MAX_FUNCTION_ID_BYTES {
             return Err(PublishError::InvalidId);
         }
@@ -221,10 +262,18 @@ impl Gateway {
         tracing::Span::current().record("wizened", wizened);
 
         let content_hash = self.registry.put(&artifact).map_err(PublishError::Io)?;
+        let described = tool.is_some();
         let mut functions = self.functions.lock().unwrap();
         functions
             .functions
             .insert(function_id.to_string(), content_hash.clone());
+        // A redeploy without a descriptor clears the old one rather than
+        // leaving it: a stale description of a function that has changed is how
+        // a model gets told confidently wrong things about what it is calling.
+        match tool {
+            Some(tool) => functions.tools.insert(function_id.to_string(), tool),
+            None => functions.tools.remove(function_id),
+        };
 
         // Persisted before the caller is told the deployment succeeded. The lock
         // is held across the write so the file can never disagree with the map;
@@ -236,6 +285,7 @@ impl Gateway {
         Ok(Published {
             content_hash,
             wizened,
+            described,
         })
     }
 
@@ -315,6 +365,7 @@ pub fn router(state: Arc<Gateway>) -> Router {
         )
         .route("/healthz", get(healthz))
         .route("/cluster", get(cluster))
+        .route("/tools", get(tools))
         .with_state(state)
 }
 
@@ -324,6 +375,54 @@ fn tenant_of(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = value.strip_prefix("Bearer ")?.trim();
     (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Reads [`TOOL_SCHEMA_HEADER`].
+///
+/// `Ok(None)` is absent. Anything present and unusable is an error rather than
+/// a silent drop — a caller that sent a descriptor is expecting its function to
+/// be callable by an agent, and quietly deploying it undescribed looks like
+/// success and produces a tool nobody can find.
+fn tool_of(headers: &HeaderMap) -> Result<Option<Tool>, String> {
+    let Some(raw) = headers.get(TOOL_SCHEMA_HEADER) else {
+        return Ok(None);
+    };
+    let raw = raw
+        .to_str()
+        .map_err(|_| "not printable ASCII".to_string())?;
+    if raw.len() > MAX_TOOL_SCHEMA_BYTES {
+        return Err(format!("longer than {MAX_TOOL_SCHEMA_BYTES} bytes"));
+    }
+
+    let tool: Tool = serde_json::from_str(raw).map_err(|err| err.to_string())?;
+    if tool.description.trim().is_empty() {
+        // The field that decides whether a model calls the tool correctly, or
+        // at all. An empty one is a descriptor that describes nothing.
+        return Err("`description` must not be empty".to_string());
+    }
+    Ok(Some(tool))
+}
+
+/// §22.2. The array in the shape the Anthropic and OpenAI tool APIs take, so
+/// wiring an agent is a paste rather than a translation layer.
+async fn tools(State(gateway): State<Arc<Gateway>>) -> Response {
+    let tools: Vec<serde_json::Value> = gateway
+        .tools()
+        .into_iter()
+        .map(|(name, tool)| {
+            serde_json::json!({
+                "name": name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect();
+
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&tools).unwrap_or_else(|_| "[]".to_string()),
+    )
+        .into_response()
 }
 
 async fn healthz() -> &'static str {
@@ -357,23 +456,35 @@ async fn publish(
     if let Decision::Limited { retry_after } = gateway.deploy_limit.check(&tenant) {
         return rate_limited(retry_after).into_response();
     }
-    match gateway.publish(&function_id, &body).await {
+    let tool = match tool_of(&headers) {
+        Ok(tool) => tool,
+        Err(detail) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                PublishError::InvalidTool(detail).to_string(),
+            )
+                .into_response()
+        }
+    };
+
+    match gateway.publish_with_tool(&function_id, &body, tool).await {
         Ok(published) => (
             StatusCode::CREATED,
             [(header::CONTENT_TYPE, "application/json")],
-            // Hand-built rather than a serde dependency for two fields. The hash
-            // is hex and the flag is a bool, so there is nothing here to escape.
+            // Hand-built rather than a serde dependency for three fields. The
+            // hash is hex and the flags are bools, so there is nothing here to
+            // escape.
             format!(
-                "{{\"content_hash\":\"{}\",\"wizened\":{}}}",
-                published.content_hash, published.wizened
+                "{{\"content_hash\":\"{}\",\"wizened\":{},\"described\":{}}}",
+                published.content_hash, published.wizened, published.described
             ),
         )
             .into_response(),
         // A module whose own initializer fails is a bad artifact, and the caller
         // is the only one who can fix it.
-        Err(err @ (PublishError::Wizer(_) | PublishError::InvalidId)) => {
-            (StatusCode::BAD_REQUEST, err.to_string()).into_response()
-        }
+        Err(
+            err @ (PublishError::Wizer(_) | PublishError::InvalidId | PublishError::InvalidTool(_)),
+        ) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
         Err(PublishError::Io(err)) => {
             tracing::error!("deploy of {function_id} failed: {err}");
             (StatusCode::INTERNAL_SERVER_ERROR, "deploy failed").into_response()

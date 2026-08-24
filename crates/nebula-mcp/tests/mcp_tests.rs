@@ -46,6 +46,17 @@ struct Canned {
 struct Stub {
     seen: Arc<Mutex<Vec<Seen>>>,
     canned: Arc<Mutex<Canned>>,
+    /// What `GET /tools` answers with (§22.2).
+    tools: Arc<Mutex<String>>,
+}
+
+async fn stub_tools(State(stub): State<Stub>) -> Response {
+    let body = stub.tools.lock().unwrap().clone();
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 async fn stub_execute(
@@ -99,12 +110,14 @@ impl Harness {
                 body: "",
                 retry_after: None,
             })),
+            tools: Arc::new(Mutex::new("[]".to_string())),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gateway_addr = listener.local_addr().unwrap().to_string();
         let router = Router::new()
             .route("/execute/{id}", post(stub_execute))
+            .route("/tools", axum::routing::get(stub_tools))
             .with_state(stub.clone());
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
@@ -161,6 +174,10 @@ impl Harness {
             body: "",
             retry_after: Some(seconds),
         };
+    }
+
+    fn advertise(&self, tools: &str) {
+        *self.stub.tools.lock().unwrap() = tools.to_string();
     }
 
     fn last_seen(&self) -> Seen {
@@ -272,7 +289,11 @@ async fn a_client_can_handshake_and_discover_the_tool() {
     let tools = response["result"]["tools"]
         .as_array()
         .expect("a tools array");
-    assert_eq!(tools.len(), 1, "§22.1 collapsed the surface to one tool");
+    assert_eq!(
+        tools.len(),
+        1,
+        "with nothing deployed, the interpreter is the whole surface"
+    );
 
     let tool = &tools[0];
     assert_eq!(tool["name"], TOOL_NAME);
@@ -314,14 +335,6 @@ async fn protocol_level_mistakes_are_json_rpc_errors() {
 
     let (_, response) = harness
         .rpc(json!({
-            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": "run_python", "arguments": {"source": "1"}}
-        }))
-        .await;
-    assert_eq!(response["error"]["code"], -32602);
-
-    let (_, response) = harness
-        .rpc(json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": TOOL_NAME, "arguments": {"src": "1"}}
         }))
@@ -336,6 +349,18 @@ async fn protocol_level_mistakes_are_json_rpc_errors() {
     let raw = raw_post(&harness.mcp, "/mcp", "{not json").await;
     let body = String::from_utf8_lossy(&raw);
     assert!(body.contains("-32700"), "expected a parse error: {body}");
+
+    // A `tools/call` with no name at all is the client's mistake and is caught
+    // here. An *unrecognised* name is not: any name might be a function
+    // deployed since the last `tools/list` (§22.2), so it goes to the cluster
+    // and comes back as a tool error naming itself.
+    let (_, response) = harness
+        .rpc(json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"arguments": {}}
+        }))
+        .await;
+    assert_eq!(response["error"]["code"], -32602);
 
     assert_eq!(
         harness.call_count(),
@@ -577,4 +602,90 @@ async fn being_throttled_tells_the_agent_to_slow_down_and_by_how_much() {
     let (text, _) = harness.call(json!({"source": "1"})).await;
     assert!(text.contains("a moment"), "{text}");
     assert!(!text.contains("None"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// Deployed tools (§22.2)
+// ---------------------------------------------------------------------------
+
+const DEPLOYED: &str = r#"[{"name":"summarise","description":"Summarises text.","input_schema":{"type":"object","properties":{"text":{"type":"string"}}}}]"#;
+
+#[tokio::test]
+async fn deployed_tools_are_listed_alongside_the_interpreter() {
+    let harness = Harness::start().await;
+    harness.advertise(DEPLOYED);
+
+    let (_, response) = harness
+        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
+    let tools = response["result"]["tools"].as_array().expect("array");
+
+    assert_eq!(tools.len(), 2);
+    // The interpreter stays first: it is what an agent reaches for by default,
+    // and a client that truncates a long list should keep it.
+    assert_eq!(tools[0]["name"], TOOL_NAME);
+    assert_eq!(tools[1]["name"], "summarise");
+    assert_eq!(
+        tools[1]["input_schema"]["properties"]["text"]["type"],
+        "string"
+    );
+}
+
+#[tokio::test]
+async fn calling_a_deployed_tool_sends_its_arguments_as_the_body() {
+    let harness = Harness::start().await;
+    harness.advertise(DEPLOYED);
+    harness.answer_with(StatusCode::OK, None, "a summary");
+
+    let (_, response) = harness
+        .rpc(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "summarise", "arguments": {"text": "hello"}}
+        }))
+        .await;
+    assert_eq!(response["result"]["content"][0]["text"], "a summary");
+    assert_eq!(response["result"]["isError"], false);
+
+    let seen = harness.last_seen();
+    assert_eq!(seen.function_id, "summarise");
+    // Passed through verbatim. Validating against the tool's own schema here
+    // would be this adapter forming an opinion about the guest's ABI.
+    assert_eq!(seen.body, r#"{"text":"hello"}"#);
+}
+
+#[tokio::test]
+async fn an_unrecognised_tool_name_is_named_back_rather_than_shrugged_at() {
+    let harness = Harness::start().await;
+    harness.advertise(DEPLOYED);
+    harness.answer_with(StatusCode::NOT_FOUND, Some("unknown_function"), "");
+
+    // `unknown_function` reads differently for a deployed tool than for the
+    // interpreter: it was advertised and then was not there, so the model
+    // should stop calling it rather than treat it as a transient failure.
+    let (_, response) = harness
+        .rpc(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "summarise", "arguments": {}}
+        }))
+        .await;
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(response["result"]["isError"], true);
+    assert!(text.contains("no tool named"), "{text}");
+    assert!(text.contains("summarise"), "{text}");
+    assert!(text.contains("tools/list"), "{text}");
+}
+
+#[tokio::test]
+async fn an_unreachable_cluster_still_leaves_the_interpreter_listed() {
+    let harness = Harness::unreachable().await;
+
+    // `tools/list` returning an error would leave a client with *no* tools at
+    // all, including the built-in one — a worse answer than the built-in one
+    // on its own.
+    let (_, response) = harness
+        .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .await;
+    let tools = response["result"]["tools"].as_array().expect("array");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], TOOL_NAME);
 }

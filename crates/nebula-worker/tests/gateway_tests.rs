@@ -1300,3 +1300,125 @@ async fn sessions_of_one_function_spread_across_workers() {
     // of cache affinity — and it is only paid by callers who ask for it.
     assert!(cold <= 3, "more cold starts than workers: {cold}");
 }
+
+// ---------------------------------------------------------------------------
+// Tool metadata (§22.2)
+// ---------------------------------------------------------------------------
+
+const SCHEMA: &str = r#"{"description":"Echoes its input back.","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}"#;
+
+async fn deploy_with(cluster: &Cluster, id: &str, schema: Option<&str>) -> HttpResponse {
+    let extra: Vec<(&str, &str)> = schema
+        .map(|s| vec![("X-Nebula-Tool-Schema", s)])
+        .unwrap_or_default();
+    http(
+        &cluster.http_addr,
+        "PUT",
+        &format!("/functions/{id}"),
+        Some("acme"),
+        &extra,
+        ECHO.as_bytes(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_described_function_is_listed_for_agents() {
+    let cluster = Cluster::start(Duration::from_secs(5)).await;
+
+    let deployed = deploy_with(&cluster, "echo", Some(SCHEMA)).await;
+    assert_eq!(deployed.status, 201);
+    assert!(
+        deployed.text().contains("\"described\":true"),
+        "{}",
+        deployed.text()
+    );
+
+    let listed = http(&cluster.http_addr, "GET", "/tools", None, &[], b"").await;
+    assert_eq!(listed.status, 200);
+
+    let tools: serde_json::Value = serde_json::from_slice(&listed.body).expect("json");
+    let tools = tools.as_array().expect("an array");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "echo");
+    assert_eq!(tools[0]["description"], "Echoes its input back.");
+    // The schema is passed through untouched. A gateway that rewrote it would
+    // be a gateway with an opinion about the guest's ABI.
+    assert_eq!(tools[0]["input_schema"]["required"][0], "text");
+}
+
+#[tokio::test]
+async fn an_undescribed_function_is_deployed_but_not_advertised() {
+    let cluster = Cluster::start(Duration::from_secs(5)).await;
+
+    let deployed = deploy_with(&cluster, "internal", None).await;
+    assert_eq!(deployed.status, 201);
+    assert!(deployed.text().contains("\"described\":false"));
+
+    // A tool a model cannot understand is worse than one it cannot see: it will
+    // call the first and guess at the arguments.
+    let listed = http(&cluster.http_addr, "GET", "/tools", None, &[], b"").await;
+    assert_eq!(listed.text(), "[]");
+}
+
+#[tokio::test]
+async fn redeploying_without_a_descriptor_clears_the_old_one() {
+    let cluster = Cluster::start(Duration::from_secs(5)).await;
+
+    deploy_with(&cluster, "echo", Some(SCHEMA)).await;
+    deploy_with(&cluster, "echo", None).await;
+
+    // A stale description of a function that has changed is how a model gets
+    // told confidently wrong things about what it is calling.
+    let listed = http(&cluster.http_addr, "GET", "/tools", None, &[], b"").await;
+    assert_eq!(listed.text(), "[]");
+}
+
+#[tokio::test]
+async fn an_unusable_descriptor_is_refused_rather_than_dropped() {
+    let cluster = Cluster::start(Duration::from_secs(5)).await;
+
+    // A caller that sent a descriptor expects an agent to be able to find the
+    // function. Deploying it undescribed would look like success and produce a
+    // tool nobody can call.
+    let long = format!(
+        r#"{{"description":"{}","input_schema":{{}}}}"#,
+        "x".repeat(20_000)
+    );
+    for bad in [
+        "not json",
+        r#"{"input_schema":{}}"#,
+        r#"{"description":"   ","input_schema":{}}"#,
+        long.as_str(),
+    ] {
+        let response = deploy_with(&cluster, "echo", Some(bad)).await;
+        assert_eq!(response.status, 400, "descriptor {bad:.40} was accepted");
+    }
+
+    // And nothing was deployed under a refused descriptor.
+    let response = cluster.post("echo", "acme", b"x").await;
+    assert_eq!(response.status, 404);
+}
+
+#[tokio::test]
+async fn a_deployment_table_written_before_tools_existed_still_loads() {
+    // The whole reason descriptors went in a second map instead of a richer
+    // value type: an unrecognised version stops startup by design (§11.1), so
+    // a bump would have refused every table already on disk.
+    let dir = temp_dir("legacy-registry");
+    std::fs::write(
+        dir.join("deployments.json"),
+        br#"{"version":1,"functions":{"legacy":"abc"}}"#,
+    )
+    .expect("write");
+
+    let registry = Registry::new(&dir).expect("registry");
+    let loaded = registry
+        .load_deployments()
+        .expect("a v1 table must still load");
+    assert_eq!(
+        loaded.functions.get("legacy").map(String::as_str),
+        Some("abc")
+    );
+    assert!(loaded.tools.is_empty());
+}
