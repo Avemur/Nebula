@@ -578,7 +578,8 @@ mod tests {
         // The dangerous reading of "no entry for this tenant" is "no
         // restrictions". An explicitly empty list must mean explicitly nothing,
         // and it must not fall back to the shared grant.
-        let policy = Policy::new(["shared.example.com"]).for_tenant("locked-down", Vec::<&str>::new());
+        let policy =
+            Policy::new(["shared.example.com"]).for_tenant("locked-down", Vec::<&str>::new());
         assert!(!policy.allows("locked-down", "shared.example.com"));
         assert!(!policy.allows("locked-down", "anything.example.com"));
     }
@@ -681,7 +682,12 @@ not tls at all",
     #[test]
     fn a_real_https_host_can_actually_be_fetched() {
         let policy = Policy::new(["example.com"]);
-        match fetch(&policy, "t", "https://example.com/", Duration::from_secs(10)) {
+        match fetch(
+            &policy,
+            "t",
+            "https://example.com/",
+            Duration::from_secs(10),
+        ) {
             Ok(response) => {
                 let text = String::from_utf8_lossy(&response);
                 assert!(
@@ -753,7 +759,12 @@ not tls at all",
         let policy = Policy::new(["internal.svc"]).allow_private_addresses();
         assert!(!policy.allows("t", "169.254.169.254"));
         assert_eq!(
-            fetch(&policy, "t", "http://169.254.169.254/", Duration::from_secs(1)),
+            fetch(
+                &policy,
+                "t",
+                "http://169.254.169.254/",
+                Duration::from_secs(1)
+            ),
             Err(Refusal::HostNotAllowed)
         );
     }
