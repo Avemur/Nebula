@@ -1181,9 +1181,11 @@ Guest crates are **standalone workspaces**, not workspace members: they build
 for `wasm32-wasip1`, and a member would be built for the host on every
 `cargo test`.
 
-`nebula-runtime` having no networking dependency is load-bearing: the sandbox
+`nebula-runtime` having no *cluster* dependency is load-bearing: the sandbox
 tests and the benchmark harness both link it directly, so G1 and G3 can be
-tested without a cluster.
+tested without one. It does carry `rustls` for §22.8's egress — an earlier draft
+of this section said "no networking dependency", which stopped being true when
+TLS landed and is corrected rather than quietly left.
 
 ---
 
@@ -2061,6 +2063,8 @@ here that does nothing at all until an operator says otherwise:
 NEBULA_EGRESS_ALLOW=api.example.com,data.example.org   # on the worker
 ```
 
+`http://` and `https://` both work; the scheme picks the default port.
+
 Absent or empty, every call is refused. A `Runtime` built any other way has
 egress off, so forgetting to enable it fails closed.
 
@@ -2110,14 +2114,26 @@ a time.
 
 #### Two limits worth stating plainly
 
-**Plain HTTP only.** TLS needs a cryptography dependency, and §17's "no
-networking dependency" for `nebula-runtime` is load-bearing — the sandbox tests
-link it directly. `std::net` is not a dependency; rustls is, and pulling one
-into the crate that runs untrusted code is a decision worth making deliberately
-rather than as a side effect of an afternoon. `https://` is refused by name
-rather than as a malformed URL, because it is the refusal a caller is most
-likely to hit and least likely to guess — and silently downgrading to plaintext
-would be a downgrade attack implemented on purpose.
+**HTTPS works**, via `rustls` with the `ring` provider and `webpki-roots` — 8
+crates, no C toolchain, no platform certificate store. Roots are bundled rather
+than read from the system because a container without `ca-certificates`
+installed would otherwise fail every handshake with an error that looks like the
+remote's fault.
+
+The certificate is verified against the **hostname**, never against the address
+that was connected to. Those are deliberately different checks: the address
+decides whether the endpoint is somewhere we are willing to talk to at all, and
+the certificate decides whether it is who it claims to be. Verifying against the
+IP would fail every ordinary site and teach whoever debugged it to switch
+verification off.
+
+The handshake runs eagerly rather than lazily on first write, so a bad
+certificate is reported as `Tls` — the one failure a caller can usually fix —
+instead of surfacing later as a generic read error.
+
+An earlier draft shipped plain HTTP only and said TLS was a dependency decision
+worth making deliberately. It was made deliberately, and this is the result: an
+egress function that cannot reach an HTTPS endpoint cannot reach any real API.
 
 **Cluster-wide, not per-tenant.** This section originally specified a per-tenant
 allowlist. What shipped is one operator-configured list per worker, which is a
@@ -2161,7 +2177,7 @@ snapshot was worth nothing on this artifact. The interpreter now exports no
 | 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse, forwarded through the mesh | **Built.** Also fixed a `request_id` that named a function, not a request |
 | 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | Do, and say plainly that it is best-effort |
 | 7 | **Per-tenant rate limits** (§22.7) | Survival, and fairness §10.3 cannot provide | A token bucket per tenant | **Built.** An agent in a retry loop *is* a load test |
-| 8 | **Egress** (§22.8) | Network-using tools | Its own threat model | **Built, and off by default.** Plain HTTP only |
+| 8 | **Egress** (§22.8) | Network-using tools | Its own threat model | **Built, and off by default.** HTTP and HTTPS |
 | 9 | Streaming responses | Incremental output | Reworks `response_write` into a flushing channel | Defer — buffered output is correct, just less pretty |
 | 10 | Actor pins (§21) | True stateful sessions | Leases, fencing, eviction rework | Stays deferred; §22.5 covers the demand that would otherwise force it |
 

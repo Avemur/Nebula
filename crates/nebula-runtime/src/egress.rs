@@ -27,7 +27,11 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 /// Cap on a fetched response. Sized to match the request-body cap of §6.4:
 /// what a guest can be handed and what it can be sent should not differ by an
@@ -114,8 +118,9 @@ pub enum Refusal {
     Disabled,
     /// Not `http://…`, or unparseable.
     BadUrl,
-    /// `https://`. Named separately because it is the one refusal a caller is
-    /// most likely to hit and least likely to guess.
+    /// The TLS handshake failed — an untrusted certificate, a name mismatch, or
+    /// a peer that does not speak TLS on that port. Named separately because it
+    /// is the one failure a caller can usually fix.
     Tls,
     /// The host is not on the allowlist.
     HostNotAllowed,
@@ -136,7 +141,7 @@ impl std::fmt::Display for Refusal {
         f.write_str(match self {
             Self::Disabled => "outbound HTTP is disabled on this cluster",
             Self::BadUrl => "not a valid http:// url",
-            Self::Tls => "https is not supported; only plain http",
+            Self::Tls => "the TLS handshake failed",
             Self::HostNotAllowed => "host is not on the egress allowlist",
             Self::Unresolvable => "host did not resolve",
             Self::PrivateAddress => "host resolved to a non-public address",
@@ -147,12 +152,13 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// A parsed `http://host[:port]/path`.
+/// A parsed `http[s]://host[:port]/path`.
 #[derive(Debug)]
 struct Target {
     host: String,
     port: u16,
     path: String,
+    tls: bool,
 }
 
 fn parse(url: &str) -> Result<Target, Refusal> {
@@ -160,13 +166,14 @@ fn parse(url: &str) -> Result<Target, Refusal> {
     if url.len() > 2048 {
         return Err(Refusal::BadUrl);
     }
-    if url.to_ascii_lowercase().starts_with("https://") {
-        return Err(Refusal::Tls);
-    }
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("HTTP://"))
-        .ok_or(Refusal::BadUrl)?;
+    let lower = url.to_ascii_lowercase();
+    let (rest, tls, default_port) = if let Some(rest) = lower.strip_prefix("https://") {
+        (&url[url.len() - rest.len()..], true, 443)
+    } else if let Some(rest) = lower.strip_prefix("http://") {
+        (&url[url.len() - rest.len()..], false, 80)
+    } else {
+        return Err(Refusal::BadUrl);
+    };
 
     let (authority, path) = match rest.find('/') {
         Some(at) => (&rest[..at], &rest[at..]),
@@ -181,7 +188,7 @@ fn parse(url: &str) -> Result<Target, Refusal> {
 
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port)) => (host, port.parse::<u16>().map_err(|_| Refusal::BadUrl)?),
-        None => (authority, 80),
+        None => (authority, default_port),
     };
     if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c == '\r' || c == '\n') {
         return Err(Refusal::BadUrl);
@@ -191,7 +198,70 @@ fn parse(url: &str) -> Result<Target, Refusal> {
         host: host.to_string(),
         port,
         path: path.to_string(),
+        tls,
     })
+}
+
+/// One client config for the process.
+///
+/// Roots come from `webpki-roots` rather than the platform store: a container
+/// with no `ca-certificates` package installed would otherwise fail every
+/// handshake with an error that looks like the remote's fault. Built once —
+/// parsing a few hundred certificates per request would dwarf the request.
+fn tls_config() -> Result<Arc<ClientConfig>, Refusal> {
+    static CONFIG: OnceLock<Option<Arc<ClientConfig>>> = OnceLock::new();
+
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+            let config = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .ok()?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            Some(Arc::new(config))
+        })
+        .clone()
+        .ok_or(Refusal::Tls)
+}
+
+/// A socket, with or without TLS on top.
+///
+/// Boxed on the TLS side because a `ClientConnection` carries buffers, and an
+/// enum sized for the larger variant would make every plain HTTP fetch pay for
+/// TLS it is not using.
+enum Transport {
+    Plain(TcpStream),
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
 }
 
 /// Whether an address is out on the public internet.
@@ -290,6 +360,27 @@ pub fn fetch(policy: &Policy, url: &str, budget: Duration) -> Result<Vec<u8>, Re
     stream
         .set_write_timeout(Some(deadline))
         .map_err(|_| Refusal::Io)?;
+
+    // The certificate is verified against the **hostname**, never against the
+    // address that was connected to. Those are deliberately different: the
+    // address check (above) decides whether the endpoint is somewhere we are
+    // willing to talk to, and the certificate decides whether it is who it
+    // claims to be. Verifying against the IP would fail every ordinary site and
+    // teach whoever debugged it to turn verification off.
+    let mut stream = if target.tls {
+        let name = ServerName::try_from(target.host.clone()).map_err(|_| Refusal::BadUrl)?;
+        let mut connection =
+            ClientConnection::new(tls_config()?, name).map_err(|_| Refusal::Tls)?;
+        // Handshake eagerly. `StreamOwned` would do it lazily on first write and
+        // report a bad certificate as a generic I/O error, which is the one
+        // failure a caller can usually fix and so the one worth naming.
+        connection
+            .complete_io(&mut stream)
+            .map_err(|_| Refusal::Tls)?;
+        Transport::Tls(Box::new(StreamOwned::new(connection, stream)))
+    } else {
+        Transport::Plain(stream)
+    };
 
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: */*\r\n\
@@ -407,12 +498,95 @@ mod tests {
     }
 
     #[test]
-    fn https_is_refused_by_name_rather_than_as_a_bad_url() {
-        // The one refusal a caller is most likely to hit and least likely to
-        // guess. Reporting it as a malformed URL would send them checking their
-        // spelling.
-        assert_eq!(parse("https://example.com/").unwrap_err(), Refusal::Tls);
-        assert_eq!(parse("HTTPS://example.com/").unwrap_err(), Refusal::Tls);
+    fn https_parses_and_defaults_to_the_right_port() {
+        let target = parse("https://api.example.com/v1").unwrap();
+        assert!(target.tls);
+        assert_eq!(target.port, 443);
+        assert_eq!(target.host, "api.example.com");
+
+        // Scheme matching is case-insensitive, but the *host* must survive with
+        // its original case for certificate verification to see what the caller
+        // wrote.
+        let target = parse("HTTPS://API.example.com/").unwrap();
+        assert!(target.tls);
+        assert_eq!(target.host, "API.example.com");
+
+        // An explicit port still wins over the scheme default.
+        assert_eq!(parse("https://api.example.com:8443/").unwrap().port, 8443);
+        assert_eq!(parse("http://api.example.com/").unwrap().port, 80);
+    }
+
+    /// A peer that speaks plain HTTP on the port must not be mistaken for TLS.
+    ///
+    /// Self-contained, and it is the test that proves the handshake actually
+    /// runs: without `complete_io` the failure would surface much later as a
+    /// generic read error, and `Refusal::Tls` would be unreachable.
+    #[test]
+    fn a_failed_handshake_is_reported_as_tls_rather_than_as_io() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::Write;
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK
+
+not tls at all",
+                );
+            }
+        });
+
+        let policy = Policy::new(["127.0.0.1"]).allow_private_addresses();
+        assert_eq!(
+            fetch(
+                &policy,
+                &format!("https://127.0.0.1:{port}/"),
+                Duration::from_secs(5)
+            ),
+            Err(Refusal::Tls)
+        );
+    }
+
+    /// The only test here that touches the real internet, and it skips rather
+    /// than fails without it.
+    ///
+    /// It earns that: nothing else proves the root store, the handshake, and
+    /// certificate verification work *together*. A `Refusal::Tls` is
+    /// deliberately not in the skip list — that is the failure this exists to
+    /// catch.
+    #[test]
+    fn a_real_https_host_can_actually_be_fetched() {
+        let policy = Policy::new(["example.com"]);
+        match fetch(&policy, "https://example.com/", Duration::from_secs(10)) {
+            Ok(response) => {
+                let text = String::from_utf8_lossy(&response);
+                assert!(
+                    text.starts_with("HTTP/1.1 "),
+                    "expected an HTTP response, got: {}",
+                    &text[..text.len().min(80)]
+                );
+            }
+            Err(Refusal::Io | Refusal::Unresolvable | Refusal::Timeout) => {
+                eprintln!("SKIPPED: no outbound network from this machine");
+            }
+            Err(other) => {
+                panic!("https fetch failed for a reason that is not the network: {other}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_root_store_is_actually_loaded() {
+        // An empty root store would fail every handshake, and the failure would
+        // look exactly like a misconfigured remote. Cheap to assert, expensive
+        // to diagnose.
+        assert!(tls_config().is_ok());
+        assert!(
+            !webpki_roots::TLS_SERVER_ROOTS.is_empty(),
+            "no trust anchors: every https fetch would fail as untrusted"
+        );
     }
 
     #[test]

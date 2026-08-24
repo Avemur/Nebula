@@ -1,8 +1,14 @@
 //! Nebula's in-process WASM execution core (README.md §5).
 //!
-//! Deliberately has no networking dependency: the sandbox tests and, later, the
+//! Deliberately has no *cluster* dependency: the sandbox tests and the
 //! benchmark harness link this directly, so the security and latency goals can
-//! be tested without a cluster. gRPC and clustering live in `nebula-worker`.
+//! be tested without one. gRPC and clustering live in `nebula-worker`.
+//!
+//! It does carry `rustls`, for the outbound HTTP of §22.8 — an egress host
+//! function that cannot speak TLS cannot reach any real API. Nothing on the
+//! guest side touches it: TLS is terminated host-side, behind the allowlist and
+//! the address checks, and a `Runtime` with no egress policy never builds a
+//! client config at all.
 
 pub mod cache;
 pub mod egress;
