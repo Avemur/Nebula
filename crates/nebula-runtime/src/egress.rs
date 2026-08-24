@@ -8,8 +8,10 @@
 //!
 //! # The rules, and why each one is not negotiable
 //!
-//! 1. **An allowlist, never a denylist.** A denylist of private ranges is a
-//!    game of whack-a-mole; an allowlist is a decision an operator made.
+//! 1. **A per-tenant allowlist, never a denylist.** A denylist of private
+//!    ranges is a game of whack-a-mole; an allowlist is a decision an operator
+//!    made. The tenant comes from the bearer token the gateway established
+//!    (§13), never from anything the guest can set.
 //! 2. **Resolve first, then check the resolved address.** Checking a hostname
 //!    proves nothing: `evil.example.com` can resolve to `169.254.169.254`.
 //! 3. **Connect to the address that was checked.** Handing the hostname back to
@@ -25,6 +27,7 @@
 //!    parked in a host call cannot be interrupted at all — without an explicit
 //!    socket timeout the deadline would stop being a bound.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
@@ -38,35 +41,74 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 /// order of magnitude for no reason.
 pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
-/// Operator-configured allowlist. Empty means egress is off.
+/// Operator-configured allowlist, per tenant. Empty means egress is off.
 ///
-/// **Cluster-wide, not per-tenant** — §22.8 specified per-tenant and this is a
-/// deliberate narrowing of scope, recorded there. Enforcement lives on the
-/// worker because that is where the socket is opened, and a policy checked
-/// anywhere else is a policy something can route around.
+/// **Both the policy and its enforcement live on the worker**, and that is the
+/// point. The worker is the process that opens the socket, so a policy checked
+/// anywhere else is one something can route around — and a policy *sent* to the
+/// worker in a request would be a policy the request could influence. This one
+/// is local configuration, and nothing on the wire can change it.
 #[derive(Clone, Debug, Default)]
 pub struct Policy {
-    hosts: Vec<String>,
+    /// Hosts every tenant may reach.
+    shared: Vec<String>,
+    /// Hosts a named tenant may reach, *instead of* the shared list.
+    per_tenant: HashMap<String, Vec<String>>,
     allow_private: bool,
 }
 
+fn normalise<I, S>(hosts: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    hosts
+        .into_iter()
+        .map(|host| host.as_ref().trim().to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+        .collect()
+}
+
 impl Policy {
-    /// Hosts an operator has decided guests may reach. Case-insensitive; no
-    /// wildcards, because `*.example.com` is a decision about subdomains that
-    /// nobody has made yet.
+    /// Hosts every tenant may reach. Case-insensitive; no wildcards, because
+    /// `*.example.com` is a decision about subdomains that nobody has made yet.
+    ///
+    /// A shared list is a deliberate grant to everyone. Where tenants should not
+    /// share a destination, name them with [`Policy::for_tenant`].
     pub fn new<I, S>(hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         Self {
-            hosts: hosts
-                .into_iter()
-                .map(|host| host.as_ref().trim().to_ascii_lowercase())
-                .filter(|host| !host.is_empty())
-                .collect(),
+            shared: normalise(hosts),
+            per_tenant: HashMap::new(),
             allow_private: false,
         }
+    }
+
+    /// Hosts one tenant may reach, **replacing** the shared list for it rather
+    /// than adding to it.
+    ///
+    /// Replacement rather than union so that reading the configuration answers
+    /// "what can this tenant reach" in one line. A union would mean the answer
+    /// is always two lines and the shared list can never be narrowed for
+    /// anyone — which is the case an operator most often wants.
+    pub fn for_tenant<I, S>(mut self, tenant: &str, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.per_tenant
+            .insert(tenant.trim().to_string(), normalise(hosts));
+        self
+    }
+
+    fn hosts_for(&self, tenant: &str) -> &[String] {
+        self.per_tenant
+            .get(tenant.trim())
+            .map(Vec::as_slice)
+            .unwrap_or(&self.shared)
     }
 
     /// Permits allowlisted hosts that resolve inside the network.
@@ -85,24 +127,49 @@ impl Policy {
         self
     }
 
-    /// Reads `NEBULA_EGRESS_ALLOW`, a comma-separated host list.
+    /// Reads `NEBULA_EGRESS_ALLOW`.
+    ///
+    /// Semicolons separate groups; a group is either a bare comma-separated host
+    /// list (shared by every tenant) or `tenant=host,host`:
+    ///
+    /// ```text
+    /// NEBULA_EGRESS_ALLOW="status.example.com;acme=api.example.com,cdn.example.com"
+    /// ```
     ///
     /// Absent or empty leaves egress disabled, which is the only safe default
     /// for a feature whose failure mode is "your sandbox is now a proxy".
     pub fn from_env() -> Self {
         match std::env::var("NEBULA_EGRESS_ALLOW") {
-            Ok(raw) => Self::new(raw.split(',')),
+            Ok(raw) => Self::parse(&raw),
             Err(_) => Self::default(),
         }
     }
 
-    pub fn is_enabled(&self) -> bool {
-        !self.hosts.is_empty()
+    pub fn parse(raw: &str) -> Self {
+        let mut policy = Self::default();
+        for group in raw.split(';').map(str::trim).filter(|g| !g.is_empty()) {
+            match group.split_once('=') {
+                Some((tenant, hosts)) => {
+                    policy = policy.for_tenant(tenant, hosts.split(','));
+                }
+                // A bare list grants every tenant. Kept because it is the
+                // obvious thing to write and it is what a single-tenant
+                // deployment wants; it is a grant to everyone and the
+                // documentation says so.
+                None => policy.shared = normalise(group.split(',')),
+            }
+        }
+        policy
     }
 
-    pub fn allows(&self, host: &str) -> bool {
+    /// Whether any tenant can reach anything at all.
+    pub fn is_enabled(&self) -> bool {
+        !self.shared.is_empty() || self.per_tenant.values().any(|hosts| !hosts.is_empty())
+    }
+
+    pub fn allows(&self, tenant: &str, host: &str) -> bool {
         let host = host.trim().to_ascii_lowercase();
-        self.hosts.contains(&host)
+        self.hosts_for(tenant).contains(&host)
     }
 }
 
@@ -317,7 +384,12 @@ fn is_public(ip: &IpAddr) -> bool {
 /// status line, headers, blank line, body. Handing back only the body would
 /// hide the status code from the guest, and a script that cannot tell `200`
 /// from `404` will treat an error page as data.
-pub fn fetch(policy: &Policy, url: &str, budget: Duration) -> Result<Vec<u8>, Refusal> {
+pub fn fetch(
+    policy: &Policy,
+    tenant: &str,
+    url: &str,
+    budget: Duration,
+) -> Result<Vec<u8>, Refusal> {
     if !policy.is_enabled() {
         return Err(Refusal::Disabled);
     }
@@ -327,7 +399,7 @@ pub fn fetch(policy: &Policy, url: &str, budget: Duration) -> Result<Vec<u8>, Re
 
     let started = Instant::now();
     let target = parse(url)?;
-    if !policy.allows(&target.host) {
+    if !policy.allows(tenant, &target.host) {
         return Err(Refusal::HostNotAllowed);
     }
 
@@ -441,7 +513,7 @@ mod tests {
         let policy = Policy::default();
         assert!(!policy.is_enabled());
         assert_eq!(
-            fetch(&policy, "http://example.com/", Duration::from_secs(1)),
+            fetch(&policy, "t", "http://example.com/", Duration::from_secs(1)),
             Err(Refusal::Disabled)
         );
     }
@@ -449,17 +521,66 @@ mod tests {
     #[test]
     fn only_listed_hosts_are_allowed() {
         let policy = Policy::new(["api.example.com", "Example.ORG"]);
-        assert!(policy.allows("api.example.com"));
+        assert!(policy.allows("acme", "api.example.com"));
         // Host comparison is case-insensitive in DNS, so the allowlist has to
         // be too — otherwise `API.example.com` is a bypass.
-        assert!(policy.allows("API.EXAMPLE.COM"));
-        assert!(policy.allows("example.org"));
+        assert!(policy.allows("acme", "API.EXAMPLE.COM"));
+        assert!(policy.allows("acme", "example.org"));
 
-        assert!(!policy.allows("evil.test"));
+        assert!(!policy.allows("acme", "evil.test"));
         // A suffix is not a match: `notexample.com` and `example.com.evil.test`
         // are the two classic ways an allowlist gets read as a substring.
-        assert!(!policy.allows("api.example.com.evil.test"));
-        assert!(!policy.allows("notapi.example.com"));
+        assert!(!policy.allows("acme", "api.example.com.evil.test"));
+        assert!(!policy.allows("acme", "notapi.example.com"));
+    }
+
+    #[test]
+    fn one_tenants_allowlist_is_not_anothers() {
+        let policy = Policy::new(["shared.example.com"])
+            .for_tenant("acme", ["acme-api.example.com"])
+            .for_tenant("globex", ["globex-api.example.com"]);
+
+        assert!(policy.allows("acme", "acme-api.example.com"));
+        assert!(!policy.allows("acme", "globex-api.example.com"));
+        assert!(!policy.allows("globex", "acme-api.example.com"));
+
+        // A named tenant gets its own list *instead of* the shared one, so a
+        // grant can be narrowed for one tenant without being narrowed for all.
+        assert!(!policy.allows("acme", "shared.example.com"));
+        // An unnamed tenant falls back to the shared list.
+        assert!(policy.allows("someone-else", "shared.example.com"));
+    }
+
+    #[test]
+    fn the_env_format_parses_both_shapes() {
+        let policy = Policy::parse("status.example.com;acme=api.example.com,cdn.example.com");
+
+        assert!(policy.is_enabled());
+        assert!(policy.allows("anyone", "status.example.com"));
+        assert!(policy.allows("acme", "api.example.com"));
+        assert!(policy.allows("acme", "cdn.example.com"));
+        assert!(!policy.allows("acme", "status.example.com"));
+
+        // Whitespace is what a real config file has in it.
+        let policy = Policy::parse("  acme = api.example.com , cdn.example.com  ");
+        assert!(policy.allows("acme", "api.example.com"));
+        assert!(policy.allows("acme", "cdn.example.com"));
+
+        // Empty, blank, and separator-only values must all leave egress off
+        // rather than producing a policy that allows an empty host name.
+        for raw in ["", "   ", ";", ",", ";;", "=", "acme="] {
+            assert!(!Policy::parse(raw).is_enabled(), "{raw:?} enabled egress");
+        }
+    }
+
+    #[test]
+    fn a_tenant_with_an_empty_list_reaches_nothing_rather_than_everything() {
+        // The dangerous reading of "no entry for this tenant" is "no
+        // restrictions". An explicitly empty list must mean explicitly nothing,
+        // and it must not fall back to the shared grant.
+        let policy = Policy::new(["shared.example.com"]).for_tenant("locked-down", Vec::<&str>::new());
+        assert!(!policy.allows("locked-down", "shared.example.com"));
+        assert!(!policy.allows("locked-down", "anything.example.com"));
     }
 
     #[test]
@@ -542,6 +663,7 @@ not tls at all",
         assert_eq!(
             fetch(
                 &policy,
+                "t",
                 &format!("https://127.0.0.1:{port}/"),
                 Duration::from_secs(5)
             ),
@@ -559,7 +681,7 @@ not tls at all",
     #[test]
     fn a_real_https_host_can_actually_be_fetched() {
         let policy = Policy::new(["example.com"]);
-        match fetch(&policy, "https://example.com/", Duration::from_secs(10)) {
+        match fetch(&policy, "t", "https://example.com/", Duration::from_secs(10)) {
             Ok(response) => {
                 let text = String::from_utf8_lossy(&response);
                 assert!(
@@ -629,9 +751,9 @@ not tls at all",
         // hosts are allowed*. If it ever did both, one careless operator flag
         // would turn the metadata endpoint into a reachable target.
         let policy = Policy::new(["internal.svc"]).allow_private_addresses();
-        assert!(!policy.allows("169.254.169.254"));
+        assert!(!policy.allows("t", "169.254.169.254"));
         assert_eq!(
-            fetch(&policy, "http://169.254.169.254/", Duration::from_secs(1)),
+            fetch(&policy, "t", "http://169.254.169.254/", Duration::from_secs(1)),
             Err(Refusal::HostNotAllowed)
         );
     }
@@ -643,7 +765,7 @@ not tls at all",
         // loopback — so allowlisting a *name* must never be enough on its own.
         let policy = Policy::new(["localhost"]);
         assert_eq!(
-            fetch(&policy, "http://localhost:1/", Duration::from_secs(1)),
+            fetch(&policy, "t", "http://localhost:1/", Duration::from_secs(1)),
             Err(Refusal::PrivateAddress)
         );
     }
@@ -654,7 +776,7 @@ not tls at all",
         // so the budget has to be checked here or it stops being a bound.
         let policy = Policy::new(["example.com"]);
         assert_eq!(
-            fetch(&policy, "http://example.com/", Duration::ZERO),
+            fetch(&policy, "t", "http://example.com/", Duration::ZERO),
             Err(Refusal::Timeout)
         );
     }
@@ -667,6 +789,7 @@ not tls at all",
         assert_eq!(
             fetch(
                 &policy,
+                "t",
                 "http://this-should-never-be-resolved.invalid/",
                 Duration::from_secs(5)
             ),

@@ -208,12 +208,19 @@ pub fn add_to_linker(linker: &mut Linker<HostCtx>) -> Result<()> {
                 String::from_utf8_lossy(bytes).into_owned()
             };
 
-            let (policy, budget) = {
+            let (policy, tenant, budget) = {
                 let ctx = caller.data();
-                (ctx.egress.clone(), ctx.remaining_budget())
+                (
+                    ctx.egress.clone(),
+                    ctx.tenant.clone(),
+                    ctx.remaining_budget(),
+                )
             };
 
-            let response = match egress::fetch(&policy, &url, budget) {
+            // The tenant selects the allowlist (§22.8). It comes from the
+            // bearer token the gateway established (§13), never from anything
+            // the guest can set.
+            let response = match egress::fetch(&policy, &tenant, &url, budget) {
                 Ok(response) => response,
                 Err(refusal) => {
                     // The reason goes to the host's logs and the guest gets a

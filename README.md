@@ -2060,8 +2060,14 @@ This is the largest new attack surface in the system, so it is the only feature
 here that does nothing at all until an operator says otherwise:
 
 ```
-NEBULA_EGRESS_ALLOW=api.example.com,data.example.org   # on the worker
+# on the worker; semicolons separate groups, `tenant=` scopes one
+NEBULA_EGRESS_ALLOW="status.example.com;acme=api.example.com,cdn.example.com"
 ```
+
+A bare list is shared by every tenant. A `tenant=` group replaces the shared
+list **for that tenant** rather than adding to it, so a grant can be narrowed
+for one caller without being narrowed for all — and reading the configuration
+answers "what can this tenant reach" in one line instead of two.
 
 `http://` and `https://` both work; the scheme picks the default port.
 
@@ -2135,11 +2141,18 @@ An earlier draft shipped plain HTTP only and said TLS was a dependency decision
 worth making deliberately. It was made deliberately, and this is the result: an
 egress function that cannot reach an HTTPS endpoint cannot reach any real API.
 
-**Cluster-wide, not per-tenant.** This section originally specified a per-tenant
-allowlist. What shipped is one operator-configured list per worker, which is a
-narrowing and is recorded here rather than quietly delivered. Per-tenant policy
-needs somewhere to store per-tenant configuration, which is §22.2's registry
-metadata; the enforcement code would not change, only where the list comes from.
+**Both the policy and its enforcement live on the worker, and that is the
+point.** The worker is the process that opens the socket, so a policy checked
+anywhere else is one something can route around — and a policy *sent* to the
+worker inside `ExecuteRequest` would be a policy the request could influence.
+This one is local configuration that nothing on the wire can change. The tenant
+that selects the list is the one the gateway established from the bearer token
+(§13), never anything the guest can set.
+
+An earlier cut shipped a single cluster-wide list and recorded the gap. This
+closes it without a proto field, a config store, or §22.2 — a `tenant=` group in
+the same variable was enough, and adding a wire field would have moved policy
+onto the network for no gain.
 
 There is also `Policy::allow_private_addresses()`, which switches off rule 2.
 It exists for an operator who has deliberately allowlisted an internal service,

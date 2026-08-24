@@ -664,3 +664,35 @@ fn a_refusal_is_recoverable_rather_than_a_trap() {
         ctx.logs
     );
 }
+
+#[test]
+fn the_tenant_selects_the_allowlist() {
+    let port = common::one_shot_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+    // Two tenants, one guest, one URL, two answers. This is the test that
+    // proves the tenant actually reaches the policy check: with the plumbing
+    // broken both calls would agree, and the feature would look like it worked
+    // right up until one tenant read another's API.
+    let runtime = Runtime::new(common::temp_dir("egress-tenants"))
+        .expect("runtime")
+        .with_egress(
+            nebula_runtime::egress::Policy::default()
+                .for_tenant("allowed", ["127.0.0.1"])
+                .for_tenant("denied", ["somewhere.else"])
+                .allow_private_addresses(),
+        );
+
+    let url = format!("http://127.0.0.1:{port}/");
+    let fetch_as = |tenant: &str| {
+        let ctx = runtime
+            .execute(FETCHER.as_bytes(), "run", tenant, url.as_bytes().to_vec())
+            .expect("guest runs");
+        String::from_utf8_lossy(&ctx.response).to_string()
+    };
+
+    assert!(fetch_as("allowed").starts_with("HTTP/1.1 200 OK"));
+    assert_eq!(fetch_as("denied"), "REFUSED");
+    // A tenant with no entry of its own falls back to the shared list, which is
+    // empty here — so an unknown caller reaches nothing rather than everything.
+    assert_eq!(fetch_as("unknown"), "REFUSED");
+}
