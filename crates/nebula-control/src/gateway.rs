@@ -295,6 +295,21 @@ impl Gateway {
             None => functions.tools.remove(function_id),
         };
 
+        // A redeploy is the only thing that can orphan an artifact, so it is
+        // the only place worth looking for one. Failure is logged and ignored:
+        // a deploy that worked must not be reported as failed because a
+        // housekeeping delete did not.
+        let live: std::collections::BTreeSet<String> =
+            functions.functions.values().cloned().collect();
+        match self
+            .registry
+            .collect_garbage(&live, crate::registry::COLLECT_AFTER)
+        {
+            Ok(0) => {}
+            Ok(collected) => tracing::info!(collected, "collected unreferenced artifacts"),
+            Err(err) => tracing::warn!(%err, "artifact collection failed"),
+        }
+
         // Persisted before the caller is told the deployment succeeded. The lock
         // is held across the write so the file can never disagree with the map;
         // deploys are rare, so serialising them costs nothing that matters.

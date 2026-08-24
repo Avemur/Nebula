@@ -563,6 +563,30 @@ its provenance. The L2 cache is keyed by
 a mismatch on any component is a miss, not a load. Nothing outside the worker
 can write to it.
 
+### 8.2.1 Both disk stores are bounded
+
+An earlier cut bounded L1 by bytes and left L2 and the registry unbounded, which
+made them a disk that fills rather than a cache that evicts.
+
+**L2** has a 4 GiB budget, swept when a compile writes to it, evicting least
+recently used first. Recency is the file's modification time, refreshed on every
+hit, so it is an LRU with no index to keep in sync and nothing to rebuild after a
+restart. Only a compile can grow L2, so that is the only place it needs
+checking, and compiles are rare by construction.
+
+**The registry** collects artifacts nothing points at. Content addressing means a
+redeploy never overwrites: it writes a new file and leaves the old one, so fifty
+deploys of one function leave fifty artifacts. Collection runs after a deploy,
+since that is the only event that can orphan one.
+
+Two details that are not decoration. An artifact must be unreferenced **and
+older than an hour** before it goes: a deploy dereferences the previous version
+immediately, while a worker that began streaming it a moment ago (§4.1) is still
+reading, and deleting underneath that worker turns a cold start into an
+`INTERNAL`. And only files named `<64 hex>.wasm` are candidates, so
+`deployments.json` is never one. Losing that file would look exactly like every
+function vanishing at once.
+
 ### 8.3 The LRU cache
 
 `Module` is `Send + Sync` and internally reference-counted, so the cache holds

@@ -4,10 +4,11 @@
 //! `function_id`, so a new version is a new name and there is no invalidation
 //! protocol.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,6 +24,14 @@ pub const CHUNK_BYTES: usize = 256 * 1024;
 
 /// §6.4 caps artifacts at 32 MiB.
 pub const MAX_ARTIFACT_BYTES: usize = 32 << 20;
+
+/// How long an unreferenced artifact is kept before collection.
+///
+/// Not politeness. Deploying a new version of a function dereferences the old
+/// artifact immediately, while a worker that started fetching it a moment ago is
+/// still streaming (§4.1). Deleting under that worker turns a cold start into an
+/// `INTERNAL`, so an artifact has to be unreferenced *and* stale before it goes.
+pub const COLLECT_AFTER: Duration = Duration::from_secs(3600);
 
 #[derive(Debug)]
 pub struct Registry {
@@ -72,6 +81,58 @@ impl Registry {
             ));
         }
         Ok(self.dir.join(format!("{hash}.wasm")))
+    }
+
+    /// Deletes artifacts nothing points at any more.
+    ///
+    /// Content addressing means a redeploy never overwrites: it writes a new
+    /// file and leaves the old one, so a function deployed fifty times leaves
+    /// fifty artifacts behind. Nothing removed them until this existed.
+    ///
+    /// Only files whose names are content hashes are considered, so
+    /// `deployments.json` and anything else living beside them is never a
+    /// candidate. Returns how many were removed.
+    pub fn collect_garbage(&self, live: &BTreeSet<String>, grace: Duration) -> io::Result<usize> {
+        let now = SystemTime::now();
+        let mut collected = 0;
+
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            // Artifacts are `<64 hex>.wasm` (see `path`). Requiring both the
+            // extension and the hash shape is what keeps `deployments.json`,
+            // and anything else living beside them, out of this loop entirely.
+            let name = entry.file_name();
+            let Some(hash) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".wasm"))
+                .filter(|hash| is_content_hash(hash))
+            else {
+                continue;
+            };
+            if live.contains(hash) {
+                continue;
+            }
+
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            // Compared as an *age* rather than against a cutoff timestamp: file
+            // timestamp granularity is a second or worse on some filesystems,
+            // so a just-written file can report a modification time equal to
+            // the cutoff and slip past a strict `<`.
+            // An age rather than a cutoff timestamp: file times are coarse on
+            // some filesystems and can read slightly ahead of the clock, and
+            // both of those are age zero here rather than an accidental "not
+            // stale".
+            let stale = meta
+                .modified()
+                .map(|at| now.duration_since(at).unwrap_or(Duration::ZERO) >= grace)
+                .unwrap_or(false);
+            if stale && fs::remove_file(entry.path()).is_ok() {
+                collected += 1;
+            }
+        }
+        Ok(collected)
     }
 
     pub fn dir(&self) -> &Path {
@@ -288,6 +349,66 @@ mod tests {
         )
         .unwrap();
         assert!(registry.load_deployments().is_err());
+    }
+
+    #[test]
+    fn unreferenced_artifacts_are_collected_and_referenced_ones_are_not() {
+        let registry = temp_registry();
+        let keep = registry.put(b"still deployed").expect("put");
+        let drop_a = registry.put(b"old version").expect("put");
+        let drop_b = registry.put(b"older version").expect("put");
+
+        // Content addressing means a redeploy never overwrites: it writes a new
+        // file and leaves the old one. Fifty deploys leave fifty artifacts, and
+        // nothing removed them until this existed.
+        let live = BTreeSet::from([keep.clone()]);
+        let collected = registry
+            .collect_garbage(&live, Duration::ZERO)
+            .expect("collect");
+
+        assert_eq!(collected, 2);
+        assert!(registry.contains(&keep));
+        assert!(!registry.contains(&drop_a));
+        assert!(!registry.contains(&drop_b));
+    }
+
+    #[test]
+    fn a_freshly_written_artifact_survives_the_grace_period() {
+        let registry = temp_registry();
+        let orphan = registry.put(b"nobody points at me yet").expect("put");
+
+        // Deploying dereferences the previous artifact immediately, while a
+        // worker that began fetching it a moment ago is still streaming (§4.1).
+        // Deleting under that worker turns a cold start into an `INTERNAL`.
+        let collected = registry
+            .collect_garbage(&BTreeSet::new(), COLLECT_AFTER)
+            .expect("collect");
+
+        assert_eq!(collected, 0);
+        assert!(registry.contains(&orphan));
+    }
+
+    #[test]
+    fn collection_never_touches_the_deployment_table() {
+        let registry = temp_registry();
+        let mut deployments = Deployments::new();
+        deployments
+            .functions
+            .insert("echo".to_string(), "abc".to_string());
+        registry.save_deployments(&deployments).expect("save");
+
+        // The same check that keeps a `function_id` out of a path keeps
+        // everything that is not an artifact out of the sweep. Losing this file
+        // would look exactly like every function vanishing at once.
+        registry
+            .collect_garbage(&BTreeSet::new(), Duration::ZERO)
+            .expect("collect");
+
+        let loaded = registry.load_deployments().expect("still there");
+        assert_eq!(
+            loaded.functions.get("echo").map(String::as_str),
+            Some("abc")
+        );
     }
 
     #[test]

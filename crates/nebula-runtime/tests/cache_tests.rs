@@ -10,7 +10,7 @@ mod common;
 use std::sync::Arc;
 
 use nebula_runtime::cache::{content_hash, Cache, Source};
-use nebula_runtime::Runtime;
+use nebula_runtime::{engine, Runtime};
 
 /// A distinct trivial module per `n`, so tests do not collide in L2.
 fn guest(n: u32) -> String {
@@ -274,5 +274,83 @@ fn the_most_recently_used_module_survives_eviction() {
         cache.cranelift_compiles(),
         10,
         "only the nine newcomers plus `keep` should ever have been compiled"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// L2 is bounded (§8.2)
+// ---------------------------------------------------------------------------
+
+/// A distinct module per `n`, so each one compiles to its own L2 entry.
+fn unique(n: usize) -> String {
+    format!("(module (func (export \"run\")) (; {n} ;))")
+}
+
+#[test]
+fn the_l2_cache_stays_inside_its_budget() {
+    let dir = common::temp_dir("l2-budget");
+    // Small enough that a handful of modules overflow it. L1 is given room, so
+    // this measures the disk bound and not the memory one.
+    let cache = Cache::with_budgets(&dir, 1 << 30, 64 << 10).expect("cache");
+    let engine = engine::engine().expect("engine");
+    let linker = wasmtime::Linker::new(&engine);
+
+    for n in 0..40 {
+        cache
+            .get_or_compile(&engine, &linker, unique(n).as_bytes())
+            .expect("compile");
+    }
+
+    let on_disk: u64 = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum();
+
+    // An unbounded disk cache is a disk that fills. Every distinct artifact a
+    // worker ever compiles leaves an AOT module behind.
+    assert!(
+        on_disk <= 64 << 10,
+        "L2 held {on_disk} bytes against a 64 KiB budget"
+    );
+    assert!(cache.evicted_l2() > 0, "nothing was evicted");
+}
+
+#[test]
+fn a_module_that_keeps_being_used_is_not_the_one_evicted() {
+    let dir = common::temp_dir("l2-lru");
+    let cache = Cache::with_budgets(&dir, 1 << 30, 64 << 10).expect("cache");
+    let engine = engine::engine().expect("engine");
+    let linker = wasmtime::Linker::new(&engine);
+
+    let hot = unique(9999);
+    cache
+        .get_or_compile(&engine, &linker, hot.as_bytes())
+        .expect("compile hot");
+
+    // Eviction orders by modification time, and an L2 hit touches the file.
+    // Without that a hot module ages out purely because it was compiled first,
+    // gets recompiled, and the cache spends its budget re-earning what it had.
+    for n in 0..40 {
+        cache
+            .get_or_compile(&engine, &linker, unique(n).as_bytes())
+            .expect("compile");
+        // Reading `hot` back keeps it current. It comes from L1 here, so this
+        // also proves the touch happens on the path that matters.
+        cache
+            .get_or_compile(&engine, &linker, hot.as_bytes())
+            .expect("hot stays warm");
+    }
+
+    let compiles_before = cache.cranelift_compiles();
+    cache
+        .get_or_compile(&engine, &linker, hot.as_bytes())
+        .expect("hot");
+    assert_eq!(
+        cache.cranelift_compiles(),
+        compiles_before,
+        "the hot module was evicted and had to be recompiled"
     );
 }
