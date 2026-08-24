@@ -18,6 +18,7 @@ use nebula_proto::{ExecuteRequest, ExecuteResponse, Outcome};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Code;
 
+use crate::auth::Auth;
 use crate::idempotency;
 use crate::membership::Membership;
 use crate::ratelimit::{Decision, Limit, Limiter};
@@ -112,6 +113,8 @@ pub struct Gateway {
     /// and an execution does not.
     execute_limit: Limiter,
     deploy_limit: Limiter,
+    /// How a bearer token becomes a tenant id (§13).
+    auth: Auth,
 }
 
 /// The result of a successful deploy.
@@ -172,7 +175,24 @@ impl Gateway {
             idempotency: idempotency::Store::new(),
             execute_limit: Limiter::new(Limit::EXECUTE),
             deploy_limit: Limiter::new(Limit::DEPLOY),
+            auth: Auth::Insecure,
         })
+    }
+
+    /// Requires signed bearer tokens (§13).
+    ///
+    /// Opt-in by construction, and the binary says which mode it is in at
+    /// startup: a gateway that silently verified nothing is exactly the failure
+    /// this exists to remove.
+    pub fn with_auth(mut self, auth: Auth) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// The tenant a request proves it is, if any.
+    pub fn tenant_of(&self, headers: &HeaderMap) -> Option<String> {
+        let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+        self.auth.tenant_of(value.strip_prefix("Bearer ")?)
     }
 
     /// Replaces the default rate limits.
@@ -369,14 +389,6 @@ pub fn router(state: Arc<Gateway>) -> Router {
         .with_state(state)
 }
 
-/// v1 authentication: the bearer token *is* the tenant id (§13). Enough to prove
-/// the authorization path exists; not a credential system.
-fn tenant_of(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let token = value.strip_prefix("Bearer ")?.trim();
-    (!token.is_empty()).then(|| token.to_string())
-}
-
 /// Reads [`TOOL_SCHEMA_HEADER`].
 ///
 /// `Ok(None)` is absent. Anything present and unusable is an error rather than
@@ -447,7 +459,7 @@ async fn publish(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(tenant) = tenant_of(&headers) else {
+    let Some(tenant) = gateway.tenant_of(&headers) else {
         return unauthorized().into_response();
     };
     // Checked before `publish`, which is where Wizer runs the caller's guest
@@ -533,7 +545,7 @@ async fn answer_for(
     body: Bytes,
     trace: &trace::TraceContext,
 ) -> Answer {
-    let Some(tenant) = tenant_of(headers) else {
+    let Some(tenant) = gateway.tenant_of(headers) else {
         return unauthorized();
     };
     tracing::Span::current().record("tenant", tenant.as_str());

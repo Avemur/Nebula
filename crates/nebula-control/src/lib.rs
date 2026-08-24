@@ -7,6 +7,7 @@
 //! Serves two surfaces: the `NebulaControl` gRPC mesh that workers speak, and
 //! the HTTP gateway of §11.1 that clients speak.
 
+pub mod auth;
 pub mod gateway;
 pub mod idempotency;
 pub mod membership;

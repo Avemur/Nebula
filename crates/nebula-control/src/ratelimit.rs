@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 /// Ceiling on tracked tenants.
 ///
-/// v1 auth makes the bearer token *be* the tenant (§13), so a caller can invent
+/// a tenant id arrives from a token (§13), so a caller can invent
 /// tenants for free — an unbounded map here would be a memory-exhaustion vector
 /// created by the very thing meant to prevent one.
 pub const MAX_TENANTS: usize = 10_000;

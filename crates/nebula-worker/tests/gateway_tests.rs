@@ -179,6 +179,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 struct Cluster {
     http_addr: String,
+    registry: Arc<Registry>,
     control_url: String,
     membership: Arc<Membership>,
     gateway: Arc<Gateway>,
@@ -202,6 +203,15 @@ impl Cluster {
         // subject to the real defaults would make an unrelated failure look
         // like a routing bug.
         Self::with_limits(liveness, Limit::NONE, Limit::NONE).await
+    }
+
+    /// A cluster that requires signed bearer tokens (§13).
+    async fn authenticated(secret: &[u8]) -> Self {
+        let mut cluster = Self::start(Duration::from_secs(5)).await;
+        cluster
+            .restart_gateway_with(nebula_control::auth::Auth::signed(secret))
+            .await;
+        cluster
     }
 
     /// A cluster with real rate limits, for the tests that are about them.
@@ -235,6 +245,7 @@ impl Cluster {
 
         Self {
             http_addr,
+            registry,
             control_url,
             membership,
             gateway,
@@ -267,6 +278,21 @@ impl Cluster {
             kill: Some(kill),
         });
         node_id
+    }
+
+    /// Replaces the gateway with one that authenticates, on a new port.
+    async fn restart_gateway_with(&mut self, auth: nebula_control::auth::Auth) {
+        let gateway = Arc::new(
+            Gateway::open(self.membership.clone(), self.registry.clone())
+                .expect("gateway")
+                .with_auth(auth),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        self.http_addr = listener.local_addr().unwrap().to_string();
+        self.gateway = gateway.clone();
+        tokio::spawn(async move {
+            let _ = gateway::serve(listener, gateway).await;
+        });
     }
 
     /// Registers a node whose address nothing is listening on — a worker the
@@ -1421,4 +1447,105 @@ async fn a_deployment_table_written_before_tools_existed_still_loads() {
         Some("abc")
     );
     assert!(loaded.tools.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Authentication (§13)
+// ---------------------------------------------------------------------------
+
+const SECRET: &[u8] = b"a shared secret";
+
+#[tokio::test]
+async fn a_signed_token_names_its_tenant_and_a_bare_one_does_not() {
+    let mut cluster = Cluster::authenticated(SECRET).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    let token = nebula_control::auth::Auth::signed(SECRET)
+        .mint("acme")
+        .expect("mint");
+    assert_eq!(cluster.post("echo", &token, b"hello").await.status, 200);
+
+    // Under v1 auth this was a valid credential for `acme`. That it is not any
+    // more is the entire point of the change.
+    let bare = cluster.post("echo", "acme", b"hello").await;
+    assert_eq!(bare.status, 401);
+    assert_eq!(bare.header("x-nebula-fault"), Some("unauthorized"));
+}
+
+#[tokio::test]
+async fn one_tenants_token_cannot_be_edited_into_another() {
+    let mut cluster = Cluster::authenticated(SECRET).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    let token = nebula_control::auth::Auth::signed(SECRET)
+        .mint("acme")
+        .expect("mint");
+    let signature = token.split_once('.').unwrap().1;
+
+    // Everything §22 isolates is keyed on the tenant — the session scratchpad
+    // (§22.5), the replay store (§22.4), the egress allowlist (§22.8). Moving
+    // the name in front of a valid signature is the cheapest possible attack on
+    // all three at once.
+    let forged = cluster
+        .post("echo", &format!("globex.{signature}"), b"hello")
+        .await;
+    assert_eq!(forged.status, 401);
+
+    // And a token minted under a different secret is refused, which is what
+    // makes rotating the secret a revocation.
+    let other = nebula_control::auth::Auth::signed(b"rotated")
+        .mint("acme")
+        .expect("mint");
+    assert_eq!(cluster.post("echo", &other, b"hello").await.status, 401);
+}
+
+#[tokio::test]
+async fn deploys_are_authenticated_too() {
+    let cluster = Cluster::authenticated(SECRET).await;
+
+    // `PUT` runs Wizer, which executes the caller's guest code on the control
+    // plane (§11.1). An unauthenticated deploy endpoint would be the cheapest
+    // way in.
+    let refused = http(
+        &cluster.http_addr,
+        "PUT",
+        "/functions/echo",
+        Some("acme"),
+        &[],
+        ECHO.as_bytes(),
+    )
+    .await;
+    assert_eq!(refused.status, 401);
+
+    let token = nebula_control::auth::Auth::signed(SECRET)
+        .mint("acme")
+        .expect("mint");
+    let accepted = http(
+        &cluster.http_addr,
+        "PUT",
+        "/functions/echo",
+        Some(&token),
+        &[],
+        ECHO.as_bytes(),
+    )
+    .await;
+    assert_eq!(accepted.status, 201);
+}
+
+#[tokio::test]
+async fn a_malformed_tenant_id_is_refused_even_without_signing() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    // The charset guards four different stores, and that is true whether or not
+    // anybody checked a signature: a tenant id is the first element of the KV
+    // key, the idempotency slot, and the egress lookup.
+    for bad in ["has a space", "has.a.dot", &"t".repeat(100)] {
+        let response = cluster.post("echo", bad, b"x").await;
+        assert_eq!(response.status, 401, "tenant {bad:?} was accepted");
+    }
+    assert_eq!(cluster.post("echo", "acme-prod_2", b"x").await.status, 200);
 }

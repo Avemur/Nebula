@@ -90,7 +90,7 @@ without teaching anything the project is about.
   which is per-node and non-durable.
 - **No WASM threads or SIMD-dependent guest features in v1.** Single-threaded
   guests only.
-- **No production identity system.** v1 uses a static bearer token per tenant
+- **No user-facing identity system.** Tokens are HMAC-signed per tenant (§13)
   (§13); real authentication is a deployment concern, not a runtime one.
 
 ---
@@ -964,6 +964,27 @@ another tenant's data, or escape to the host.
 | Poisoned AOT cache | L2 keyed by artifact hash + engine config + wasmtime version; worker-writable only |
 | Compile bombs | Size cap and compile timeout at deploy time, not request time |
 
+**Authentication is HMAC-signed bearer tokens.** A token is `tenant.signature`,
+where the signature is a SHA-256 HMAC over the tenant id under a secret only the
+control plane holds. That makes the tenant a *fact* rather than a claim, which
+matters because everything §22 isolates is keyed on it — the session scratchpad
+(§22.5), the replay store (§22.4), the egress allowlist (§22.8), the rate
+buckets (§22.7). Verification is constant-time (`ring::hmac::verify`); comparing
+hex with `==` would leak a signature one byte at a time to anyone willing to
+measure.
+
+There is no expiry and no revocation list. A token says one thing — "this is
+tenant X" — and rotating `NEBULA_AUTH_SECRET` invalidates every token at once,
+which is the whole revocation story until something needs finer. Mint with
+`nebula-control mint <tenant>`.
+
+**Verification is off unless `NEBULA_AUTH_SECRET` is set**, and the control
+plane says so at startup in as many words. The alternative — refusing every
+request until a secret exists — means `cargo run` does not work, and the
+predictable response to that is a secret of `x` that everybody then believes is
+security. An operator who knows they have no authentication is better off than
+one who believes they have some.
+
 **Outbound HTTP is a defended surface, not an absent one (§22.8).** It is off
 unless an operator names hosts, and when on it enforces an allowlist, checks
 every resolved address against the private ranges, connects to the address it
@@ -992,9 +1013,12 @@ a decision about that host rather than about this code.
   reachable by anyone who can `PUT` a function. Moving the Wizer pass onto a
   worker removes the exception entirely and is the answer if deploy is ever
   exposed to callers less trusted than today's.
-- **v1 authentication is a static bearer token per tenant**, compared in
-  constant time. Sufficient to prove the authorization *path* exists; not a
-  credential system.
+- **Authentication is an HMAC-signed bearer token**: `tenant.signature`, where
+  the signature is a SHA-256 HMAC over the tenant id under a secret only the
+  control plane holds, verified in constant time. No expiry and no revocation
+  list — rotating `NEBULA_AUTH_SECRET` invalidates everything at once. **Off
+  unless that variable is set**, and the control plane says so loudly at
+  startup; see §13.
 - **Internal gRPC is unauthenticated plaintext** on a trusted network. mTLS is a
   known, deferred hardening step.
 
@@ -1399,8 +1423,10 @@ numbers clearing the bar is marketing.
    As written they are deferred. Overrideable.
    Agent workloads are the demand that would otherwise force them; §22.5 argues
    that demand is met by session *state* without pinning a live *instance*.
-2. **Is a static bearer token enough for v1 auth**, or should per-function
-   signing keys land in Phase 3?
+2. ~~**Is a static bearer token enough for v1 auth**~~ — **answered.** It was
+   not: everything §22 isolates is keyed on the tenant, so an unverified tenant
+   made all of it conditional on everyone being honest. Tokens are now
+   HMAC-signed (§13). Per-*function* keys remain unbuilt and unneeded.
 3. **Is loopback-only benchmarking acceptable** for the headline numbers, or is
    a two-machine setup required for M2/M3 to be credible?
 4. **WASI preview 1 vs the component model.** p1 is the pragmatic v1 choice.
@@ -1794,8 +1820,7 @@ gateway's — duplication without a check is a bug with a delay on it.
 
 An MCP endpoint is by construction the thing you hand to something that loops.
 Per-tenant rate limiting (§22.7) landed for exactly this reason. v1 auth is
-still a static bearer token that doubles as the tenant id (§13), and that one is
-known and not built.
+HMAC-signed per tenant (§13), so the identity these limits meter is verified.
 
 ### 22.4 Idempotency keys — because agent frameworks retry by default
 
@@ -2109,9 +2134,10 @@ invisible.
 
 #### The limiter's own state is bounded
 
-v1 auth makes the bearer token *be* the tenant (§13), so a caller can invent
-tenants for free. An unbounded map keyed on an attacker-chosen string would be a
-memory-exhaustion vector created by the very thing meant to prevent one — the
+Tokens are signed now (§13), so inventing a tenant needs the signing secret —
+but verification is off by default, and an unbounded map keyed on an
+attacker-chosen string would be a memory-exhaustion vector created by the very
+thing meant to prevent one — the
 same mistake §22.4 shipped and had to fix, so it was designed in here rather
 than found later.
 
@@ -2141,10 +2167,10 @@ module is arithmetic and a lock. Per-function or per-endpoint limits, a
 distributed limiter shared across control planes, and adaptive limits all belong
 to a system that has measured this one being wrong.
 
-**Still not built: authentication worth the name.** A bearer token that *is* the
-tenant means anyone can pick any tenant, so these buckets meter a self-declared
-identity. That is enough to stop an honest client's runaway loop and not enough
-to stop a dishonest one, which is exactly what §13 already says about v1 auth.
+These buckets meter a *verified* identity now that tokens are signed (§13). An
+earlier cut of this section noted that they metered a self-declared one — enough
+to stop an honest client's runaway loop, and not enough to stop a dishonest one.
+That gap is closed: minting a fresh tenant now needs the signing secret.
 
 ### 22.8 Egress — the one every agent workload asks for, and the one to gate
 
