@@ -13,37 +13,56 @@
 //! * **stdout** — the response body: whatever `console.log` printed, followed by
 //!   the completion value when it is not `undefined`.
 //!
-//! Nothing but WASI is imported, and that is not a style choice: Wizer has to
-//! instantiate the module to run `_initialize`, so every import must be
-//! satisfiable at build time (README.md R2). `nebula.request_read` and
-//! `nebula.response_write` are therefore unavailable here, and stdin/stdout
-//! carry the request instead.
+//! The request arrives on stdin rather than through `nebula.request_read`
+//! because that is what a wizenable guest can do — and this guest is no longer
+//! wizened. The channel stayed because it works and because swapping it would
+//! change the contract in §22.1 for no gain.
 //!
-//! # Why Wizer matters more here than anywhere else
+//! # Why this is not wizened
 //!
-//! Building a JS realm means constructing every intrinsic — `Object`, `Array`,
-//! `JSON`, `Math`, `RegExp` — before a single line of user code runs. That is
-//! the §4.3 boot cost in its purest form. `_initialize` builds the realm and
-//! parks it; Wizer runs that at build time and snapshots the result into the
-//! module's data segments, so each request starts from a realm that is already
-//! there via `memory_init_cow`.
+//! It was, until egress landed. Wizer has to instantiate a module to run its
+//! initializer, so **every import must be satisfiable at build time** (README.md
+//! R2) — which means a wizenable guest can import nothing but WASI, and
+//! `nebula.http_get` would be unsatisfiable.
+//!
+//! Giving that up cost nothing, and that is measured rather than assumed: §22.1
+//! found Boa builds a realm in well under a millisecond, while the snapshot
+//! *added* ~150 KiB to an artifact whose instantiation cost is dominated by
+//! size. Raw and wizened measured the same. So the guest keeps no
+//! `_initialize`, builds its realm on first use, and can reach the network when
+//! an operator allows it.
 //!
 //! # Isolation
 //!
-//! The snapshot is restored copy-on-write into a *fresh instance per request*
-//! (§4.2), so a script that scribbles on `globalThis` scribbles on its own
-//! private copy and it dies with the instance. The invariant is unchanged.
+//! Every request gets a *fresh instance* (§4.2), so a script that scribbles on
+//! `globalThis` scribbles on its own private copy and it dies with the
+//! instance. The invariant is unchanged, and it never depended on the snapshot.
 
 use std::cell::RefCell;
 use std::io::Read;
 
-use boa_engine::{js_string, Context, JsError, JsResult, JsValue, NativeFunction, Source};
+use boa_engine::{
+    js_string, Context, JsError, JsNativeError, JsResult, JsValue, NativeFunction, Source,
+};
+
+// Outbound HTTP (README.md §22.8). Refused unless an operator allowlisted the
+// host, which is why the JS side reports a refusal as an exception rather than
+// as an empty string — a script must be able to tell "blocked" from "the page
+// was empty".
+#[link(wasm_import_module = "nebula")]
+extern "C" {
+    fn http_get(url_ptr: *const u8, url_len: u32, out_ptr: *mut u8, out_len: u32) -> i32;
+}
+
+/// Matches the host's own cap (§22.8), so the only truncation that can happen
+/// is the one the host already refused.
+const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
 // A thread local rather than a `static`: `Context` is `!Sync`, and
 // `wasm32-wasip1` is single-threaded, so this compiles down to a plain
-// location in linear memory — which is exactly what Wizer snapshots.
+// location in linear memory.
 thread_local! {
-    /// The realm, built once and snapshotted by Wizer.
+    /// The realm, built on first use and reused for the rest of the request.
     static ENGINE: RefCell<Option<Context>> = const { RefCell::new(None) };
 }
 
@@ -59,6 +78,7 @@ globalThis.__nebula_fmt = (v) => {
   try { const s = JSON.stringify(v); return s === undefined ? String(v) : s; }
   catch (e) { return String(v); }
 };
+globalThis.httpGet = (url) => __nebula_http_get(String(url));
 globalThis.console = {
   log:   (...a) => __nebula_print(a.map(__nebula_fmt).join(' ')),
   info:  (...a) => __nebula_print(a.map(__nebula_fmt).join(' ')),
@@ -68,12 +88,45 @@ globalThis.console = {
 };
 "#;
 
-/// Backs the console shim. A Rust closure inside the guest, not a WASM import —
-/// which is the only reason the console survives wizening.
+/// Backs the console shim. A Rust function inside the guest rather than a WASM
+/// import, so it costs the host nothing and needs no policy.
 fn print(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let line = args.first().cloned().unwrap_or_default().to_string(ctx)?;
     println!("{}", line.to_std_string_escaped());
     Ok(JsValue::undefined())
+}
+
+/// Backs `httpGet`. Returns the raw HTTP response — status line, headers,
+/// blank line, body — because a script that cannot tell `200` from `404` will
+/// treat an error page as data.
+fn fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let url = args
+        .first()
+        .cloned()
+        .unwrap_or_default()
+        .to_string(ctx)?
+        .to_std_string_escaped();
+
+    let mut buffer = vec![0u8; MAX_RESPONSE_BYTES];
+    let written = unsafe {
+        http_get(
+            url.as_ptr(),
+            url.len() as u32,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    };
+
+    if written < 0 {
+        // The host deliberately does not say *why* — a script told which hosts
+        // are blocked can enumerate the allowlist one request at a time (§22.8).
+        return Err(JsNativeError::error()
+            .with_message(format!("httpGet refused: {url}"))
+            .into());
+    }
+
+    let written = (written as usize).min(buffer.len());
+    Ok(js_string!(String::from_utf8_lossy(&buffer[..written]).as_ref()).into())
 }
 
 fn build() -> Context {
@@ -84,35 +137,31 @@ fn build() -> Context {
         NativeFunction::from_fn_ptr(print),
     )
     .expect("register __nebula_print");
-    // Panicking here is deliberate: it fails the Wizer step loudly at build
-    // time rather than shipping an artifact whose console is silently missing.
+    ctx.register_global_callable(
+        js_string!("__nebula_http_get"),
+        1,
+        NativeFunction::from_fn_ptr(fetch),
+    )
+    .expect("register __nebula_http_get");
+    // Panicking here is deliberate: a realm whose console or `httpGet` failed
+    // to register is one where every script fails in a way that looks like the
+    // script's fault. Better to trap on the first request than to mislead every
+    // one after it.
     ctx.eval(Source::from_bytes(PRELUDE)).expect("prelude");
     ctx
 }
 
-/// Run by Wizer at build time; run by the host per request if this artifact was
-/// never wizened (§4.3).
-#[export_name = "_initialize"]
-pub extern "C" fn initialize() {
-    ENGINE.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(build());
-        }
-    });
-}
-
-/// Diagnostic export: prints `warm` if the realm arrived already built.
+/// Diagnostic export: builds the realm and prints nothing else.
 ///
-/// `run` falls back to building the realm when it finds an empty slot, which is
-/// the right behaviour and also the perfect way to hide a snapshot that never
-/// took — both artifacts would work, one would just be slower, and a benchmark
-/// would report the difference as noise. Called on the wizened artifact, which
-/// has no `_initialize` for the host to call, `warm` can only mean the snapshot.
+/// Deliberately *not* `_initialize`. That name is the WASI reactor convention
+/// (§4.3) and the control plane's deploy pipeline wizens anything exporting it —
+/// which would fail here, because Wizer cannot satisfy `nebula.http_get`. This
+/// exists so a benchmark can time instantiation without also timing a parse.
 #[export_name = "realm_probe"]
 pub extern "C" fn realm_probe() {
     ENGINE.with(|cell| {
-        println!("{}", if cell.borrow().is_some() { "warm" } else { "cold" });
+        let mut slot = cell.borrow_mut();
+        slot.get_or_insert_with(build);
     });
 }
 
@@ -127,8 +176,8 @@ pub extern "C" fn run() {
 
     ENGINE.with(|cell| {
         let mut slot = cell.borrow_mut();
-        // `get_or_insert_with` rather than `expect`: an un-wizened artifact is
-        // slow, not broken, and it is the control arm of the benchmark.
+        // The realm is built on first use. It was a Wizer snapshot until egress
+        // arrived; §22.1 measured the difference as nothing.
         let ctx = slot.get_or_insert_with(build);
         eval(ctx, &source);
     });

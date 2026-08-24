@@ -32,9 +32,12 @@ ls -l "$dist"
 
 # --- The JavaScript interpreter (§22.1) --------------------------------------
 #
-# Same recipe, and for a much better reason: an interpreter's boot *is* building
-# its realm — every intrinsic, before a line of user code runs. Un-wizened, this
-# guest would spend most of a tool call constructing `Object` and `JSON`.
+# Not wizened, and that is deliberate. Wizer must instantiate a module to run
+# its initializer, so every import has to be satisfiable at build time — and
+# this guest imports `nebula.http_get` for egress (§22.8), which Wizer cannot
+# provide. §22.1 measured what that costs: nothing. Boa builds a realm in well
+# under a millisecond, and the snapshot added bytes to an artifact whose
+# instantiation cost is dominated by size.
 js="$here/interpreters/js"
 js_dist="$js/dist"
 
@@ -43,7 +46,8 @@ mkdir -p "$js_dist"
 cargo build --release --target wasm32-wasip1 --manifest-path "$js/Cargo.toml"
 cp "$js/target/wasm32-wasip1/release/nebula_js.wasm" "$js_dist/nebula_js.wasm"
 
-wizer --allow-wasi --init-func _initialize \
-  -o "$js_dist/initialized.wasm" "$js_dist/nebula_js.wasm"
+# Left over from when this guest was wizened; a stale copy would be silently
+# served by tests that still look for it.
+rm -f "$js_dist/initialized.wasm"
 
 ls -l "$js_dist"

@@ -1471,9 +1471,9 @@ context, per-tenant rate limits, and gated outbound HTTP.
 ### 22.1 Interpreter guests — the prerequisite for everything else
 
 **Status: built.** `guests/interpreters/js`, tested in
-`crates/nebula-runtime/tests/interpreter_tests.rs`. Its artifacts are *not*
-committed — 7 MiB each, and a rebuild writes a fresh pair — so build them with
-`bash guests/build.sh`; without them those tests skip with a pointer rather than
+`crates/nebula-runtime/tests/interpreter_tests.rs`. The artifact is *not*
+committed — 7 MiB, rewritten on every build — so build it with
+`bash guests/build.sh`; without it those tests skip with a pointer rather than
 failing.
 
 **An agent writes Python and JavaScript. It does not write Rust and it cannot
@@ -1494,14 +1494,16 @@ source code the request body.**
 
 #### The interface
 
-The guest imports **nothing but WASI**, and that is a constraint rather than a
-preference: Wizer must instantiate the module to run `_initialize`, so every
-import has to be satisfiable at build time (R2). `nebula.request_read` and
-`nebula.response_write` are therefore unavailable to it. So:
+The request arrives on **stdin** rather than through `nebula.request_read`,
+which was a constraint when this guest was wizened and is now simply the
+contract. It still works, and changing it would break §22.1's interface for no
+gain. So:
 
 - **stdin** carries the source to evaluate (§7.1).
 - **stdout** carries the answer, and becomes the response body when the guest
   wrote nothing through `response_write` (§7.2).
+- **`httpGet(url)`** reaches the network when an operator allows it (§22.8),
+  returning the raw response and throwing on a refusal.
 
 `console.log` and friends are shimmed onto stdout, and values render through
 `JSON.stringify` with a `String` fallback — `[object Object]` tells an agent
@@ -1539,11 +1541,11 @@ magnitude smaller, and *that* is what would make a JS tool call faster.
 `instantiation_cost_tracks_artifact_size` pins the finding so the guidance can
 be re-checked rather than re-argued.
 
-#### Wizer: it works, and it buys almost nothing here
+#### Wizer: it worked, it bought nothing, and it has been removed
 
 This section previously claimed Wizer was what made interpreter guests viable —
 that an interpreter's boot is the §4.3 cost in its purest form. **That was a
-prediction, and the measurement contradicts it.** Recorded rather than quietly
+prediction, and the measurement contradicted it.** Recorded rather than quietly
 dropped:
 
 | | Median execution |
@@ -1551,23 +1553,31 @@ dropped:
 | Raw (`_initialize` runs per request) | ~3.9 ms |
 | Wizened (realm restored from the snapshot) | ~3.9 ms |
 
-The snapshot demonstrably takes — the wizened artifact no longer exports
-`_initialize`, and a `realm_probe` export reports the realm already built, which
-has no other possible cause. It simply does not help, for two compounding
-reasons: Boa constructs a realm in well under a millisecond, and the snapshot
-*adds* ~150 KiB to an artifact whose instantiation cost is dominated by size.
-The saving and the penalty are the same order of magnitude.
+The snapshot demonstrably took — the wizened artifact no longer exported
+`_initialize`, and a probe reported the realm already built, which had no other
+possible cause. It simply did not help, for two compounding reasons: Boa
+constructs a realm in well under a millisecond, and the snapshot *added*
+~150 KiB to an artifact whose instantiation cost is dominated by size. The
+saving and the penalty were the same order of magnitude.
 
-Two consequences, and neither is "remove the initializer":
+**Egress (§22.8) then made the choice for us.** Wizer must instantiate a module
+to run its initializer, so every import has to be satisfiable at build time
+(R2) — which means a wizenable guest can import nothing but WASI, and
+`nebula.http_get` cannot be one of its imports. Keeping the snapshot would have
+meant an interpreter that cannot reach the network in exchange for a speedup
+measured at zero.
 
-1. **The guest keeps `_initialize`.** It is what makes the artifact correct
-   whether or not it was wizened, it costs nothing, and the control plane's
-   deploy pipeline wizens anything that exports it anyway. An interpreter whose
-   boot *is* expensive — CPython, whose startup genuinely is tens of
-   milliseconds — plugs into the same machinery unchanged.
-2. **§4.3's ~80× stands, and is narrower than it looked.** It was measured on a
-   guest built to have an expensive boot, and it is honest for that guest. Wizer
-   pays when boot is expensive relative to instantiation; here it is not.
+So the interpreter exports no `_initialize`, builds its realm on first use, and
+is not wizened. `the_interpreter_does_not_ask_to_be_wizened` holds that line,
+and it is not a style test: `PUT /functions/{id}` wizens anything exporting
+`_initialize` (§11.1), so re-adding the export would turn every deploy of this
+guest into a `400` whose only clue is a Wizer error about an unsatisfiable
+import.
+
+**§4.3's ~80× still stands, and is narrower than it looked.** It was measured on
+a guest built to have an expensive boot, and it is honest for that guest. Wizer
+pays when boot is expensive *relative to instantiation*; for an interpreter this
+size, it is not.
 
 #### It is still a guest
 
@@ -2123,19 +2133,22 @@ widens *where an allowed host may resolve to* and never *which hosts are
 allowed*, and a test pins that distinction: with the switch on,
 `http://169.254.169.254/` is still refused as `HostNotAllowed`.
 
-#### The interpreter guest cannot use this yet
+#### The interpreter guest uses it
 
-`guests/interpreters/js` imports nothing but WASI, because Wizer must
-instantiate a module to run its initializer and every import has to be
-satisfiable at build time (R2). `nebula.http_get` is therefore unavailable to
-it, and the flagship guest cannot fetch anything.
+```js
+const raw = httpGet('http://api.example.com/things');
+JSON.parse(raw.split('\r\n\r\n')[1]).length
+```
 
-The fix is known and cheap: drop `_initialize` from the interpreter and stop
-wizening it, which §22.1 measured as costing **nothing** — Boa builds a realm in
-well under a millisecond and the snapshot adds bytes to an artifact whose cost
-is dominated by size. That is a decision to make when egress is actually turned
-on, not a blocker, and it is not made here because it would trade a
-demonstrated capability for an unused one.
+`httpGet` returns the raw response and **throws** on a refusal, so a script can
+tell "blocked" from "the page was empty" — an empty string would conflate them,
+and a trap would kill a script for asking a question it was allowed to ask and
+told no (§7.2). The thrown message names the URL and never the reason.
+
+Wiring it cost the Wizer snapshot, because a wizenable guest can import nothing
+but WASI (R2). §22.1 has the measurement that made this an easy trade: the
+snapshot was worth nothing on this artifact. The interpreter now exports no
+`_initialize` and builds its realm on first use.
 
 ### 22.9 Ranked, with what each one costs
 
@@ -2148,7 +2161,7 @@ demonstrated capability for an unused one.
 | 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse, forwarded through the mesh | **Built.** Also fixed a `request_id` that named a function, not a request |
 | 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | Do, and say plainly that it is best-effort |
 | 7 | **Per-tenant rate limits** (§22.7) | Survival, and fairness §10.3 cannot provide | A token bucket per tenant | **Built.** An agent in a retry loop *is* a load test |
-| 8 | **Egress** (§22.8) | Network-using tools | Its own threat model | **Built, and off by default.** Plain HTTP only; the interpreter cannot use it yet |
+| 8 | **Egress** (§22.8) | Network-using tools | Its own threat model | **Built, and off by default.** Plain HTTP only |
 | 9 | Streaming responses | Incremental output | Reworks `response_write` into a flushing channel | Defer — buffered output is correct, just less pretty |
 | 10 | Actor pins (§21) | True stateful sessions | Leases, fencing, eviction rework | Stays deferred; §22.5 covers the demand that would otherwise force it |
 

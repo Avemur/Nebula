@@ -28,3 +28,24 @@ pub fn temp_dir(tag: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
+
+/// A single-shot HTTP server on loopback, returning its port.
+///
+/// A real socket rather than a mock: the client under test is hand-written, and
+/// the bugs it can have — framing, the `Host` header, reading to EOF — are
+/// exactly the ones a mock would paper over.
+pub fn one_shot_server(response: &'static str) -> u16 {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}

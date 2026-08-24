@@ -7,9 +7,10 @@
 //! 2. **It is still a guest.** §6's ceilings apply to an interpreter exactly as
 //!    they apply to anything else, even though it now parses attacker-authored
 //!    source on every request.
-//! 3. **The cost is where the measurement says it is.** The Wizer snapshot is
-//!    verified to take — and then measured, and it turns out to buy almost
-//!    nothing here. §22.1 records that rather than the hope it replaced.
+//! 3. **The cost is where the measurement says it is.** Instantiating a 7 MiB
+//!    module dominates everything else this guest does, which is why it is no
+//!    longer wizened — §22.1 measured the snapshot as buying nothing, and
+//!    §22.8 needed the import slot Wizer was standing in.
 //!
 //! Requires the artifacts from `bash guests/build.sh`; without them these skip
 //! rather than failing on a machine with no `wasm32-wasip1` target or `wizer`.
@@ -19,12 +20,8 @@ mod common;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use nebula_runtime::egress::Policy;
 use nebula_runtime::{HostCtx, Runtime, INIT_EXPORT};
-
-/// What "usable as an agent tool" means numerically: a comfortable fraction of
-/// the 50 ms default deadline, with enough margin that a loaded machine does
-/// not turn the benchmark into a flaky trap. Measured at ~4 ms.
-const MAX_EXECUTION: Duration = Duration::from_millis(25);
 
 const SAMPLES: usize = 9;
 
@@ -34,9 +31,9 @@ fn dist(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// The wizened artifact — the one that would actually be deployed.
+/// The artifact that would actually be deployed.
 fn interpreter() -> Option<Vec<u8>> {
-    std::fs::read(dist("initialized.wasm")).ok()
+    std::fs::read(dist("nebula_js.wasm")).ok()
 }
 
 fn skip(what: &str) {
@@ -64,9 +61,9 @@ fn run(runtime: &Runtime, wasm: &[u8], source: &str) -> HostCtx {
         Ok(ctx) => ctx,
         Err(err) if err.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt) => {
             panic!(
-                "the interpreter hit the {}ms epoch deadline evaluating `{source}`. On a \
-                 wizened artifact that is a real regression — the realm should already \
-                 exist — so check that `bash guests/build.sh` ran Wizer.",
+                "the interpreter hit the {}ms epoch deadline evaluating `{source}`. \
+                 Building the realm plus instantiating a 7 MiB module is ~4 ms, so \
+                 this is a loaded machine or a real regression, not a tight budget.",
                 nebula_runtime::engine::DEFAULT_DEADLINE_TICKS
             )
         }
@@ -205,93 +202,33 @@ fn the_interpreter_is_bounded_by_the_same_ceilings_as_any_other_guest() {
 // Wizer is what makes it viable
 // ---------------------------------------------------------------------------
 
-/// The snapshot took, and the honest cost breakdown that goes with it.
+/// The interpreter must not export the WASI reactor initializer.
 ///
-/// The mechanism is asserted; the *size* of the win is only reported. That
-/// split is deliberate — see the timings this prints. Building a JS realm turns
-/// out to be roughly half a millisecond in Boa, while instantiating a 7 MiB
-/// module is roughly four. So Wizer is a real but modest win here, and
-/// asserting a large multiple would be asserting a number the machine does not
-/// produce. §22.1 records the measurement rather than the hope.
+/// This is a build-breaking invariant, not a preference. `PUT /functions/{id}`
+/// runs Wizer on anything exporting `_initialize` (§11.1), and Wizer has to
+/// instantiate the module to run it — which it cannot do, because
+/// `nebula.http_get` is not a WASI import. Re-adding the export would turn
+/// every deploy of this guest into a `400`, and the only clue would be a Wizer
+/// error about an unsatisfiable import.
 #[test]
-fn the_realm_arrives_snapshotted_rather_than_rebuilt() {
-    let (Ok(raw), Ok(wizened)) = (
-        std::fs::read(dist("nebula_js.wasm")),
-        std::fs::read(dist("initialized.wasm")),
-    ) else {
-        return skip("wizer measurement");
+fn the_interpreter_does_not_ask_to_be_wizened() {
+    let Some(wasm) = interpreter() else {
+        return skip("wizer opt-out");
     };
-
-    let runtime = Runtime::new(common::temp_dir("js-wizer")).expect("runtime");
-
-    let raw_module = runtime
+    let runtime = Runtime::new(common::temp_dir("js-nowizen")).expect("runtime");
+    let module = runtime
         .cache()
-        .get_or_compile(runtime.engine(), runtime.linker(), &raw)
-        .expect("compile raw");
-    let wizened_module = runtime
-        .cache()
-        .get_or_compile(runtime.engine(), runtime.linker(), &wizened)
-        .expect("compile wizened");
-    assert!(raw_module.module.get_export(INIT_EXPORT).is_some());
+        .get_or_compile(runtime.engine(), runtime.linker(), &wasm)
+        .expect("compile");
+
     assert!(
-        wizened_module.module.get_export(INIT_EXPORT).is_none(),
-        "wizer must consume and drop {INIT_EXPORT}"
-    );
-
-    // The discriminating assertion, and the reason `realm_probe` exists. `run`
-    // rebuilds the realm when it finds an empty slot, so a snapshot that never
-    // took would still produce correct answers — just slower — and every test
-    // above would pass while the feature was broken. The wizened artifact has
-    // no `_initialize` for the host to call, so `warm` has exactly one possible
-    // cause.
-    let probe = String::from_utf8(
-        runtime
-            .execute(&wizened, "realm_probe", "js", Vec::new())
-            .expect("probe runs")
-            .stdout(),
-    )
-    .expect("utf-8");
-    assert_eq!(
-        probe.trim(),
-        "warm",
-        "the wizened artifact built its realm at request time, so the Wizer \
-         snapshot did not take"
-    );
-
-    // Same answer from both, or "faster" would only mean "did less".
-    const PROGRAM: &str = "JSON.stringify([1,2,3].map(n => n * Math.PI))";
-    let raw_answer = eval(&runtime, &raw, PROGRAM);
-    let wizened_answer = eval(&runtime, &wizened, PROGRAM);
-    assert_eq!(
-        raw_answer, wizened_answer,
-        "the snapshotted realm must behave identically to a freshly built one"
+        module.module.get_export(INIT_EXPORT).is_none(),
+        "the interpreter exports {INIT_EXPORT}, so the deploy pipeline will try \
+         to wizen it and fail on the `nebula.http_get` import"
     );
     assert!(
-        raw_answer.starts_with('['),
-        "expected a JSON array, got: {raw_answer}"
-    );
-
-    let raw_time = median(&runtime, &raw, PROGRAM);
-    let wizened_time = median(&runtime, &wizened, PROGRAM);
-    let deadline =
-        nebula_runtime::engine::EPOCH_TICK * nebula_runtime::engine::DEFAULT_DEADLINE_TICKS as u32;
-
-    eprintln!(
-        "js interpreter ({} MiB artifact): raw {raw_time:?}, wizened {wizened_time:?}",
-        wizened.len() >> 20
-    );
-    eprintln!(
-        "share of the {deadline:?} request budget: raw {:.0}%, wizened {:.0}%",
-        100.0 * raw_time.as_secs_f64() / deadline.as_secs_f64(),
-        100.0 * wizened_time.as_secs_f64() / deadline.as_secs_f64()
-    );
-
-    // The claim that actually matters for a tool: it serves well inside the
-    // default deadline. Stable by roughly 6x, unlike a ratio between two
-    // numbers that differ by 10%.
-    assert!(
-        wizened_time < MAX_EXECUTION,
-        "the interpreter must serve inside the request budget: {wizened_time:?}"
+        std::fs::read(dist("initialized.wasm")).is_err(),
+        "a stale wizened artifact is still on disk; re-run `bash guests/build.sh`"
     );
 }
 
@@ -348,17 +285,70 @@ fn median_of(mut once: impl FnMut()) -> Duration {
     timings[SAMPLES / 2]
 }
 
-fn median(runtime: &Runtime, wasm: &[u8], source: &str) -> Duration {
-    // Warm the compile cache so the timings measure execution, not Cranelift.
-    let _ = eval(runtime, wasm, source);
+// ---------------------------------------------------------------------------
+// Egress (§22.8)
+// ---------------------------------------------------------------------------
 
-    let mut timings: Vec<Duration> = (0..SAMPLES)
-        .map(|_| {
-            let start = Instant::now();
-            run(runtime, wasm, source);
-            start.elapsed()
-        })
-        .collect();
-    timings.sort();
-    timings[SAMPLES / 2]
+#[test]
+fn a_script_cannot_reach_the_network_by_default() {
+    let Some(wasm) = interpreter() else {
+        return skip("egress default");
+    };
+    // No `with_egress`, so the policy is empty. This is the default a fresh
+    // deployment runs with, and it is the only thing between an agent-authored
+    // script and the rest of the network.
+    let runtime = Runtime::new(common::temp_dir("js-egress-off")).expect("runtime");
+
+    let answer = eval(
+        &runtime,
+        &wasm,
+        "try { httpGet('http://example.com/'); 'reached' } catch (e) { 'blocked' }",
+    );
+    assert_eq!(answer, "blocked");
+}
+
+#[test]
+fn a_refusal_is_catchable_javascript_rather_than_a_dead_script() {
+    let Some(wasm) = interpreter() else {
+        return skip("egress refusal");
+    };
+    let runtime = Runtime::new(common::temp_dir("js-egress-refuse"))
+        .expect("runtime")
+        .with_egress(Policy::new(["api.example.com"]));
+
+    // A refusal has to be an exception a script can catch, not a trap and not
+    // an empty string. An empty string would be indistinguishable from a page
+    // that really was empty, and a trap would kill a script for asking a
+    // question it was allowed to ask and told no (§7.2).
+    let answer = eval(
+        &runtime,
+        &wasm,
+        "try { httpGet('http://blocked.test/'); 'reached' } catch (e) { 'caught: ' + e.message }",
+    );
+    assert!(answer.starts_with("caught: "), "{answer}");
+    assert!(answer.contains("blocked.test"), "{answer}");
+}
+
+#[test]
+fn an_allowed_host_comes_back_to_the_script_whole() {
+    let Some(wasm) = interpreter() else {
+        return skip("egress fetch");
+    };
+    let port = common::one_shot_server(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nhello, agent!",
+    );
+
+    // Loopback needs the escape hatch; the address check has its own tests.
+    let runtime = Runtime::new(common::temp_dir("js-egress-on"))
+        .expect("runtime")
+        .with_egress(Policy::new(["127.0.0.1"]).allow_private_addresses());
+
+    // The whole point of the feature, from the layer an agent actually writes
+    // at: source in, network out, text back.
+    let answer = eval(
+        &runtime,
+        &wasm,
+        &format!("httpGet('http://127.0.0.1:{port}/').split('\\r\\n\\r\\n')[1]"),
+    );
+    assert_eq!(answer, "hello, agent!");
 }
