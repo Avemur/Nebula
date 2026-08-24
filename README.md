@@ -1,4 +1,4 @@
-# Nebula — Design Document
+# Nebula: Design Document
 
 **Project:** Distributed WebAssembly Serverless Runtime
 **Author:** Anirudh Vemuri
@@ -133,11 +133,11 @@ flowchart TB
     MEM --> SCH
 ```
 
-**Control Plane** — stateless with respect to execution; holds cluster
+**Control Plane**: stateless with respect to execution; holds cluster
 membership and the module registry. Horizontally replicable later, single
 instance in v1.
 
-**Worker Node** — owns a wasmtime `Engine`, a module cache, and a bounded
+**Worker Node**: owns a wasmtime `Engine`, a module cache, and a bounded
 execution pool. Workers are interchangeable; the ring decides which one gets a
 given function, and any worker can serve any function after a cold start.
 
@@ -150,7 +150,7 @@ talks to another worker.
 
 Three paths, distinguished by what the worker already has in memory.
 
-### 4.1 Cold start — worker has never seen this module
+### 4.1 Cold start: worker has never seen this module
 
 1. **Ingress.** Gateway receives `POST /execute/{function_id}`, validates the
    bearer token and body size cap, assigns a request ID.
@@ -169,7 +169,7 @@ Three paths, distinguished by what the worker already has in memory.
    the LRU cache alongside a pre-resolved `InstancePre`.
 7. **Execute.** Falls into the hot path below.
 
-**Design note — why the worker pulls through the control plane rather than
+**Design note: why the worker pulls through the control plane rather than
 from object storage.** In v1 the registry *is* local disk on the control plane
 node, so there is nowhere else to pull from. This does put the control plane
 on the data path for cold starts. It is acceptable because cold starts are
@@ -177,7 +177,7 @@ rare by construction (the ring pins functions to nodes) and the transfer is
 one-shot per module per worker. When the registry moves to S3, workers pull
 directly and the control plane leaves the data path entirely.
 
-### 4.2 Hot start — module compiled and cached
+### 4.2 Hot start: module compiled and cached
 
 1. Ingress and scheduling as above; the ring routes to the same worker.
 2. **Cache hit.** LRU lookup by content hash returns the `InstancePre<HostCtx>`.
@@ -190,7 +190,7 @@ directly and the control plane leaves the data path entirely.
 5. **Execute.** The call runs on the blocking execution pool (§5.2) under an
    epoch deadline. Result is copied out of guest memory.
 6. **Teardown.** `Store` is dropped, the instance slot returns to the pool, and
-   the CoW mapping is discarded — dirtied pages are dropped, not scrubbed, so
+   the CoW mapping is discarded. Dirtied pages are dropped, not scrubbed, so
    no cross-request state can survive.
 
 **Every request gets a fresh `Store` and a fresh instance.** The cached object
@@ -198,7 +198,7 @@ is the compiled `Module`/`InstancePre`, which is immutable and `Send + Sync`.
 Instances are never reused across requests in v1; this is what makes tenant
 isolation trivially correct.
 
-### 4.3 Pre-initialized start — heavy guest runtimes
+### 4.3 Pre-initialized start: heavy guest runtimes
 
 Compiling is fast; *booting* is not. A guest embedding a language runtime or a
 framework may spend tens of milliseconds in `_initialize` allocating its heap
@@ -226,7 +226,7 @@ handler*. A raw module still exports it and pays the boot on every request; a
 wizened module does not export it and there is nothing to call. One code path,
 and the export's absence is the entire signal.
 
-**Measured** (`crates/nebula-runtime/tests/wizer_bench.rs`, `heavy_init` guest —
+**Measured** (`crates/nebula-runtime/tests/wizer_bench.rs`, `heavy_init` guest,
 a 200k sieve kept on the heap plus a hash chain, ~22 ms of boot):
 
 | | Median execution | Share of the 50 ms deadline |
@@ -235,7 +235,7 @@ a 200k sieve kept on the heap plus a hash chain, ~22 ms of boot):
 | Wizened | 0.25 ms | 0.5% |
 | | **~80× faster** | |
 
-Both emit an identical result, which the test asserts — a module that skipped
+Both emit an identical result, which the test asserts. A module that skipped
 the work would otherwise look like a win. The share-of-budget column is the
 operationally interesting half: the raw guest burns two fifths of its request
 budget before the handler starts, and roughly 2.4× this boot cost would exceed
@@ -243,8 +243,8 @@ the deadline outright and fail the request.
 
 > **Superseded:** the original spec proposed freezing and `mmap`-ing linear
 > memory snapshots inside the worker. That is a reimplementation of
-> `memory_init_cow`, and the hard part — capturing post-`_initialize` state as
-> something a fresh instance can start from — is exactly what Wizer does. Cut.
+> `memory_init_cow`, and the hard part. Capturing post-`_initialize` state as
+> something a fresh instance can start from, is exactly what Wizer does. Cut.
 
 ---
 
@@ -279,7 +279,7 @@ right (§6.4).
 
 > **API versions.** Names above track the wasmtime 2x series. Pin one exact
 > version in `Cargo.toml` at the start of Phase 1 and verify each call against
-> that version's docs — this API surface moves between releases (`add_fuel` →
+> that version's docs. This API surface moves between releases (`add_fuel` →
 > `set_fuel`, WASI p1 → p2 bindings). Do not upgrade mid-phase.
 
 ### 5.2 Execution is blocking work, not async work
@@ -321,7 +321,7 @@ options:
 
 1. **Block inside the host function** on a channel round-trip to the async
    runtime. Simple, correct, and the executing thread is a pool thread that is
-   *supposed* to block — it costs nothing that matters.
+   *supposed* to block. It costs nothing that matters.
 2. **`Config::async_support(true)`** with `call_async`, which requires guest
    execution on the async runtime and reintroduces §5.2's problem.
 
@@ -345,7 +345,7 @@ interval. Each `Store` is given a deadline in ticks via
 back-edges and function entries; exceeding the deadline raises a trap that
 unwinds the guest without touching the host.
 
-- **Tick interval:** 1 ms. This is also the deadline granularity — a 50 ms
+- **Tick interval:** 1 ms. This is also the deadline granularity. A 50 ms
   budget is enforced to within ±1 ms.
 - **Overhead:** a relaxed atomic load and compare on back-edges. Negligible.
 - **Not deterministic:** the same input can consume different wall-clock time
@@ -357,15 +357,15 @@ unwinds the guest without touching the host.
 against a budget, trapping deterministically at zero. Identical input always
 traps at the identical instruction.
 
-Fuel costs 1.3–2× throughput on compute-bound code, because metering is
+Fuel costs 1.3-2× throughput on compute-bound code, because metering is
 instrumented into the compiled output. That is too expensive to impose on every
 tenant for a guarantee most do not need.
 
 **Decision: epochs are the default; fuel is a per-function opt-in** for
 workloads that need reproducibility (replay, deterministic simulation,
 instruction-count billing, and the stateful actors of §21 if they land).
-Enabling fuel requires a separate `Engine` — `consume_fuel` is engine-level
-config baked into compiled code — so the worker holds two engines and routes by
+Enabling fuel requires a separate `Engine`, `consume_fuel` is engine-level
+config baked into compiled code, so the worker holds two engines and routes by
 function metadata.
 
 > **Superseded:** the original spec made fuel the sole CPU mechanism. Fuel
@@ -404,7 +404,7 @@ policy, and is what per-function registry overrides will vary. Setting them equa
 has a specific failure mode: the pool silently enforces the same number, so
 dropping the per-store limiter changes nothing observable and no test catches it.
 Keeping the slot strictly above the default ceiling makes the limiter the binding
-constraint and the pool the backstop — see
+constraint and the pool the backstop. See
 `store_limiter_refuses_growth_the_pooling_slot_would_allow`, which fails if the
 limiter is ever removed.
 
@@ -476,7 +476,7 @@ Registered on the `Linker` under the `nebula` module namespace:
 The interpreter guest wraps the last three as `session.get`, `session.set`, and
 `httpGet` (§22.1).
 
-The KV shim is **node-local and non-durable** — a `DashMap` keyed by
+The KV shim is **node-local and non-durable**: a `DashMap` keyed by
 `(tenant, session, key)` *tuples*, not by a concatenated prefix, and bounded per
 §6.4. The tuple matters: a delimiter scheme needs an argument about escaping
 before you can believe one tenant cannot spell its way into another's namespace,
@@ -485,11 +485,11 @@ and a tuple needs none.
 A guest may only assume a write is visible on the next request when the caller
 sends the same `X-Nebula-Partition-Key` (§22.5), which is what routes both
 requests to the same worker. Without one, the session is `""` and the old rule
-stands: do not assume. Entries expire after 10 minutes, refreshed on write —
+stands: do not assume. Entries expire after 10 minutes, refreshed on write,
 caps without an expiry are caps that become permanent.
 
 The response body is what the guest wrote through `response_write`, or its
-captured **stdout** when it wrote nothing there — the same reason stdin carries
+captured **stdout** when it wrote nothing there. The same reason stdin carries
 the request. It is a fallback rather than a merge because two channels landing
 in one body would interleave by flush order, which is not a contract a caller
 can use. stdout is capped at 64 KiB, so that is the ceiling on a stdout-answered
@@ -497,7 +497,7 @@ response.
 
 Integer returns across the `nebula` namespace follow one convention: a
 non-negative count on success, `-1` on refusal. A refusal (store full, item
-oversized) is a recoverable condition the guest can handle — the precedent is
+oversized) is a recoverable condition the guest can handle. The precedent is
 WebAssembly's own `memory.grow` returning `-1`. Traps are reserved for a guest
 that hands the host an invalid pointer, which is not recoverable. Silent
 truncation is used only where the guest can detect it: `kv_get` returns the
@@ -527,7 +527,7 @@ fn guest_slice<'a>(caller: &'a mut Caller<'_, HostCtx>, ptr: u32, len: u32)
 
 **One function. Every host call routes through it. No exceptions.** Checked
 arithmetic on the bound, a slice index that cannot reach outside the memory,
-and a trap on any failure. Borrows are never held across a guest re-entry —
+and a trap on any failure. Borrows are never held across a guest re-entry,
 `memory.grow` may reallocate the backing store and invalidate them.
 
 This is a trust boundary and is not subject to simplification. It gets direct
@@ -550,14 +550,14 @@ protocol, no staleness window, no cache-busting RPC.
 
 | Tier | Contents | Scope | Populated by |
 |---|---|---|---|
-| L1 — memory | `Module` + `InstancePre<HostCtx>` | Per worker process | Compile or AOT load |
-| L2 — disk | `Module::serialize()` bytes | Per worker node, survives restart | First compile |
-| L3 — registry | Original `.wasm` artifact | Cluster | Deploy |
+| L1, memory | `Module` + `InstancePre<HostCtx>` | Per worker process | Compile or AOT load |
+| L2, disk | `Module::serialize()` bytes | Per worker node, survives restart | First compile |
+| L3, registry | Original `.wasm` artifact | Cluster | Deploy |
 
 A cold start walks L1 → L2 → L3, populating on the way back down. A worker
 restart replays from L2 and skips Cranelift entirely.
 
-`Module::deserialize` is `unsafe` — it maps precompiled machine code and trusts
+`Module::deserialize` is `unsafe`. It maps precompiled machine code and trusts
 its provenance. The L2 cache is keyed by
 `sha256(artifact) + wasmtime_version + engine_config_hash + target_triple`, and
 a mismatch on any component is a miss, not a load. Nothing outside the worker
@@ -601,7 +601,7 @@ configured budget (default 1 GiB).
 
 Concurrent cold starts for the same hash must not compile the same module N
 times. A per-hash in-flight map lets the first request compile while the rest
-await a broadcast — the standard single-flight pattern, roughly twenty lines.
+await a broadcast. The standard single-flight pattern, roughly twenty lines.
 
 `InstancePre` is built once at insert. It resolves and type-checks every import
 ahead of time, so per-request instantiation skips the entire linking step. This
@@ -631,12 +631,12 @@ maintenance, no binary search to write.
 
 **Virtual nodes (V = 160 per physical node) are mandatory, not an
 optimization.** With one point per node, a 4-node cluster produces arc lengths
-that differ by 3–4×, and one worker takes the majority of traffic. The original
+that differ by 3-4×, and one worker takes the majority of traffic. The original
 spec's "hash the `function_id` to a node" is only balanced with virtual nodes
 present.
 
 **What V = 160 actually buys, measured.** Consistent hashing's load imbalance
-falls off as roughly `1/√V`, so V = 160 gives about 8% — not "a few percent",
+falls off as roughly `1/√V`, so V = 160 gives about 8%, not "a few percent",
 as an earlier draft of this document claimed. Over 200 key sets of 10 000 keys
 on a 3-worker ring:
 
@@ -652,7 +652,7 @@ median, so a genuine regression is distinguishable from an unlucky draw.
 
 Raising V is the lever if a hard worst-case bound is ever needed: the error
 shrinks as `1/√V`, so a 10% worst case wants V ≈ 640. That is a deliberate
-trade — 640 points per node makes ring rebuilds and memory four times heavier —
+trade, 640 points per node makes ring rebuilds and memory four times heavier,
 and §9.2's bounded-load check is the cheaper answer to the same problem, since
 it corrects hotspots at request time rather than trying to eliminate them
 structurally.
@@ -660,14 +660,14 @@ structurally.
 **Hashing.** The ring uses stdlib `DefaultHasher`. That is sound only while the
 control plane is a single process (§2): the ring is rebuilt in memory from live
 membership, never persisted and never compared across processes, so the hash
-only has to be stable within one run — and `DefaultHasher` is explicitly not
+only has to be stable within one run, and `DefaultHasher` is explicitly not
 stable across Rust releases. Replacing it with a fixed hash (§16 names xxhash)
 is a prerequisite for replicating the control plane, not an optimization;
 without it two instances on different toolchains would disagree about routing
 and silently split the keyspace.
 
 **Failover:** if the owning node is unhealthy, walk the ring to the next
-*distinct* physical node. This is deliberately not replication — the second
+*distinct* physical node. This is deliberately not replication. The second
 node cold-starts. Correct, slower, and one line. Pre-warming replicas is
 deferred (§21).
 
@@ -699,7 +699,7 @@ missed beats) as unhealthy, removing its virtual nodes from the ring.
 
 > **Superseded:** the original spec called for bidirectional gRPC streaming. A
 > unary beat plus a timestamp is strictly simpler and detects *more* failure
-> modes — a stream stays open through a wedged process or a stop-the-world
+> modes. A stream stays open through a wedged process or a stop-the-world
 > pause, and reconnect logic is a whole state machine to get wrong. A stale
 > timestamp catches process death, network partition, and livelock identically.
 
@@ -739,7 +739,7 @@ control is a **concurrency limit, not a latency threshold**:
   retry-storm.
 
 A p99-latency trigger measures the symptom after the queue has already filled;
-the semaphore prevents the queue from filling. It is also fewer moving parts —
+the semaphore prevents the queue from filling. It is also fewer moving parts,
 no histogram, no windowing, no controller to tune.
 
 > `ponytail:` static concurrency limit. If measurement shows the right limit
@@ -782,20 +782,20 @@ The value is clamped to `[10, 5000]` and the *effective* budget is echoed on the
 response, so a caller that asked for 60 s learns it got 5 s rather than reading
 the resulting `timeout` fault as a bug in its own code. A malformed header is a
 `400` with `X-Nebula-Fault: invalid_deadline`, not a silent fall back to the
-default — defaulting would hand a client that asked for seconds a 50 ms budget
+default. Defaulting would hand a client that asked for seconds a 50 ms budget
 and then a timeout it cannot diagnose. The worker clamps independently
 (`MAX_DEADLINE_MS`): a gateway is not a trust boundary the worker relies on.
 
-**`X-Nebula-Fault` is on every non-200 response.** Status codes collide — `503`
+**`X-Nebula-Fault` is on every non-200 response.** Status codes collide, `503`
 is both "no worker in the ring" and "worker shed", `500` is both a guest trap
-and a memory ceiling — so a client branching on status alone cannot tell them
+and a memory ceiling, so a client branching on status alone cannot tell them
 apart. The header names the cause:
 
 | Fault | Status | Meaning |
 |---|---|---|
 | `trap` | 500 | Guest trapped; detail in the body |
 | `memory_limit` | 500 | Guest hit its linear-memory ceiling (§6.3) |
-| `timeout` / `fuel_exhausted` | 504 | Guest exceeded its budget (§6.1–6.2) |
+| `timeout` / `fuel_exhausted` | 504 | Guest exceeded its budget (§6.1-6.2) |
 | `internal` | 500 | Host-side failure; detail withheld (§12) |
 | `unknown_function` | 404 | Nothing deployed under that id |
 | `module_not_found` | 404 | Deployed, but the artifact is missing from the registry |
@@ -808,7 +808,7 @@ apart. The header names the cause:
 | `cluster_at_capacity` / `worker_shed` | 503 | Admission control refused (§10.3) |
 | `worker_unreachable` | 502 | Sent, then the connection failed; may or may not have run (§10.2) |
 
-Every `503` and `429` carries `Retry-After`. `502` deliberately does not —
+Every `503` and `429` carries `Retry-After`. `502` deliberately does not,
 §10.2 forbids retrying a request that may already have executed, and inviting a
 retry would undo that. An `Idempotency-Key` does **not** change this: the gateway never
 received an answer to replay, so the retry is exactly as unsafe as before
@@ -856,7 +856,7 @@ Three reasons the compiler stays on the data plane:
    attack surface in the system. A compiler bug on a worker costs one
    replaceable node; the same bug on the control plane costs cluster routing,
    membership, and the registry at once.
-2. **Compilation is CPU-bound work, and §5.2 already solved that** — on the
+2. **Compilation is CPU-bound work, and §5.2 already solved that**: on the
    worker, behind a bounded pool and an admission semaphore. Doing it on the
    control plane would put unbounded CPU work on the reactor that also serves
    heartbeats, which is the exact failure §5.2 exists to prevent.
@@ -868,14 +868,14 @@ Three reasons the compiler stays on the data plane:
 The cost of this choice is honest and worth stating: **a malformed artifact
 deploys `201` and fails on the first worker that tries it**, surfacing as
 `INTERNAL` (§12) rather than as a `400`. If that trade stops being acceptable,
-the fix is not to move the compiler — it is to have a *worker* validate on
+the fix is not to move the compiler. It is to have a *worker* validate on
 deploy and report back, keeping the engine on the data plane where it belongs.
 
 **One caveat, because the principle is "no untrusted execution on the control
 plane" and Wizer bends it.** Wizer instantiates the guest and runs its
 `_initialize`, so a tenant's code does execute on the control-plane host. It is
-meaningfully contained — a separate process, `--allow-wasi` with no preopened
-directories, and a crash takes the subprocess rather than the control plane —
+meaningfully contained. A separate process, `--allow-wasi` with no preopened
+directories, and a crash takes the subprocess rather than the control plane,
 but it is guest execution, not merely inspection. §13 records it as an accepted
 risk. Moving the Wizer pass onto a worker is the clean answer if that stops
 being acceptable, and it costs nothing architecturally: Wizer's output is just
@@ -883,12 +883,12 @@ bytes, and the artifact must be hashed after it either way.
 
 **Deployment persistence.** The `function_id` → content-hash table lives in
 `deployments.json` in the registry directory, written via a temporary and a
-rename before the `PUT` is acknowledged — a client told its function is
+rename before the `PUT` is acknowledged. A client told its function is
 deployed must not lose it to a restart a moment later. It is one file for the
 whole table rather than a file per function, deliberately: a `function_id`
 arrives from a URL, and the surest way not to have to defend it against path
 traversal is never to put it in a path. A corrupt or unknown-version table is
-an error that stops startup, not something to shrug off into an empty map —
+an error that stops startup, not something to shrug off into an empty map,
 silently starting empty would look like every function vanishing for no reason.
 
 ### 11.2 gRPC (internal)
@@ -948,17 +948,17 @@ reserved for things that are genuinely Nebula's fault.
 | Epoch deadline exceeded | `TIMEOUT` | 504 | |
 | Fuel exhausted | `FUEL_EXHAUSTED` | 504 | Only when opted in |
 | Memory ceiling hit | `MEMORY_LIMIT` | 500 + `X-Nebula-Fault: memory_limit` | Guest's own fault; 5xx by convention |
-| — | — | — | *The limiter records its refusal on the store (`engine::Limits`), and a failed execution after one is tagged `MemoryLimitExceeded`. Without that, a guest refused memory and then dereferencing the pointer reports `TRAP` — the symptom, not the cause.* |
+| n/a |, | n/a | *The limiter records its refusal on the store (`engine::Limits`), and a failed execution after one is tagged `MemoryLimitExceeded`. Without that, a guest refused memory and then dereferencing the pointer reports `TRAP`, the symptom, not the cause.* |
 | Unknown `function_id` | `MODULE_NOT_FOUND` | 404 | |
 | Artifact fails validation at deploy | `INVALID_ARGUMENT` | 400 | Deploy path only |
-| Artifact > 32 MiB / body > 1 MiB | — | 413 | Gateway-enforced |
-| Missing or bad bearer token | — | 401 | |
+| Artifact > 32 MiB / body > 1 MiB | n/a | 413 | Gateway-enforced |
+| Missing or bad bearer token | n/a | 401 | |
 | Worker sheds | `RESOURCE_EXHAUSTED` | 503 + `Retry-After` | After one ring retry |
 | No healthy worker in ring | `UNAVAILABLE` | 503 | |
 | Worker died mid-request | `UNAVAILABLE` | 502 | Never retried |
 | Host-side bug | `INTERNAL` | 500 | Alerts; should be zero |
 
-Guest fault detail is returned to the caller — it is their code. Host internal
+Guest fault detail is returned to the caller. It is their code. Host internal
 error detail is **not**; it logs with the request ID and the client gets an
 opaque 500.
 
@@ -991,20 +991,20 @@ another tenant's data, or escape to the host.
 **Authentication is HMAC-signed bearer tokens.** A token is `tenant.signature`,
 where the signature is a SHA-256 HMAC over the tenant id under a secret only the
 control plane holds. That makes the tenant a *fact* rather than a claim, which
-matters because everything §22 isolates is keyed on it — the session scratchpad
+matters because everything §22 isolates is keyed on it. The session scratchpad
 (§22.5), the replay store (§22.4), the egress allowlist (§22.8), the rate
 buckets (§22.7). Verification is constant-time (`ring::hmac::verify`); comparing
 hex with `==` would leak a signature one byte at a time to anyone willing to
 measure.
 
-There is no expiry and no revocation list. A token says one thing — "this is
-tenant X" — and rotating `NEBULA_AUTH_SECRET` invalidates every token at once,
+There is no expiry and no revocation list. A token says one thing. "This is
+tenant X", and rotating `NEBULA_AUTH_SECRET` invalidates every token at once,
 which is the whole revocation story until something needs finer. Mint with
 `nebula-control mint <tenant>`.
 
 **Verification is off unless `NEBULA_AUTH_SECRET` is set**, and the control
-plane says so at startup in as many words. The alternative — refusing every
-request until a secret exists — means `cargo run` does not work, and the
+plane says so at startup in as many words. The alternative. Refusing every
+request until a secret exists. Means `cargo run` does not work, and the
 predictable response to that is a secret of `x` that everybody then believes is
 security. An operator who knows they have no authentication is better off than
 one who believes they have some.
@@ -1020,8 +1020,8 @@ a decision about that host rather than about this code.
 
 - **Timing side channels (Spectre class).** Wasmtime mitigates some variants
   (heap access masking, indirect-call guards) but co-tenancy on shared hardware
-  is not side-channel-free. Mitigation is deployment-level — separate hardware
-  for hostile-adjacent tenants — not runtime-level. Explicitly out of scope
+  is not side-channel-free. Mitigation is deployment-level. Separate hardware
+  for hostile-adjacent tenants, not runtime-level. Explicitly out of scope
   (§2).
 - **Wall-clock timing observation.** Guests can read a clock and observe
   neighbours. Not addressed in v1; coarsening the clock is the known lever if it
@@ -1033,14 +1033,14 @@ a decision about that host rather than about this code.
   compiler and the runtime are kept off the control plane deliberately, and this
   is the one exception. It is contained by a process boundary and a WASI context
   with no preopened directories, so a hostile initializer costs a failed deploy
-  rather than the control plane — but it is execution, not inspection, and it is
+  rather than the control plane, but it is execution, not inspection, and it is
   reachable by anyone who can `PUT` a function. Moving the Wizer pass onto a
   worker removes the exception entirely and is the answer if deploy is ever
   exposed to callers less trusted than today's.
 - **Authentication is an HMAC-signed bearer token**: `tenant.signature`, where
   the signature is a SHA-256 HMAC over the tenant id under a secret only the
   control plane holds, verified in constant time. No expiry and no revocation
-  list — rotating `NEBULA_AUTH_SECRET` invalidates everything at once. **Off
+  list. Rotating `NEBULA_AUTH_SECRET` invalidates everything at once. **Off
   unless that variable is set**, and the control plane says so loudly at
   startup; see §13.
 - **Internal gRPC is unauthenticated plaintext** on a trusted network. mTLS is a
@@ -1077,7 +1077,7 @@ grpc_execute         { function_id, tenant, cold, outcome }       [worker]
 
 `tracing-subscriber` with `FmtSpan::CLOSE` is the whole configuration: it prints
 each span's duration as it closes, which is what turns the tree into a latency
-breakdown rather than a log. No collector — `tracing` alone answers "where did
+breakdown rather than a log. No collector, `tracing` alone answers "where did
 the time go", and a collector is infrastructure to run, not a question to
 answer. `NEBULA_LOG` sets the filter; it defaults to `off` under test so a
 normal `cargo test` stays quiet.
@@ -1094,14 +1094,14 @@ grpc_execute:wasm_execute{deadline_ms=50 bytes=482}:                            
 grpc_execute{cold=false outcome=Ok}:                                              close time.busy=178µs
 ```
 
-Cold is 2.95 ms, of which Cranelift is 2.53 ms — compilation dominates, and the
+Cold is 2.95 ms, of which Cranelift is 2.53 ms. Compilation dominates, and the
 fetch is noise beside it. Warm is **78 µs of guest inside 178 µs of worker**,
 the rest being instantiation and the gRPC frame.
 
 Two deliberate shapes here. `route_to_worker` is one span *per attempt*, so a
 §10.2 retry shows as a second span instead of hiding inside the first. And
 `compile_l1` nests *inside* `wasm_execute` rather than beside it, because
-compilation is lazy — it happens during the execute call, not before it. That
+compilation is lazy. It happens during the execute call, not before it. That
 nesting is what lets you read actual execution as the difference: 2.76 − 2.53 ≈
 0.23 ms on the cold path.
 
@@ -1141,12 +1141,12 @@ against the sandbox in CI **from Phase 1 onward**. Each asserts a specific
 | Guest | Expected |
 |---|---|
 | `infinite_loop.wat` | `TIMEOUT` |
-| `tight_alloc.wat` — grow until refused | `MEMORY_LIMIT` or graceful `-1` handling |
+| `tight_alloc.wat`, grow until refused | `MEMORY_LIMIT` or graceful `-1` handling |
 | `deep_recursion.wat` | `TRAP` (stack exhausted), host stack intact |
 | `oob_read.wat` / `oob_write.wat` | `TRAP` |
-| `ptr_overflow.wat` — host call with `ptr + len` overflowing `u32` | `TRAP`, no host read |
-| `huge_response.wat` — write past the response cap | `TRAP` or truncation, capped |
-| `grow_then_write.wat` — `memory.grow` inside a host call sequence | No stale host borrow |
+| `ptr_overflow.wat`, host call with `ptr + len` overflowing `u32` | `TRAP`, no host read |
+| `huge_response.wat`, write past the response cap | `TRAP` or truncation, capped |
+| `grow_then_write.wat`, `memory.grow` inside a host call sequence | No stale host borrow |
 | `kv_flood.wat` | Bounded at the KV cap |
 | `unreachable.wat` | `TRAP` |
 | `fuel_burn.wat` (fuel engine) | `FUEL_EXHAUSTED` at a deterministic count |
@@ -1162,17 +1162,17 @@ carries a first pair of these; a corpus of them belongs here.
 
 ### Other layers
 
-- **Unit** — ring distribution (chi-square across 10⁶ keys), ring failover and
+- **Unit**: ring distribution (chi-square across 10⁶ keys), ring failover and
   wraparound, byte-bounded LRU eviction, single-flight compile, §7.3 bounds
   cases, error mapping table.
-- **Integration** — one control plane + N workers in-process over real gRPC on
+- **Integration**: one control plane + N workers in-process over real gRPC on
   ephemeral ports. Cold-then-hot, deploy-new-version, kill-a-worker,
   restart-a-worker, drain.
-- **Chaos** — `kill -9` a worker mid-request; assert 502 and no retry. Pause a
+- **Chaos**: `kill -9` a worker mid-request; assert 502 and no retry. Pause a
   worker with `SIGSTOP`; assert heartbeat timeout and ring removal. Partition
   the control plane; assert workers keep serving in-flight work.
-- **Load** — §19.
-- **Fuzz** — `cargo-fuzz` on the host-function argument surface. The guest side
+- **Load**: §19.
+- **Fuzz**: `cargo-fuzz` on the host-function argument surface. The guest side
   is attacker-controlled by definition, so it is the natural fuzz target.
 
 CI runs unit + adversarial corpus + integration on every commit. Load and chaos
@@ -1185,7 +1185,7 @@ run at phase boundaries.
 | Concern | Choice | Rationale |
 |---|---|---|
 | Language | Rust | Memory safety at the host boundary is the whole premise |
-| WASM engine | `wasmtime` (pinned exact version) | Pooling allocator, CoW images, epochs, fuel, AOT — all upstream |
+| WASM engine | `wasmtime` (pinned exact version) | Pooling allocator, CoW images, epochs, fuel, AOT, all upstream |
 | Async runtime | `tokio` | Everything below assumes it |
 | RPC | `tonic` + `prost` | Typed internal contracts, streaming for module transfer |
 | HTTP | `axum` | Thin layer over `hyper`, same tower middleware stack as tonic |
@@ -1198,7 +1198,7 @@ run at phase boundaries.
 | Load generation | `oha` (external) + `nebula-bench` | Off-the-shelf for throughput; a small custom bin only for the cold/hot split `oha` cannot express |
 | Serialization | `serde` + `serde_json` for registry metadata | Human-readable on disk |
 
-**Consistent hashing has no crate dependency** — `BTreeMap::range` is the
+**Consistent hashing has no crate dependency**: `BTreeMap::range` is the
 algorithm (§9.1).
 
 ---
@@ -1231,7 +1231,7 @@ nebula/
 ```
 
 The hostile corpus of §15 is inline `.wat` inside the test files rather than a
-`guests/adversarial/` directory — a two-line module is more legible next to the
+`guests/adversarial/` directory. A two-line module is more legible next to the
 assertion that explains it than in a file of its own.
 
 Guest crates are **standalone workspaces**, not workspace members: they build
@@ -1240,7 +1240,7 @@ for `wasm32-wasip1`, and a member would be built for the host on every
 
 `nebula-runtime` having no *cluster* dependency is load-bearing: the sandbox
 tests and the benchmark harness both link it directly, so G1 and G3 can be
-tested without one. It does carry `rustls` for §22.8's egress — an earlier draft
+tested without one. It does carry `rustls` for §22.8's egress. An earlier draft
 of this section said "no networking dependency", which stopped being true when
 TLS landed and is corrected rather than quietly left.
 
@@ -1251,7 +1251,7 @@ TLS landed and is corrected rather than quietly left.
 Each phase ends with something that runs and a demo you could show someone.
 Phase boundaries are commit points.
 
-### Phase 1 — Single-Node Execution Core
+### Phase 1: Single-Node Execution Core
 
 **Goal:** `curl` a WASM function on localhost, with hostile code contained.
 
@@ -1262,7 +1262,7 @@ Phase boundaries are commit points.
   stack.
 - Execution on `spawn_blocking` (upgraded in Phase 3 per §5.2).
 - Minimal `axum` gateway in `nebula-control` calling `nebula-runtime`
-  **in-process** — no gRPC yet. This is the vertical slice.
+  **in-process**: no gRPC yet. This is the vertical slice.
 - **Adversarial corpus wired into CI.** All of §15's guests, asserting exact
   outcomes.
 
@@ -1273,14 +1273,14 @@ Phase boundaries are commit points.
   survives all of them, back to back, without leaking memory across 10 000
   iterations.
 - Instantiate + trivial execute p99 measured and recorded as the Phase 1
-  baseline. G1 should already be close here — everything after this is about not
+  baseline. G1 should already be close here, everything after this is about not
   regressing it.
 
 **Not yet:** gRPC, clustering, host functions beyond request/response, caching.
 
 ---
 
-### Phase 2 — Host Interface & Module Caching
+### Phase 2: Host Interface & Module Caching
 
 **Goal:** guests do useful work; hot starts are measurably fast.
 
@@ -1311,7 +1311,7 @@ Phase boundaries are commit points.
 
 ---
 
-### Phase 3 — The Distributed Mesh
+### Phase 3: The Distributed Mesh
 
 **Goal:** a real cluster that survives node loss and overload.
 
@@ -1329,7 +1329,7 @@ Phase boundaries are commit points.
   before a `PUT` is acknowledged and reloaded on startup.
 - ✅ **Scale criteria, measured.** A worker at capacity 2 offered 10 concurrent
   100 ms guests admits exactly 2 and sheds 8, and stays in the ring through
-  2.4 s of continuous saturation — the proof that §5.2 was worth its
+  2.4 s of continuous saturation. The proof that §5.2 was worth its
   complexity, since heartbeats keep flowing while every execution thread is
   busy. Fifty distinct functions over three workers across 1 000 requests:
   **50 compiles, 950 L1 hits (95.0%)**, per-worker split 46 / 22 / 32%.
@@ -1337,14 +1337,14 @@ Phase boundaries are commit points.
   The split is wide because fifty keys is a different regime from §9.1's ten
   thousand: sampling noise is about `sqrt(50/3)/(50/3)` ≈ 24%, so the 10% bound
   does not apply at this scale and asserting it would be wrong. The stable-
-  routing claim is carried by the compile count instead — 50 compiles for 50
+  routing claim is carried by the compile count instead, 50 compiles for 50
   functions means no function was ever served by two workers, which a hit ratio
   alone would not show.
 - `FetchModule` chunked streaming with SHA-256 verification; L3 registry.
 - **Replace `spawn_blocking` with the dedicated bounded execution pool (§5.2).**
 - Admission semaphore, bounded queue, `RESOURCE_EXHAUSTED` → 503 mapping
   (§10.3).
-- Retry policy per §10.2 — connection-establishment failures only.
+- Retry policy per §10.2. Connection-establishment failures only.
 - Bearer-token auth; graceful `Drain`.
 
 **Exit criteria**
@@ -1355,13 +1355,13 @@ Phase boundaries are commit points.
 - `SIGSTOP` a worker → heartbeat timeout removes it from the ring; `SIGCONT`
   re-adds it.
 - At 5× capacity the cluster returns 503s with stable p99 on admitted requests
-  and no OOM. **This is the test that proves §5.2 was necessary** — heartbeats
+  and no OOM. **This is the test that proves §5.2 was necessary**: heartbeats
   must keep flowing while every execution thread is saturated.
 - Key distribution across 3 workers within 10% of even.
 
 ---
 
-### Phase 4 — Pre-initialization, Benchmarking, Optimization
+### Phase 4: Pre-initialization, Benchmarking, Optimization
 
 **Goal:** numbers that support the claims in §1.
 
@@ -1386,7 +1386,7 @@ Phase boundaries are commit points.
 
 **Exit criteria**
 
-- Every goal in §1 has a measured number — met, or explicitly not met with an
+- Every goal in §1 has a measured number. Met, or explicitly not met with an
   explanation.
 - A wizened heavy guest's hot-start p50 is within 2× of a trivial guest's.
 - Flamegraph shows no single non-guest frame above 15% of hot-path time.
@@ -1400,13 +1400,13 @@ measurement.** Nebula reports three separate numbers:
 
 | Measurement | Boundary | Target |
 |---|---|---|
-| **M1 — Instantiate + execute** | In-process, `nebula-runtime` only. No network, no gRPC, no HTTP. Instantiate from cached `InstancePre`, call handler, drop `Store`. | p99 < 1 ms (**G1**) |
-| **M2 — Hot end-to-end** | Client socket to client socket, over loopback, through gateway and gRPC, module cached. | p99 < 5 ms |
-| **M3 — Cold end-to-end** | Same, but the worker has never seen the module: fetch + compile + instantiate + execute. | p99 < 50 ms (**G2**) |
+| **M1: instantiate and execute** | In-process, `nebula-runtime` only. No network, no gRPC, no HTTP. Instantiate from cached `InstancePre`, call handler, drop `Store`. | p99 < 1 ms (**G1**) |
+| **M2: hot end to end** | Client socket to client socket, over loopback, through gateway and gRPC, module cached. | p99 < 5 ms |
+| **M3: cold end to end** | Same, but the worker has never seen the module: fetch + compile + instantiate + execute. | p99 < 50 ms (**G2**) |
 
 M1 is the WASM claim. M2 is the system claim. **M3 is what gets compared against
-Firecracker's 125–200 ms boot floor**, and that comparison is the honest one for
-G2 — not M1 against a microVM cold start, which measures two different things.
+Firecracker's 125-200 ms boot floor**, and that comparison is the honest one for
+G2, not M1 against a microVM cold start, which measures two different things.
 
 ### Conditions
 
@@ -1431,9 +1431,9 @@ numbers clearing the bar is marketing.
 | # | Risk | Impact | Mitigation |
 |---|---|---|---|
 | R1 | Pooling allocator address-space reservation is large (slots × max memory) | Startup failure or reduced density | 64 slots × 128 MiB = 8 GiB of *virtual* reservation, fine on 64-bit. Validate on the target box before anything depends on it. |
-| ~~R2~~ | ~~Wizer does not work on the chosen heavy guest~~ | — | **Closed in Phase 2.** `guests/examples/heavy_init` wizens cleanly and is measured at ~80×. Two constraints found in the doing: Wizer must instantiate the module to run the initializer, so *every* import has to be satisfiable at build time — the guest therefore imports only WASI and reports through stdout rather than through `nebula` host functions. And Wizer's default init export is `wizer.initialize`, so the build passes `--init-func _initialize`. |
+| ~~R2~~ | ~~Wizer does not work on the chosen heavy guest~~ | n/a | **Closed in Phase 2.** `guests/examples/heavy_init` wizens cleanly and is measured at ~80×. Two constraints found in the doing: Wizer must instantiate the module to run the initializer, so *every* import has to be satisfiable at build time, the guest therefore imports only WASI and reports through stdout rather than through `nebula` host functions. And Wizer's default init export is `wizer.initialize`, so the build passes `--init-func _initialize`. |
 | R3 | Wasmtime API drift mid-project | Rework | Pin an exact version; no upgrades inside a phase. |
-| R4 | Guest toolchain friction (Rust → `wasm32-wasip1`, TinyGo) | Time sink | The corpus is hand-written `.wat` — no toolchain in the critical path for G3/G4. |
+| R4 | Guest toolchain friction (Rust → `wasm32-wasip1`, TinyGo) | Time sink | The corpus is hand-written `.wat`, no toolchain in the critical path for G3/G4. |
 | R5 | Loopback benchmarking hides real network effects | Optimistic M2/M3 | State it. Add a two-machine run in Phase 4 if time allows. |
 | R6 | Single control plane is a SPOF | Total outage | Accepted (§2). The design keeps it off the data path for hot requests, so the blast radius is *new* routing, not in-flight work. |
 | R7 | Epoch granularity (1 ms) is coarse for a sub-ms target | Imprecise timeouts at the low end | Only matters for functions with sub-ms deadlines; the 50 ms default is 50 ticks. Note it, do not chase it. |
@@ -1442,12 +1442,12 @@ numbers clearing the bar is marketing.
 ### Open questions for review
 
 1. **Are stateful actor pins (§21) in or out?** They are the most distinctive
-   idea in the original spec and also the largest scope risk — they invert the
+   idea in the original spec and also the largest scope risk. They invert the
    "fresh instance per request" invariant that makes §13 easy to reason about.
    As written they are deferred. Overrideable.
    Agent workloads are the demand that would otherwise force them; §22.5 argues
    that demand is met by session *state* without pinning a live *instance*.
-2. ~~**Is a static bearer token enough for v1 auth**~~ — **answered.** It was
+2. ~~**Is a static bearer token enough for v1 auth**~~. **Answered.** It was
    not: everything §22 isolates is keyed on the tenant, so an unverified tenant
    made all of it conditional on everyone being honest. Tokens are now
    HMAC-signed (§13). Per-*function* keys remain unbuilt and unneeded.
@@ -1461,7 +1461,7 @@ numbers clearing the bar is marketing.
 
 ## 21. Deferred Work
 
-Not cancelled — scoped out of v1, with the reasoning recorded so the
+Not cancelled. Scoped out of v1, with the reasoning recorded so the
 decision can be revisited rather than re-derived.
 
 ### Stateful Execution Pins (Actor Model)
@@ -1478,7 +1478,7 @@ invariants the rest of the system rests on:
    key." Cross-request isolation stops being structural and starts needing an
    argument.
 2. **The LRU cache (§8.3)** currently evicts anything. Pinned instances cannot be
-   evicted while live, so it needs a second eviction policy plus an idle reaper —
+   evicted while live, so it needs a second eviction policy plus an idle reaper,
    and a hostile tenant creating unbounded keys becomes a memory-exhaustion
    vector that §6 does not currently cover.
 3. **Resource limits (§6)** are per-request budgets. A long-lived actor needs
@@ -1488,15 +1488,15 @@ invariants the rest of the system rests on:
 There is also a distributed-systems problem the original spec does not address:
 mutual exclusion holds only while ring membership is stable. During a rebalance,
 two workers can briefly both believe they own a key. Correctness requires
-ownership leases with fencing tokens — a real consensus-shaped problem, not a
+ownership leases with fencing tokens, a real consensus-shaped problem, not a
 routing tweak.
 
-**Recommendation:** ship the stateless system, prove G1–G6, then take actors as a
+**Recommendation:** ship the stateless system, prove G1-G6, then take actors as a
 follow-on with proper design. The `partition_key` field is reserved in the proto
 and the HTTP header so adding it later is additive.
 
 That reserved plumbing is the entire concession. If actors are wanted inside
-v1, they replace Phase 4 — they do not fit alongside it.
+v1, they replace Phase 4. They do not fit alongside it.
 
 ### Other deferrals
 
@@ -1508,32 +1508,32 @@ v1, they replace Phase 4 — they do not fit alongside it.
 | mTLS on internal gRPC | Before any deployment on an untrusted network |
 | Multi-instance control plane | When the SPOF matters more than the simplicity |
 | WASI preview 2 / component model | When guest toolchains emit components as reliably as p1 modules |
-| Per-tenant rate limiting at the gateway | Before multi-tenant exposure to untrusted callers — an agent in a retry loop is one. **Built**, §22.7 |
+| Per-tenant rate limiting at the gateway | Before multi-tenant exposure to untrusted callers, an agent in a retry loop is one. **Built**, §22.7 |
 
 ---
 
 ## 22. Agent Ecosystem Integration
 
-Phases 1–4 built a **sandbox**. An LLM agent needs a **tool**, and the gap
+Phases 1-4 built a **sandbox**. An LLM agent needs a **tool**, and the gap
 between those two words is this section.
 
-The gap is not sandboxing — that part is done and is the hard part. It is that
+The gap is not sandboxing. That part is done and is the hard part. It is that
 an agent cannot use what it cannot discover, cannot target a runtime whose only
 input format is a compiled `wasm32-wasip1` artifact, and cannot recover from a
 failure it cannot name. §11.1's `X-Nebula-Fault` closed the third of those. The
 rest is scoped here.
 
-The ranking is the point: items 22.1–22.3 are what "works with agents" actually
+The ranking is the point: items 22.1-22.3 are what "works with agents" actually
 means, and the rest are sharp edges agent traffic will find in a system tuned
-for web handlers. **All of it is built** — the JavaScript interpreter guest,
+for web handlers. **All of it is built**: the JavaScript interpreter guest,
 tool metadata, the MCP server, idempotency keys, session continuity, W3C trace
 context, per-tenant rate limits, and gated outbound HTTP.
 
-### 22.1 Interpreter guests — the prerequisite for everything else
+### 22.1 Interpreter guests: the prerequisite for everything else
 
 **Status: built.** `guests/interpreters/js`, tested in
 `crates/nebula-runtime/tests/interpreter_tests.rs`. The artifact is *not*
-committed — 7 MiB, rewritten on every build — so build it with
+committed, 7 MiB, rewritten on every build, so build it with
 `bash guests/build.sh`; without it those tests skip with a pointer rather than
 failing.
 
@@ -1567,14 +1567,14 @@ gain. So:
   returning the raw response and throwing on a refusal.
 
 `console.log` and friends are shimmed onto stdout, and values render through
-`JSON.stringify` with a `String` fallback — `[object Object]` tells an agent
+`JSON.stringify` with a `String` fallback, `[object Object]` tells an agent
 nothing. A script's completion value is printed when it is not `undefined`, so
 the smallest useful tool call is a bare expression.
 
 **An uncaught exception is a `200`, not a fault.** The sandbox did its job; the
 tenant's program ran and threw, and the text comes back exactly as `node -e`
 would print it, prefixed `Uncaught`. `X-Nebula-Fault` (§11.1) stays reserved for
-*Nebula* failing — a timeout, a memory ceiling, an unreachable worker — because
+*Nebula* failing. A timeout, a memory ceiling, an unreachable worker, because
 those are the ones an agent must handle differently from "my code has a bug in
 it". This is the §11.2 rule about guest faults, one level further out.
 
@@ -1596,7 +1596,7 @@ the thing that matters. Measured on the development machine:
 
 Instantiation tracks artifact size, and a 7 MiB module costs ~4 ms before it
 evaluates a single character. That is 8% of the 50 ms default deadline and
-noise against the multi-second deadline an agent tool actually uses (§11.1) —
+noise against the multi-second deadline an agent tool actually uses (§11.1),
 so it is fine, and it is also the lever. A QuickJS build is roughly an order of
 magnitude smaller, and *that* is what would make a JS tool call faster.
 `instantiation_cost_tracks_artifact_size` pins the finding so the guidance can
@@ -1604,7 +1604,7 @@ be re-checked rather than re-argued.
 
 #### Wizer: it worked, it bought nothing, and it has been removed
 
-This section previously claimed Wizer was what made interpreter guests viable —
+This section previously claimed Wizer was what made interpreter guests viable,
 that an interpreter's boot is the §4.3 cost in its purest form. **That was a
 prediction, and the measurement contradicted it.** Recorded rather than quietly
 dropped:
@@ -1614,7 +1614,7 @@ dropped:
 | Raw (`_initialize` runs per request) | ~3.9 ms |
 | Wizened (realm restored from the snapshot) | ~3.9 ms |
 
-The snapshot demonstrably took — the wizened artifact no longer exported
+The snapshot demonstrably took. The wizened artifact no longer exported
 `_initialize`, and a probe reported the realm already built, which had no other
 possible cause. It simply did not help, for two compounding reasons: Boa
 constructs a realm in well under a millisecond, and the snapshot *added*
@@ -1623,7 +1623,7 @@ saving and the penalty were the same order of magnitude.
 
 **Egress (§22.8) then made the choice for us.** Wizer must instantiate a module
 to run its initializer, so every import has to be satisfiable at build time
-(R2) — which means a wizenable guest can import nothing but WASI, and
+(R2), which means a wizenable guest can import nothing but WASI, and
 `nebula.http_get` cannot be one of its imports. Keeping the snapshot would have
 meant an interpreter that cannot reach the network in exchange for a speedup
 measured at zero.
@@ -1643,7 +1643,7 @@ size, it is not.
 #### It is still a guest
 
 The interpreter parses attacker-authored source on every request, which makes
-the guest a compiler. This does not weaken the threat model — it is inside the
+the guest a compiler. This does not weaken the threat model. It is inside the
 same linear-memory ceiling (§6.3), the same epoch deadline (§6.1), and the same
 import allowlist as anything else, and
 `the_interpreter_is_bounded_by_the_same_ceilings_as_any_other_guest` asserts
@@ -1654,9 +1654,9 @@ writes to `globalThis` writes to its own private copy and it dies with the
 instance.
 
 What it does change is §15: the adversarial corpus is hand-written `.wat`, and
-interpreter-level hostility — deep recursion, pathological regex, allocation
-storms in guest source rather than in bytecode — is a different shape of input
-that deserves its own entries.
+interpreter-level hostility is a different shape of input that deserves its own
+entries: deep recursion, pathological regex, and allocation storms written in
+guest source rather than in bytecode.
 
 #### Python is not built, and why
 
@@ -1667,7 +1667,7 @@ give the guest a read-only in-memory filesystem, and both are their own piece of
 work with their own threat-model paragraph. Recorded here so the next person
 starts from the constraint instead of discovering it.
 
-### 22.2 Tool metadata — an agent cannot call what it cannot describe
+### 22.2 Tool metadata: an agent cannot call what it cannot describe
 
 **Status: built.** The registry carries descriptors, `GET /tools` serves them,
 and §22.3 merges them into `tools/list`.
@@ -1688,7 +1688,7 @@ GET /tools
   ->  200 [ { "name": "summarise", "description": "...", "input_schema": {...} } ]
 ```
 
-The name is the `function_id` rather than a separate field — one identity is
+The name is the `function_id` rather than a separate field, one identity is
 easier to reason about than two that can disagree. The array comes back in the
 shape the Anthropic and OpenAI tool APIs already take, so wiring an agent is a
 paste rather than a translation layer.
@@ -1709,7 +1709,7 @@ already on disk**, because an unrecognised version stops startup by design
 
 **An undescribed function is deployed but not advertised.** `GET /tools` lists
 only what has a descriptor. A tool a model cannot understand is worse than one
-it cannot see — it will call the first and guess at the arguments.
+it cannot see. It will call the first and guess at the arguments.
 
 **A redeploy without a descriptor clears the old one.** A stale description of a
 function that has since changed is how a model gets told confidently wrong
@@ -1723,14 +1723,14 @@ look like success and produce a tool nobody can call.
 #### What this changed in §22.3
 
 `tools/list` now returns the interpreter *plus* every described function, with
-the interpreter first — it is what an agent reaches for by default, and a client
+the interpreter first. It is what an agent reaches for by default, and a client
 truncating a long list should keep it. `tools/call` dispatches by name:
 `run_javascript` is the one tool whose arguments the adapter understands, and
 everything else has its arguments passed through as the request body, so a newly
 deployed tool needs no change to the adapter at all.
 
 Two consequences worth stating. If the cluster is unreachable, `tools/list`
-returns the interpreter alone rather than an error — failing would leave a
+returns the interpreter alone rather than an error. Failing would leave a
 client with *no* tools, including the built-in one, which is a worse answer.
 And an unrecognised tool name goes to the cluster rather than being refused
 locally: the adapter does not cache `tools/list`, so a name it has never heard
@@ -1738,7 +1738,7 @@ of and one undeployed a second ago look identical. Asking costs one round trip;
 checking locally would cost two, and the answer names the tool back and points
 at `tools/list`.
 
-### 22.3 MCP — the actual interoperability standard
+### 22.3 MCP: the actual interoperability standard
 
 **Status: built.** `crates/nebula-mcp`, tested in `tests/mcp_tests.rs`.
 
@@ -1752,7 +1752,7 @@ $ NEBULA_GATEWAY_ADDR=127.0.0.1:8080 NEBULA_JS_FUNCTION=js cargo run -p nebula-m
 nebula-mcp: POST http://127.0.0.1:8090/mcp -> gateway 127.0.0.1:8080, interpreter `js`
 ```
 
-It is a thin adapter, not a new system — every method maps onto something
+It is a thin adapter, not a new system, every method maps onto something
 §11.1 already does:
 
 | MCP method | Nebula |
@@ -1766,7 +1766,7 @@ It is a thin adapter, not a new system — every method maps onto something
 
 §22.2 scoped a per-function descriptor because `tools/list` needed something to
 return. §22.1 then landed, and the *default* surface collapsed to a single tool
-— `run_javascript(source, timeout_ms)` — because an agent sends source rather
+ `run_javascript(source, timeout_ms)`, because an agent sends source rather
 than deploying a module per snippet. That took §22.2 off the critical path, and
 it has since been built: `tools/list` returns the interpreter followed by every
 described function, and `tools/call` dispatches by name.
@@ -1775,7 +1775,7 @@ The descriptor is a constant. The `timeout_ms` argument exists because §11.1's
 50 ms default suits a web handler and starves an agent; this adapter asks for
 1 s and clamps at the gateway's 5 s ceiling. It clamps *before* the call as well
 as at the gateway, so the number quoted in a timeout message is the number that
-was actually applied — a schema is a suggestion to a model, not a constraint on
+was actually applied, a schema is a suggestion to a model, not a constraint on
 it.
 
 #### Faults become instructions
@@ -1787,15 +1787,15 @@ retry forever or give up.
 
 | Fault | What the model is told |
 |---|---|
-| `timeout` / `fuel_exhausted` | Ran past its budget — do less, or raise `timeout_ms` |
-| `memory_limit` | Hit the memory ceiling — process smaller pieces |
+| `timeout` / `fuel_exhausted` | Ran past its budget, do less, or raise `timeout_ms` |
+| `memory_limit` | Hit the memory ceiling, process smaller pieces |
 | `unknown_function` / `unauthorized` | Server-side misconfiguration; **retrying will not help** |
 | `worker_shed` / `cluster_at_capacity` / `no_healthy_worker` | **Nothing ran**; retrying shortly is reasonable |
 | `worker_unreachable` | **May or may not have run** (§10.2); retry only if that is safe |
 | anything unrecognised | Named verbatim, with the detail, rather than diagnosed |
 
 The last two rows matter most. §10.2 refuses to retry a dispatched request
-because it may already have executed — a rule the agent one layer up will break
+because it may already have executed. A rule the agent one layer up will break
 unless it is told, and the wording is the only place it can be told. §22.4 has
 since landed and does not help here: an `Idempotency-Key` protects a caller that
 retries *the same* keyed HTTP request, while an MCP client retries by issuing a
@@ -1810,7 +1810,7 @@ inside a successful RPC rather than a gRPC status, because a tenant's infinite
 loop is not a transport failure. Here, the reason is sharper: a JSON-RPC error
 is handled by the client's plumbing and never reaches the model, so an error
 that the model could have corrected becomes one it never sees. JSON-RPC errors
-are reserved for the client's own mistakes — unknown method, unknown tool,
+are reserved for the client's own mistakes, unknown method, unknown tool,
 missing `source`.
 
 Note where that puts an ordinary JavaScript exception: it is a `200` from the
@@ -1820,7 +1820,7 @@ what it would do in a REPL.
 
 #### What it is not
 
-ponytail: Streamable HTTP only — `POST /mcp`, JSON responses, no SSE, no
+ponytail: Streamable HTTP only, `POST /mcp`, JSON responses, no SSE, no
 session ids, no batching. The spec permits answering with `application/json`
 rather than an event stream, and with no streaming results (§22.9 item 9) there
 is nothing to stream. Batching was removed from the protocol in the 2025-06-18
@@ -1829,7 +1829,7 @@ worth having when §22.5 does.
 
 **It carries no dependency on `nebula-control`.** It reaches the cluster over
 the HTTP gateway like any other client, which keeps a protocol adapter facing
-the open internet off the node that owns routing, membership and the registry —
+the open internet off the node that owns routing, membership and the registry,
 the same boundary the architecture guard enforces for the compiler, one layer
 out. The client is forty lines of `TcpStream`: every request sends
 `Connection: close`, so "read to EOF" is the whole response framing. The
@@ -1838,7 +1838,7 @@ script, and the upgrade path is a pooled client.
 
 The one thing it does borrow is two header *names*. They are duplicated rather
 than imported, and a dev-dependency test asserts they still match the
-gateway's — duplication without a check is a bug with a delay on it.
+gateway's. Duplication without a check is a bug with a delay on it.
 
 #### Before pointing it at anything untrusted
 
@@ -1846,7 +1846,7 @@ An MCP endpoint is by construction the thing you hand to something that loops.
 Per-tenant rate limiting (§22.7) landed for exactly this reason. v1 auth is
 HMAC-signed per tenant (§13), so the identity these limits meter is verified.
 
-### 22.4 Idempotency keys — because agent frameworks retry by default
+### 22.4 Idempotency keys: because agent frameworks retry by default
 
 **Status: built.** `crates/nebula-control/src/idempotency.rs`, with the
 end-to-end behaviour in `nebula-worker/tests/gateway_tests.rs`.
@@ -1868,20 +1868,20 @@ POST /execute/{function_id}
 
 An answer is held for **60 s**, keyed by `(tenant, function_id, key)`. A repeat
 inside that window returns the stored answer without invoking the guest at all,
-and says so with `X-Nebula-Idempotent-Replay` — a client should be able to tell
+and says so with `X-Nebula-Idempotent-Replay`. A client should be able to tell
 "it ran again" from "it did not need to".
 
 **The tenant in that tuple is a security boundary, not a scoping convenience.**
 Without it, an `Idempotency-Key` is an oracle: send a plausible key and read
 whatever another tenant named the same thing. The function id is there for a
-duller reason — an agent reusing one key across two tools should get two
+duller reason. An agent reusing one key across two tools should get two
 entries rather than one wrong answer.
 
 #### What replays, and what deliberately does not
 
 | Outcome | Stored? | Why |
 |---|---|---|
-| `200`, and guest faults (`trap`, `timeout`, `memory_limit`, `fuel_exhausted`) | **Yes** | The script ran and produced this. Running it again produces it again — and a retrying client should not re-execute every failing script. |
+| `200`, and guest faults (`trap`, `timeout`, `memory_limit`, `fuel_exhausted`) | **Yes** | The script ran and produced this. Running it again produces it again, and a retrying client should not re-execute every failing script. |
 | `503` (`no_healthy_worker`, `worker_shed`, `cluster_at_capacity`) | No | Nothing ran. Storing it would pin a transient failure for the whole TTL and make the key *worse* than not sending one. |
 | `502 worker_unreachable` | No | There is no answer to store. See below. |
 | `4xx` client errors | No | The request never became work. |
@@ -1889,7 +1889,7 @@ entries rather than one wrong answer.
 #### A claim is written before dispatch, not after
 
 Two identical requests arriving at once would both miss a store that only
-records completions, both execute, and both write — an idempotency key that
+records completions, both execute, and both write. An idempotency key that
 permits exactly the double execution it was sent to prevent. So the slot is
 claimed *before* the request is dispatched, and a duplicate that arrives while
 the first is still running gets `409 idempotency_in_flight`.
@@ -1899,19 +1899,19 @@ first request has not finished. Telling the caller to wait is the only option
 that neither runs the script twice nor invents a result.
 
 **A claim is a drop guard, and that is not a detail.** A client that hangs up
-mid-request has its handler future dropped, so the answer never arrives — and a
+mid-request has its handler future dropped, so the answer never arrives, and a
 slot left claimed answers `409` for the whole minute, to the very retry the key
 exists to serve. The first cut had exactly that bug; a test now pins it: hang up
 mid-request, retry with the same key, and the retry must run. As a backstop for
-the one case no guard covers — a gateway killed between the claim and the answer
-— an in-flight marker older than the TTL is reclaimed.
+the one case no guard covers. A gateway killed between the claim and the answer
+ an in-flight marker older than the TTL is reclaimed.
 
 #### The honest limit: this does not fix `502`
 
 An earlier draft of this section claimed a key would let `502` carry
 `Retry-After`, "because the retry would be provably safe". **That is wrong and
 is retracted.** A `502` means the request reached a worker and then the
-connection failed — the gateway never received a result, so it has nothing to
+connection failed. The gateway never received a result, so it has nothing to
 store and nothing to replay. A retry is exactly as unsafe as it was before, and
 `502` still carries no `Retry-After` (§11.1).
 
@@ -1919,7 +1919,7 @@ What the key actually covers is the loss the gateway *can* see:
 
 | Where the answer was lost | Covered? |
 |---|---|
-| Between client and gateway — client timeout, dropped connection, agent framework retry | **Yes.** The gateway completed the work and stored it; the retry gets it back. |
+| Between client and gateway, client timeout, dropped connection, agent framework retry | **Yes.** The gateway completed the work and stored it; the retry gets it back. |
 | Between gateway and worker (`502`) | No. Nobody has the answer. |
 
 The first row is the common case and the one agent frameworks actually
@@ -1934,7 +1934,7 @@ The store is capped at **10,000 entries and 64 MiB**. The byte budget is not
 belt-and-braces: a response body is capped at 1 MiB (§7.2), so a count cap alone
 would let any client willing to send keys hold ten gigabytes of gateway memory
 for a minute. The first cut had only the count cap. An answer that does not fit
-the remaining budget is not stored and the retry re-runs — the guarantee that
+the remaining budget is not stored and the retry re-runs. The guarantee that
 existed before the key, rather than letting one caller's large responses evict
 everyone else's.
 
@@ -1951,14 +1951,14 @@ payloads returns the first answer, which is what an idempotency key *means*;
 detecting the mismatch and reporting it (as Stripe does) needs a body hash and
 buys a better error message rather than a better guarantee.
 
-### 22.5 Session continuity — the 80% of §21 that costs 5%
+### 22.5 Session continuity: the 80% of §21 that costs 5%
 
 **Status: built.** `X-Nebula-Partition-Key`, the session dimension in
 `crates/nebula-runtime/src/kv.rs`, and `session.get/set` in the interpreter.
 
 Agents work in steps: define something in step one, use it in step two. §7.2
-used to say plainly that this did not work — "guests must not assume a value
-written on one request is visible on the next" — because nothing guaranteed the
+used to say plainly that this did not work. "Guests must not assume a value
+written on one request is visible on the next", because nothing guaranteed the
 second request landed on the same worker.
 
 ```
@@ -1980,8 +1980,8 @@ live instance. It needs the data to still be there.**
 |---|---|---|
 | What survives a request | A live, instantiated `Store` | Bytes in the KV shim |
 | Routes by | `partition_key` through the ring | The same |
-| Needs eviction policy change | Yes — pinned instances cannot be evicted | No |
-| Needs leases + fencing | Yes — two workers can both claim a key | **No** — a rebalance loses state, which is recoverable |
+| Needs eviction policy change | Yes, pinned instances cannot be evicted | No |
+| Needs leases + fencing | Yes, two workers can both claim a key | **No**, a rebalance loses state, which is recoverable |
 | Breaks "fresh instance per request" (§4.2) | Yes | **No** |
 
 That last row is the load-bearing one, and there is a test for it:
@@ -1993,7 +1993,7 @@ easy to reason about as it was.
 
 **The key namespaces the store, not just the routing.** KV keys became
 `(tenant, session, key)` tuples. Two conversations belonging to one tenant will
-pick the same key names — an agent chooses `"draft"` every time — so separation
+pick the same key names. An agent chooses `"draft"` every time, so separation
 has to come from the session rather than from the guest being careful. A request
 with no partition key gets `""` as its own namespace rather than a shared one,
 so an unscoped call never reads a conversation's scratchpad by accident.
@@ -2006,7 +2006,7 @@ conflating them makes the second step of every conversation a guess.
 **The KV shim now has a TTL** (10 minutes, refreshed on write). It had none, and
 without one the caps are permanent: the node fills once and refuses every write
 for the life of the process. The sweep runs when a write is refused rather than
-on a timer — a scan is expensive and the common path should not pay for the rare
+on a timer. A scan is expensive and the common path should not pay for the rare
 one. It cannot run inside the write itself, because `retain` touches every shard
 and would deadlock against the `entry` lock held there.
 
@@ -2015,7 +2015,7 @@ and would deadlock against the `entry` lock held there.
 Routing by session rather than by function trades **cache affinity for state
 affinity**. Two sessions of one function land on different workers and each
 compiles the module once. That is the trade, it is only paid by callers who send
-a key, and it is what `sessions_of_one_function_spread_across_workers` measures —
+a key, and it is what `sessions_of_one_function_spread_across_workers` measures,
 by counting `X-Nebula-Cold` responses, because consistent hashing already pins
 one *function* to one worker and a notepad would accumulate correctly even if
 the partition key were ignored for routing entirely. Without spread that test
@@ -2026,19 +2026,19 @@ pass, which is why it exists.
 
 **This is best-effort, not durable.** A ring rebalance sends the next request to
 a different worker and the session starts empty. That is a recoverable outcome
-rather than a correctness bug — which is precisely why this costs a KV namespace
+rather than a correctness bug, which is precisely why this costs a KV namespace
 and §21 costs a consensus protocol. It is right for a scratchpad and wrong for
 anything that must not be lost, and a caller should be told that rather than
 discover it during a rebalance.
 
-### 22.6 Trace context — stitching Nebula's spans into the agent's trace
+### 22.6 Trace context: stitching Nebula's spans into the agent's trace
 
 **Status: built.** `crates/nebula-control/src/trace.rs`, forwarded through the
 MCP adapter and the mesh.
 
 §14 produces a real span tree and it was an island. An agent run is already
 traced end to end by LangSmith, Langfuse, or a plain OTel collector, and the
-interesting question is always "which step was slow" — which nobody can answer
+interesting question is always "which step was slow", which nobody can answer
 if the tool call is an opaque 800 ms gap in the parent trace.
 
 ```
@@ -2068,14 +2068,14 @@ agent's trace and Nebula's.
 **Four rules that are not obvious:**
 
 1. **A malformed `traceparent` starts a new trace; it does not fail the
-   request.** The W3C spec requires this, and it is the only sane trade — a
+   request.** The W3C spec requires this, and it is the only sane trade. A
    caller's broken instrumentation must not take down their tool calls. The
    spec's explicit invalid encodings (all-zero ids) are rejected too, or every
    request emitting one would join a single enormous trace.
 2. **Sampling flags are carried verbatim.** The decision belongs to whoever
    started the trace. Rewriting it here would silently drop a caller out of
    their own sample.
-3. **The trace id is stamped on every exit, failures included** — `401`, `404`,
+3. **The trace id is stamped on every exit, failures included**: `401`, `404`,
    `503`, a replayed answer. A trace id present only on success is missing
    exactly when it is wanted.
 4. **A replay reports the trace that asked for it**, not the one that produced
@@ -2084,18 +2084,18 @@ agent's trace and Nebula's.
    of.
 
 The MCP adapter forwards an incoming `traceparent` verbatim rather than parsing
-it — the gateway already validates and mints, and a second parser is a second
+it. The gateway already validates and mints, and a second parser is a second
 place to disagree about the format. It does check the value is hex-and-dashes
 before writing it into a hand-built request, because a `\r\n` in a forwarded
 header is request splitting.
 
 **`request_id` is now the trace id.** It used to be `format!("{function_id}-{}",
-plan.len())`, which is identical for every request to a given function — it
+plan.len())`, which is identical for every request to a given function. It
 named a *function*, not a request. The trace id is unique per request and is the
 same id the caller and the worker both log, which is the only property that
 makes a request id worth carrying.
 
-ponytail: no OpenTelemetry exporter and no collector. §14's position holds —
+ponytail: no OpenTelemetry exporter and no collector. §14's position holds,
 `tracing` alone answers "where did the time go", and a collector is
 infrastructure to run rather than a question to answer. A `trace_id` field joins
 Nebula's spans to whatever the caller already uses. An exporter earns itself
@@ -2107,7 +2107,7 @@ is a correlation handle, nothing authorizes on it, and a collision costs two
 requests sharing a line in a log viewer. If that ever stops being true it needs
 a real RNG, and the comment in `trace.rs` says so.
 
-### 22.7 Per-tenant rate limits — the thing §10.3 cannot do
+### 22.7 Per-tenant rate limits: the thing §10.3 cannot do
 
 **Status: built.** `crates/nebula-control/src/ratelimit.rs`.
 
@@ -2126,7 +2126,7 @@ POST /execute/{function_id}
       Retry-After: <seconds until a token exists>
 ```
 
-Token buckets, keyed by tenant, refilled lazily from elapsed time on access —
+Token buckets, keyed by tenant, refilled lazily from elapsed time on access,
 a timer per tenant would be a scheduler's worth of machinery for arithmetic
 that fits on one line.
 
@@ -2144,7 +2144,7 @@ build failure rather than a test failure an afternoon later.
 
 **`429`, not `503`.** The cluster is fine; this caller is ahead of its own
 budget. Answering "service unavailable" would send it looking at the wrong
-problem — and `x-nebula-fault: rate_limited` is what lets an agent tell "slow
+problem, and `x-nebula-fault: rate_limited` is what lets an agent tell "slow
 down" from "Nebula is broken", which are opposite instructions. `Retry-After`
 carries the real wait, rounded up and never zero: a `Retry-After: 0` invites an
 immediate retry into another refusal.
@@ -2158,10 +2158,10 @@ invisible.
 
 #### The limiter's own state is bounded
 
-Tokens are signed now (§13), so inventing a tenant needs the signing secret —
+Tokens are signed now (§13), so inventing a tenant needs the signing secret,
 but verification is off by default, and an unbounded map keyed on an
 attacker-chosen string would be a memory-exhaustion vector created by the very
-thing meant to prevent one — the
+thing meant to prevent one. The
 same mistake §22.4 shipped and had to fix, so it was designed in here rather
 than found later.
 
@@ -2183,7 +2183,7 @@ an inconvenience, losing a rate limit under a flood is the flood.
 what this refuses. It passes `Limit::NONE` with a comment saying so, rather than
 the two quieter options: raising the default until the test fits under it, or
 tuning the test to stay below the limit. A load test that silently measures the
-rate limiter is measuring the wrong thing, and one shaped to avoid it is worse —
+rate limiter is measuring the wrong thing, and one shaped to avoid it is worse,
 it looks like a routing result and is really a limiter result.
 
 ponytail: one `HashMap` behind a `Mutex`, checked on the request path. The whole
@@ -2192,11 +2192,11 @@ distributed limiter shared across control planes, and adaptive limits all belong
 to a system that has measured this one being wrong.
 
 These buckets meter a *verified* identity now that tokens are signed (§13). An
-earlier cut of this section noted that they metered a self-declared one — enough
+earlier cut of this section noted that they metered a self-declared one. Enough
 to stop an honest client's runaway loop, and not enough to stop a dishonest one.
 That gap is closed: minting a fresh tenant now needs the signing secret.
 
-### 22.8 Egress — the one every agent workload asks for, and the one to gate
+### 22.8 Egress: the one every agent workload asks for, and the one to gate
 
 **Status: built, and off by default.** `crates/nebula-runtime/src/egress.rs`.
 
@@ -2212,7 +2212,7 @@ NEBULA_EGRESS_ALLOW="status.example.com;acme=api.example.com,cdn.example.com"
 
 A bare list is shared by every tenant. A `tenant=` group replaces the shared
 list **for that tenant** rather than adding to it, so a grant can be narrowed
-for one caller without being narrowed for all — and reading the configuration
+for one caller without being narrowed for all, and reading the configuration
 answers "what can this tenant reach" in one line instead of two.
 
 `http://` and `https://` both work; the scheme picks the default port.
@@ -2224,7 +2224,7 @@ egress off, so forgetting to enable it fails closed.
 nebula.http_get(url_ptr, url_len, out_ptr, out_len) -> i32
 ```
 
-Returns the **raw response** — status line, headers, blank line, body — and its
+Returns the **raw response**: status line, headers, blank line, body, and its
 full length, or `-1` on any refusal. The full length rather than the written
 length so a guest can detect truncation, which is the `kv_get` convention
 (§7.2). The whole response rather than the body alone because a script that
@@ -2235,7 +2235,7 @@ cannot tell `200` from `404` will summarise an error page as data.
 1. **An allowlist, never a denylist.** A denylist of private ranges is
    whack-a-mole; an allowlist is a decision someone made.
 2. **Resolve first, then check the resolved address.** Checking a hostname
-   proves nothing — `evil.example.com` can resolve to `169.254.169.254`.
+   proves nothing, `evil.example.com` can resolve to `169.254.169.254`.
 3. **Connect to the address that was checked.** Handing the hostname back to
    `connect` invites a second lookup with a different answer, which is DNS
    rebinding in one line.
@@ -2248,25 +2248,25 @@ cannot tell `200` from `404` will summarise an error page as data.
    interruption (§6.1) fires only at WASM instruction boundaries, so a guest
    parked in a host call cannot be interrupted at all. Without an explicit
    socket timeout drawn from the remaining deadline, the deadline would stop
-   being a bound — this is the rule most likely to be forgotten and the one
+   being a bound. This is the rule most likely to be forgotten and the one
    whose absence is least visible.
 
 The address check rejects loopback, all three RFC 1918 ranges, carrier-grade
 NAT, `0.0.0.0/8`, reserved space, IPv6 unique-local and link-local, and
-IPv4-mapped IPv6 — because `::ffff:169.254.169.254` reaches the same metadata
+IPv4-mapped IPv6, because `::ffff:169.254.169.254` reaches the same metadata
 endpoint as its IPv4 spelling. `169.254.0.0/16` matters most and sits in none of
 the RFC 1918 ranges, so a check that covers only 10/172/192 misses the single
 most valuable target an SSRF has.
 
 A refusal is a `-1`, not a trap: a blocked host is a condition a script can
 handle, and killing it for asking would break §7.2's convention. **The reason
-goes to the host's logs and never to the guest** — telling a script *why* a host
+goes to the host's logs and never to the guest**: telling a script *why* a host
 was blocked turns the allowlist into something it can enumerate one request at
 a time.
 
 #### Two limits worth stating plainly
 
-**HTTPS works**, via `rustls` with the `ring` provider and `webpki-roots` — 8
+**HTTPS works**, via `rustls` with the `ring` provider and `webpki-roots`, 8
 crates, no C toolchain, no platform certificate store. Roots are bundled rather
 than read from the system because a container without `ca-certificates`
 installed would otherwise fail every handshake with an error that looks like the
@@ -2280,7 +2280,7 @@ IP would fail every ordinary site and teach whoever debugged it to switch
 verification off.
 
 The handshake runs eagerly rather than lazily on first write, so a bad
-certificate is reported as `Tls` — the one failure a caller can usually fix —
+certificate is reported as `Tls`. The one failure a caller can usually fix,
 instead of surfacing later as a generic read error.
 
 An earlier draft shipped plain HTTP only and said TLS was a dependency decision
@@ -2289,20 +2289,20 @@ egress function that cannot reach an HTTPS endpoint cannot reach any real API.
 
 **Both the policy and its enforcement live on the worker, and that is the
 point.** The worker is the process that opens the socket, so a policy checked
-anywhere else is one something can route around — and a policy *sent* to the
+anywhere else is one something can route around, and a policy *sent* to the
 worker inside `ExecuteRequest` would be a policy the request could influence.
 This one is local configuration that nothing on the wire can change. The tenant
 that selects the list is the one the gateway established from the bearer token
 (§13), never anything the guest can set.
 
 An earlier cut shipped a single cluster-wide list and recorded the gap. This
-closes it without a proto field, a config store, or §22.2 — a `tenant=` group in
+closes it without a proto field, a config store, or §22.2. A `tenant=` group in
 the same variable was enough, and adding a wire field would have moved policy
 onto the network for no gain.
 
 There is also `Policy::allow_private_addresses()`, which switches off rule 2.
 It exists for an operator who has deliberately allowlisted an internal service,
-and it is the only way to test the client against a loopback server — an
+and it is the only way to test the client against a loopback server. An
 untested hand-written HTTP client is a worse hazard than a documented switch. It
 widens *where an allowed host may resolve to* and never *which hosts are
 allowed*, and a test pins that distinction: with the switch on,
@@ -2316,7 +2316,7 @@ JSON.parse(raw.split('\r\n\r\n')[1]).length
 ```
 
 `httpGet` returns the raw response and **throws** on a refusal, so a script can
-tell "blocked" from "the page was empty" — an empty string would conflate them,
+tell "blocked" from "the page was empty". An empty string would conflate them,
 and a trap would kill a script for asking a question it was allowed to ask and
 told no (§7.2). The thrown message names the URL and never the reason.
 
@@ -2332,18 +2332,18 @@ snapshot was worth nothing on this artifact. The interpreter now exports no
 | 1 | **Interpreter guests** (§22.1) | Agents can use Nebula *at all* | One guest crate, plus stdin/stdout as the request channel | **Built.** Everything else was decoration without it |
 | 2 | **Tool metadata + `GET /tools`** (§22.2) | Describing purpose-built wasm tools | A second map in the registry, no version bump | **Built.** §22.3 lists and dispatches them |
 | 3 | **MCP server** (§22.3) | Any MCP client, no glue | A thin crate, no control-plane dependency | **Built.** The step where an off-the-shelf agent connects |
-| 4 | **Idempotency keys** (§22.4) | Safe retries when the *client* lost the answer | One bounded map | **Built.** It does not fix `502` — §22.4 retracts that claim |
+| 4 | **Idempotency keys** (§22.4) | Safe retries when the *client* lost the answer | One bounded map | **Built.** It does not fix `502`, §22.4 retracts that claim |
 | 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse, forwarded through the mesh | **Built.** Also fixed a `request_id` that named a function, not a request |
 | 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | **Built.** Best-effort by design; a rebalance loses it |
 | 7 | **Per-tenant rate limits** (§22.7) | Survival, and fairness §10.3 cannot provide | A token bucket per tenant | **Built.** An agent in a retry loop *is* a load test |
 | 8 | **Egress** (§22.8) | Network-using tools | Its own threat model | **Built, and off by default.** HTTP and HTTPS |
-| 9 | Streaming responses | Incremental output | Reworks `response_write` into a flushing channel | Defer — buffered output is correct, just less pretty |
+| 9 | Streaming responses | Incremental output | Reworks `response_write` into a flushing channel | Defer, buffered output is correct, just less pretty |
 | 10 | Actor pins (§21) | True stateful sessions | Leases, fencing, eviction rework | Stays deferred; §22.5 covers the demand that would otherwise force it |
 
-**The thread running through 1–6: they are all adapters over things that already
+**The thread running through 1-6: they are all adapters over things that already
 exist.** Wizer is built, the fault taxonomy is built, the span tree is built,
 `partition_key` is already reserved in both the header and the proto. That is
-not an accident of luck — it is what the reserved plumbing in §21 was for. The
+not an accident of luck. It is what the reserved plumbing in §21 was for. The
 work here is exposure, not architecture, and the moment an item on this list
 requires changing §4.2's fresh-instance invariant or §6's per-request budgets,
 it has left this section and belongs in §21.
