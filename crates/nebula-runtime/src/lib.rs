@@ -5,6 +5,7 @@
 //! be tested without a cluster. gRPC and clustering live in `nebula-worker`.
 
 pub mod cache;
+pub mod egress;
 pub mod engine;
 pub mod host;
 pub mod kv;
@@ -17,6 +18,7 @@ pub use wasmtime;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use wasmtime::{Engine, Linker, Result, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
@@ -68,6 +70,16 @@ pub struct HostCtx {
     pub response: Vec<u8>,
     pub tenant: String,
     kv: Arc<Kv>,
+    /// Outbound HTTP policy (§22.8). Shared, immutable, and off by default.
+    egress: Arc<egress::Policy>,
+    /// When this execution started, and how long it may take in total.
+    ///
+    /// Egress needs both: the epoch deadline of §6.1 only fires at WASM
+    /// instruction boundaries, so a guest parked in a host call cannot be
+    /// interrupted — a socket timeout has to come out of the same budget or the
+    /// deadline stops being one.
+    started: Instant,
+    budget: Duration,
     stdout_pipe: MemoryOutputPipe,
     stderr_pipe: MemoryOutputPipe,
     wasi: WasiP1Ctx,
@@ -75,7 +87,13 @@ pub struct HostCtx {
 }
 
 impl HostCtx {
-    fn new(tenant: String, request: Vec<u8>, kv: Arc<Kv>) -> Self {
+    fn new(
+        tenant: String,
+        request: Vec<u8>,
+        kv: Arc<Kv>,
+        egress: Arc<egress::Policy>,
+        budget: Duration,
+    ) -> Self {
         let stdout_pipe = MemoryOutputPipe::new(host::MAX_STDIO_BYTES);
         let stderr_pipe = MemoryOutputPipe::new(host::MAX_STDIO_BYTES);
 
@@ -106,7 +124,18 @@ impl HostCtx {
             stderr_pipe,
             wasi,
             limits: engine::store_limits(),
+            egress,
+            started: Instant::now(),
+            budget,
         }
+    }
+
+    /// What is left of this execution's deadline.
+    ///
+    /// Zero once the budget is spent, which every host call that can block must
+    /// treat as a refusal rather than as "no limit".
+    pub fn remaining_budget(&self) -> Duration {
+        self.budget.saturating_sub(self.started.elapsed())
     }
 
     /// Bytes the guest wrote to WASI stdout. Captured, never inherited.
@@ -165,6 +194,7 @@ pub struct Runtime {
     linker: Linker<HostCtx>,
     cache: Cache,
     kv: Arc<Kv>,
+    egress: Arc<egress::Policy>,
 }
 
 impl Runtime {
@@ -185,7 +215,21 @@ impl Runtime {
             engine,
             linker,
             kv: Arc::new(Kv::new()),
+            egress: Arc::new(egress::Policy::default()),
         })
+    }
+
+    /// Enables outbound HTTP for the hosts an operator allowed (§22.8).
+    ///
+    /// Opt-in by construction: a `Runtime` built any other way has egress off,
+    /// so forgetting to call this fails closed.
+    pub fn with_egress(mut self, policy: egress::Policy) -> Self {
+        self.egress = Arc::new(policy);
+        self
+    }
+
+    pub fn egress(&self) -> &egress::Policy {
+        &self.egress
     }
 
     pub fn engine(&self) -> &Engine {
@@ -273,12 +317,19 @@ impl Runtime {
     /// Both are set here rather than at the call site so there is no path to a
     /// `Store` that runs guest code without them (§13, invariant 3).
     fn new_store(&self, tenant: &str, request: Vec<u8>, deadline_ticks: u64) -> Store<HostCtx> {
-        let ctx = HostCtx::new(tenant.to_string(), request, self.kv.clone());
+        let ticks = deadline_ticks.max(1);
+        let ctx = HostCtx::new(
+            tenant.to_string(),
+            request,
+            self.kv.clone(),
+            self.egress.clone(),
+            engine::EPOCH_TICK * ticks as u32,
+        );
         let mut store = Store::new(&self.engine, ctx);
         store.limiter(|ctx| &mut ctx.limits);
         // A zero deadline would mean "no budget at all", which is never what a
         // caller means; treat it as the default.
-        store.set_epoch_deadline(deadline_ticks.max(1));
+        store.set_epoch_deadline(ticks);
         store
     }
 }

@@ -19,9 +19,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_dir =
         std::env::var("NEBULA_CACHE_DIR").unwrap_or_else(|_| "/tmp/nebula-l2".to_string());
 
+    // §22.8. Off unless `NEBULA_EGRESS_ALLOW` names hosts, and enforced here
+    // rather than at the gateway because this is the process that opens the
+    // socket — a policy checked anywhere else is one something can route
+    // around.
+    let egress = nebula_runtime::egress::Policy::from_env();
+
     // Expensive: reserves the pooling allocator's address space and starts the
     // epoch ticker. One per process, never per request.
-    let runtime = Arc::new(Runtime::new(&cache_dir)?);
+    let runtime = Arc::new(Runtime::new(&cache_dir)?.with_egress(egress.clone()));
     let pool = Arc::new(ExecPool::with_default_size(runtime.clone()));
     let service = WorkerService::new(runtime.clone(), pool.clone(), &control)?;
 
@@ -52,6 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          {} execution threads, L2 cache at {cache_dir}",
         pool.threads()
     );
+    // Printed either way. An operator who meant to enable egress and typoed the
+    // variable would otherwise find out from a guest's `-1`, and an operator
+    // who did *not* mean to enable it should see that it is on.
+    if egress.is_enabled() {
+        println!("nebula-worker: outbound HTTP enabled for {egress:?}");
+    } else {
+        println!("nebula-worker: outbound HTTP disabled (set NEBULA_EGRESS_ALLOW to enable)");
+    }
     Server::builder()
         .add_service(NebulaWorkerServer::new(service))
         .serve(addr.parse()?)

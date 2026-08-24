@@ -8,7 +8,7 @@ use std::ops::Range;
 use wasmtime::{Caller, Extern, Linker, Result, Trap};
 
 use crate::kv;
-use crate::HostCtx;
+use crate::{egress, HostCtx};
 
 /// Cap on one `nebula.log` payload (§6.4). An unbounded copy out of guest
 /// memory is a trust-boundary hole, not a nicety: without this, one guest can
@@ -181,6 +181,57 @@ pub fn add_to_linker(linker: &mut Linker<HostCtx>) -> Result<()> {
                 Ok(()) => 0,
                 Err(kv::Rejected) => -1,
             })
+        },
+    )?;
+
+    // §22.8. Writes the raw HTTP response — status line, headers, blank line,
+    // body — into the guest buffer and returns its full length, or `-1` on any
+    // refusal. The full length rather than the written length so a guest can
+    // detect truncation, which is the `kv_get` convention.
+    //
+    // The whole response rather than just the body: a script that cannot tell
+    // `200` from `404` will parse an error page as data.
+    linker.func_wrap(
+        "nebula",
+        "http_get",
+        |mut caller: Caller<'_, HostCtx>,
+         url_ptr: u32,
+         url_len: u32,
+         out_ptr: u32,
+         out_len: u32|
+         -> Result<i32> {
+            // The URL is read and copied out before anything else touches guest
+            // memory: the fetch re-enters nothing, but holding a borrow across
+            // a call that can take seconds is a habit worth not having.
+            let url = {
+                let bytes = guest_slice(&mut caller, url_ptr, url_len)?;
+                String::from_utf8_lossy(bytes).into_owned()
+            };
+
+            let (policy, budget) = {
+                let ctx = caller.data();
+                (ctx.egress.clone(), ctx.remaining_budget())
+            };
+
+            let response = match egress::fetch(&policy, &url, budget) {
+                Ok(response) => response,
+                Err(refusal) => {
+                    // The reason goes to the host's logs and the guest gets a
+                    // `-1` (§7.2). Telling a guest *why* a host is blocked
+                    // turns the allowlist into an oracle it can enumerate.
+                    tracing::info!(%refusal, "egress refused");
+                    caller
+                        .data_mut()
+                        .logs
+                        .push((3, format!("http_get refused: {refusal}")));
+                    return Ok(-1);
+                }
+            };
+
+            let dst = guest_slice(&mut caller, out_ptr, out_len)?;
+            let written = dst.len().min(response.len());
+            dst[..written].copy_from_slice(&response[..written]);
+            Ok(response.len() as i32)
         },
     )?;
 

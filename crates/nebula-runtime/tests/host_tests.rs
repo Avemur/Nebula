@@ -508,3 +508,159 @@ fn kv_state_is_shared_across_requests_on_one_node() {
         Some(&b"over"[..])
     );
 }
+
+// ---------------------------------------------------------------------------
+// Outbound HTTP (§22.8)
+// ---------------------------------------------------------------------------
+
+/// Fetches the URL in the request body and writes the raw response back.
+const FETCHER: &str = r#"
+    (module
+      (import "nebula" "request_len" (func $len (result i32)))
+      (import "nebula" "request_read" (func $read (param i32 i32) (result i32)))
+      (import "nebula" "http_get" (func $get (param i32 i32 i32 i32) (result i32)))
+      (import "nebula" "response_write" (func $write (param i32 i32) (result i32)))
+      (memory (export "memory") 32)
+      (data (i32.const 0) "REFUSED")
+      (func (export "run")
+        (local $n i32)
+        (local $got i32)
+        (local.set $n (call $len))
+        (drop (call $read (i32.const 1024) (local.get $n)))
+        (local.set $got
+          (call $get (i32.const 1024) (local.get $n) (i32.const 8192) (i32.const 65536)))
+        (if (i32.lt_s (local.get $got) (i32.const 0))
+          (then (drop (call $write (i32.const 0) (i32.const 7))))
+          (else (drop (call $write (i32.const 8192) (local.get $got)))))))
+    "#;
+
+/// A single-shot HTTP server on loopback. Returns its port.
+///
+/// A real socket rather than a mock: the thing under test is a hand-written
+/// HTTP client, and the bugs it can have — framing, the `Host` header, reading
+/// to EOF — are exactly the ones a mock would paper over.
+fn one_shot_server(response: &'static str) -> u16 {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}
+
+fn fetch_via_guest(policy: nebula_runtime::egress::Policy, url: &str) -> String {
+    // A runtime of its own: egress policy is per-`Runtime`, and the shared one
+    // in `common` must stay egress-off so nothing else can reach a socket.
+    let runtime = Runtime::new(common::temp_dir("egress"))
+        .expect("runtime")
+        .with_egress(policy);
+    let ctx = runtime
+        .execute(FETCHER.as_bytes(), "run", "egress", url.as_bytes().to_vec())
+        .expect("guest runs");
+    String::from_utf8_lossy(&ctx.response).to_string()
+}
+
+#[test]
+fn a_guest_cannot_reach_the_network_unless_an_operator_said_so() {
+    let port = one_shot_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+
+    // The default. Every other test in this file passes an explicit policy, so
+    // this is the one that pins the default itself — and the default is the
+    // only thing standing between a fresh deployment and an SSRF proxy.
+    let answer = fetch_via_guest(
+        nebula_runtime::egress::Policy::default(),
+        &format!("http://127.0.0.1:{port}/"),
+    );
+    assert_eq!(answer, "REFUSED");
+}
+
+#[test]
+fn an_allowed_host_comes_back_whole() {
+    let port = one_shot_server("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot there");
+
+    // Loopback is not a public address, so this needs the escape hatch — the
+    // only way to point the client at a server the test controls. The address
+    // check is asserted on its own, against the whole list of ranges it has to
+    // reject; what this test is for is the client itself, which is hand-written
+    // and would otherwise never be exercised against a real socket.
+    let policy = nebula_runtime::egress::Policy::new(["127.0.0.1"]).allow_private_addresses();
+    let answer = fetch_via_guest(policy, &format!("http://127.0.0.1:{port}/"));
+
+    // The *whole* response, status line included. Handing back only the body
+    // would leave a script unable to tell `200` from `404`, and an agent would
+    // summarise an error page as though it were data.
+    assert!(answer.starts_with("HTTP/1.1 404 Not Found"), "{answer}");
+    assert!(answer.ends_with("not there"), "{answer}");
+}
+
+#[test]
+fn a_response_past_the_cap_is_refused_rather_than_truncated() {
+    // A truncated response is worse than none: it parses, and it is wrong.
+    let body = "x".repeat(2 << 20);
+    let response: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_boxed_str(),
+    );
+    let port = one_shot_server(response);
+
+    let policy = nebula_runtime::egress::Policy::new(["127.0.0.1"]).allow_private_addresses();
+    let answer = fetch_via_guest(policy, &format!("http://127.0.0.1:{port}/"));
+    assert_eq!(answer, "REFUSED");
+}
+
+#[test]
+fn a_host_that_is_not_on_the_list_is_refused() {
+    let policy = nebula_runtime::egress::Policy::new(["api.example.com"]);
+    let answer = fetch_via_guest(policy, "http://evil.test/");
+    assert_eq!(answer, "REFUSED");
+}
+
+#[test]
+fn https_is_refused_rather_than_silently_downgraded() {
+    // The dangerous alternative is stripping the scheme and fetching over
+    // plaintext, which would be a downgrade attack implemented on purpose.
+    let policy = nebula_runtime::egress::Policy::new(["api.example.com"]);
+    let answer = fetch_via_guest(policy, "https://api.example.com/");
+    assert_eq!(answer, "REFUSED");
+}
+
+#[test]
+fn a_refusal_is_recoverable_rather_than_a_trap() {
+    // §7.2's convention: `-1` on refusal, because a blocked host is a condition
+    // the guest can handle. Trapping would kill a script for asking a question
+    // it was allowed to ask and told no.
+    let policy = nebula_runtime::egress::Policy::new(["api.example.com"]);
+    let runtime = Runtime::new(common::temp_dir("egress-trap"))
+        .expect("runtime")
+        .with_egress(policy);
+
+    let ctx = runtime
+        .execute(
+            FETCHER.as_bytes(),
+            "run",
+            "egress",
+            b"http://blocked.test/".to_vec(),
+        )
+        .expect("a refused fetch must not trap the guest");
+
+    assert_eq!(ctx.response, b"REFUSED");
+    // The reason goes to the host, never to the guest — a guest told *why* a
+    // host was blocked can enumerate the allowlist one request at a time.
+    assert!(
+        ctx.logs
+            .iter()
+            .any(|(_, message)| message.contains("refused")),
+        "the host should record why: {:?}",
+        ctx.logs
+    );
+}

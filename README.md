@@ -471,6 +471,7 @@ Registered on the `Linker` under the `nebula` module namespace:
 | `nebula.kv_get` | `(kptr, klen, vptr, vlen) -> i32` | Read from the node-local KV shim |
 | `nebula.kv_set` | `(kptr, klen, vptr, vlen) -> i32` | Write to the node-local KV shim |
 | `nebula.log` | `(level: i32, ptr, len)` | Emit a structured log line |
+| `nebula.http_get` | `(uptr, ulen, optr, olen) -> i32` | Outbound HTTP, allowlisted and off by default (§22.8) |
 
 The KV shim is **node-local and non-durable** — a `DashMap` keyed by
 `(tenant, key)` *tuples*, not by a concatenated prefix, and bounded per §6.4.
@@ -955,6 +956,13 @@ another tenant's data, or escape to the host.
 | Poisoned AOT cache | L2 keyed by artifact hash + engine config + wasmtime version; worker-writable only |
 | Compile bombs | Size cap and compile timeout at deploy time, not request time |
 
+**Outbound HTTP is a defended surface, not an absent one (§22.8).** It is off
+unless an operator names hosts, and when on it enforces an allowlist, checks
+every resolved address against the private ranges, connects to the address it
+checked, follows no redirects, and draws its timeout from the request budget.
+The residual risk is what an allowlisted host can be talked into doing, which is
+a decision about that host rather than about this code.
+
 ### Accepted risks
 
 - **Timing side channels (Spectre class).** Wasmtime mitigates some variants
@@ -1149,7 +1157,7 @@ nebula/
 ├── crates/
 │   ├── nebula-proto/           # tonic-prost-build output, isolated for build times
 │   ├── nebula-runtime/         # lib: engine, limits, host fns, KV, cache, execute
-│   │   ├── src/{engine,host,kv,cache}.rs
+│   │   ├── src/{engine,host,kv,cache,egress}.rs
 │   │   └── tests/{sandbox,host,cache,interpreter}_tests.rs, wizer_bench.rs
 │   ├── nebula-control/         # bin: gateway + ring + registry + membership + wizer
 │   │   └── src/{gateway,ring,registry,membership,server,wizer,idempotency,trace,ratelimit}.rs
@@ -1439,7 +1447,6 @@ v1, they replace Phase 4 — they do not fit alongside it.
 | mTLS on internal gRPC | Before any deployment on an untrusted network |
 | Multi-instance control plane | When the SPOF matters more than the simplicity |
 | WASI preview 2 / component model | When guest toolchains emit components as reliably as p1 modules |
-| Outbound HTTP host function | When a guest needs it — the largest new attack surface (SSRF, egress policy). Agent workloads will ask; §22.8 sets the terms |
 | Per-tenant rate limiting at the gateway | Before multi-tenant exposure to untrusted callers — an agent in a retry loop is one. **Built**, §22.7 |
 
 ---
@@ -1457,9 +1464,9 @@ rest is scoped here.
 
 The ranking is the point: items 22.1–22.3 are what "works with agents" actually
 means, and the rest are sharp edges agent traffic will find in a system tuned
-for web handlers. **§22.1, §22.3, §22.4, §22.6 and §22.7 are built** — the
+for web handlers. **Everything except §22.2 and §22.5 is built** — the
 JavaScript interpreter guest, the MCP server, idempotency keys, W3C trace
-context, and per-tenant rate limits. The rest is scoped, not written.
+context, per-tenant rate limits, and gated outbound HTTP.
 
 ### 22.1 Interpreter guests — the prerequisite for everything else
 
@@ -2033,26 +2040,102 @@ to stop a dishonest one, which is exactly what §13 already says about v1 auth.
 
 ### 22.8 Egress — the one every agent workload asks for, and the one to gate
 
+**Status: built, and off by default.** `crates/nebula-runtime/src/egress.rs`.
+
 "Fetch this URL and summarise it" is the second thing anyone asks a code
-sandbox to do. §21 already defers an outbound HTTP host function on the grounds
-that it is the single largest new attack surface in the system, and agent
-demand does not change that analysis — it only guarantees the request will
-arrive.
+sandbox to do, and the first thing that turns a sandbox into an SSRF proxy.
+This is the largest new attack surface in the system, so it is the only feature
+here that does nothing at all until an operator says otherwise:
 
-If it is built, the constraints are not negotiable and belong in §13 before any
-code:
+```
+NEBULA_EGRESS_ALLOW=api.example.com,data.example.org   # on the worker
+```
 
-- A **per-tenant allowlist** of hosts. Not a denylist; a denylist of private
-  address ranges is a game of whack-a-mole against DNS rebinding.
-- Resolve first, then check the **resolved IP** against the allowlist and
-  against RFC 1918 / link-local / loopback. Checking the hostname alone is an
-  SSRF with extra steps.
-- **No redirect following.** A 302 to `169.254.169.254` is the entire attack.
-- Time spent in egress is **charged against the request deadline**, not added
-  to it. Otherwise the epoch deadline of §6.1 stops being a bound.
+Absent or empty, every call is refused. A `Runtime` built any other way has
+egress off, so forgetting to enable it fails closed.
 
-The `-1`-on-refusal convention of §7.2 extends naturally: a blocked host is a
-refusal the guest can handle, not a trap.
+```
+nebula.http_get(url_ptr, url_len, out_ptr, out_len) -> i32
+```
+
+Returns the **raw response** — status line, headers, blank line, body — and its
+full length, or `-1` on any refusal. The full length rather than the written
+length so a guest can detect truncation, which is the `kv_get` convention
+(§7.2). The whole response rather than the body alone because a script that
+cannot tell `200` from `404` will summarise an error page as data.
+
+#### The rules, and why none of them is negotiable
+
+1. **An allowlist, never a denylist.** A denylist of private ranges is
+   whack-a-mole; an allowlist is a decision someone made.
+2. **Resolve first, then check the resolved address.** Checking a hostname
+   proves nothing — `evil.example.com` can resolve to `169.254.169.254`.
+3. **Connect to the address that was checked.** Handing the hostname back to
+   `connect` invites a second lookup with a different answer, which is DNS
+   rebinding in one line.
+4. **Every resolved address must pass.** A host answering with one public and
+   one private address is not half-safe.
+5. **No redirects.** A `302` to the metadata endpoint is the whole attack. The
+   response comes back as-is; a guest that wants to follow one may ask again,
+   and that request is checked like any other.
+6. **Time comes out of the request budget, never on top of it.** Epoch
+   interruption (§6.1) fires only at WASM instruction boundaries, so a guest
+   parked in a host call cannot be interrupted at all. Without an explicit
+   socket timeout drawn from the remaining deadline, the deadline would stop
+   being a bound — this is the rule most likely to be forgotten and the one
+   whose absence is least visible.
+
+The address check rejects loopback, all three RFC 1918 ranges, carrier-grade
+NAT, `0.0.0.0/8`, reserved space, IPv6 unique-local and link-local, and
+IPv4-mapped IPv6 — because `::ffff:169.254.169.254` reaches the same metadata
+endpoint as its IPv4 spelling. `169.254.0.0/16` matters most and sits in none of
+the RFC 1918 ranges, so a check that covers only 10/172/192 misses the single
+most valuable target an SSRF has.
+
+A refusal is a `-1`, not a trap: a blocked host is a condition a script can
+handle, and killing it for asking would break §7.2's convention. **The reason
+goes to the host's logs and never to the guest** — telling a script *why* a host
+was blocked turns the allowlist into something it can enumerate one request at
+a time.
+
+#### Two limits worth stating plainly
+
+**Plain HTTP only.** TLS needs a cryptography dependency, and §17's "no
+networking dependency" for `nebula-runtime` is load-bearing — the sandbox tests
+link it directly. `std::net` is not a dependency; rustls is, and pulling one
+into the crate that runs untrusted code is a decision worth making deliberately
+rather than as a side effect of an afternoon. `https://` is refused by name
+rather than as a malformed URL, because it is the refusal a caller is most
+likely to hit and least likely to guess — and silently downgrading to plaintext
+would be a downgrade attack implemented on purpose.
+
+**Cluster-wide, not per-tenant.** This section originally specified a per-tenant
+allowlist. What shipped is one operator-configured list per worker, which is a
+narrowing and is recorded here rather than quietly delivered. Per-tenant policy
+needs somewhere to store per-tenant configuration, which is §22.2's registry
+metadata; the enforcement code would not change, only where the list comes from.
+
+There is also `Policy::allow_private_addresses()`, which switches off rule 2.
+It exists for an operator who has deliberately allowlisted an internal service,
+and it is the only way to test the client against a loopback server — an
+untested hand-written HTTP client is a worse hazard than a documented switch. It
+widens *where an allowed host may resolve to* and never *which hosts are
+allowed*, and a test pins that distinction: with the switch on,
+`http://169.254.169.254/` is still refused as `HostNotAllowed`.
+
+#### The interpreter guest cannot use this yet
+
+`guests/interpreters/js` imports nothing but WASI, because Wizer must
+instantiate a module to run its initializer and every import has to be
+satisfiable at build time (R2). `nebula.http_get` is therefore unavailable to
+it, and the flagship guest cannot fetch anything.
+
+The fix is known and cheap: drop `_initialize` from the interpreter and stop
+wizening it, which §22.1 measured as costing **nothing** — Boa builds a realm in
+well under a millisecond and the snapshot adds bytes to an artifact whose cost
+is dominated by size. That is a decision to make when egress is actually turned
+on, not a blocker, and it is not made here because it would trade a
+demonstrated capability for an unused one.
 
 ### 22.9 Ranked, with what each one costs
 
@@ -2065,7 +2148,7 @@ refusal the guest can handle, not a trap.
 | 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse, forwarded through the mesh | **Built.** Also fixed a `request_id` that named a function, not a request |
 | 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | Do, and say plainly that it is best-effort |
 | 7 | **Per-tenant rate limits** (§22.7) | Survival, and fairness §10.3 cannot provide | A token bucket per tenant | **Built.** An agent in a retry loop *is* a load test |
-| 8 | **Egress** (§22.8) | Network-using tools | Its own threat model | Gate behind §13 review, never ship it casually |
+| 8 | **Egress** (§22.8) | Network-using tools | Its own threat model | **Built, and off by default.** Plain HTTP only; the interpreter cannot use it yet |
 | 9 | Streaming responses | Incremental output | Reworks `response_write` into a flushing channel | Defer — buffered output is correct, just less pretty |
 | 10 | Actor pins (§21) | True stateful sessions | Leases, fencing, eviction rework | Stays deferred; §22.5 covers the demand that would otherwise force it |
 
