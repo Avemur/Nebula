@@ -733,11 +733,13 @@ POST /execute/{function_id}
   X-Nebula-Deadline-Ms: <opt, 10..5000, default 50>
   X-Nebula-Partition-Key: <opt, reserved for §21>
   Idempotency-Key: <opt, 1..=255 bytes; replays an answer for 60s, §22.4>
+  traceparent: <opt, W3C trace context; adopted or minted, §22.6>
   Body: <= 1 MiB
   ->  200 <response body>
       X-Nebula-Cold: true|false
       X-Nebula-Exec-Micros: <n>
       X-Nebula-Deadline-Ms: <the effective budget, after clamping>
+      X-Nebula-Trace-Id: <this request's trace, on every response, §22.6>
   ->  4xx/5xx
       X-Nebula-Fault: <machine-readable cause, always present>
 ```
@@ -1149,7 +1151,7 @@ nebula/
 │   │   ├── src/{engine,host,kv,cache}.rs
 │   │   └── tests/{sandbox,host,cache,interpreter}_tests.rs, wizer_bench.rs
 │   ├── nebula-control/         # bin: gateway + ring + registry + membership + wizer
-│   │   └── src/{gateway,ring,registry,membership,server,wizer,idempotency}.rs
+│   │   └── src/{gateway,ring,registry,membership,server,wizer,idempotency,trace}.rs
 │   ├── nebula-worker/          # bin: gRPC server wrapping nebula-runtime
 │   │   ├── src/{server,exec_pool,heartbeat}.rs
 │   │   └── tests/{mesh,gateway,scale}_tests.rs
@@ -1454,9 +1456,9 @@ rest is scoped here.
 
 The ranking is the point: items 22.1–22.3 are what "works with agents" actually
 means, and the rest are sharp edges agent traffic will find in a system tuned
-for web handlers. **§22.1, §22.3 and §22.4 are built** — the JavaScript
-interpreter guest, the MCP server, and idempotency keys. The rest is scoped,
-not written.
+for web handlers. **§22.1, §22.3, §22.4 and §22.6 are built** — the JavaScript
+interpreter guest, the MCP server, idempotency keys, and W3C trace context. The
+rest is scoped, not written.
 
 ### 22.1 Interpreter guests — the prerequisite for everything else
 
@@ -1866,17 +1868,79 @@ say so in the response rather than let a caller discover it during a rebalance.
 
 ### 22.6 Trace context — stitching Nebula's spans into the agent's trace
 
-§14 produces a real span tree, and today it is an island. An agent run is
-already traced end to end by LangSmith, Langfuse, or a plain OTel collector,
-and the interesting question is always "which step was slow" — which nobody can
-answer if the tool call is an opaque 800 ms gap in the parent trace.
+**Status: built.** `crates/nebula-control/src/trace.rs`, forwarded through the
+MCP adapter and the mesh.
 
-Accepting the W3C `traceparent` header and using it as the parent of the
-`request_received` span closes that gap. `tracing` already supports an explicit
-parent, and the worker already propagates a `Span` across the thread-pool
-boundary by hand (§14), so the plumbing exists — this only extends it one hop
-outward to the caller. It is a header parse and a span attribute, and it does
-not require the OpenTelemetry collector §14 deliberately avoids.
+§14 produces a real span tree and it was an island. An agent run is already
+traced end to end by LangSmith, Langfuse, or a plain OTel collector, and the
+interesting question is always "which step was slow" — which nobody can answer
+if the tool call is an opaque 800 ms gap in the parent trace.
+
+```
+POST /execute/{function_id}
+  traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+  ->  X-Nebula-Trace-Id: 4bf92f3577b34da6a3ce929d0e0e4736
+```
+
+A W3C `traceparent` is adopted if one arrives and minted if not, recorded as a
+`trace_id` field on `request_received`, and forwarded to the worker in gRPC
+metadata. Measured output, both processes, one caller-supplied id:
+
+```
+grpc_execute{trace_id="4bf92f…4736" function_id="echo" tenant="acme"}
+  :fetch_module{hash=d3eec6… bytes=482}: close time.busy=179µs
+  :wasm_execute{…}:compile_l1{source="cranelift"}: close time.busy=3.55ms
+  : close time.busy=4.04ms outcome=Ok
+request_received{function_id=echo trace_id="4bf92f…4736" deadline_ms=50}
+  :route_to_worker{worker=127.0.0.1:42091 outcome="answered"}: close time.busy=411µs
+  : close time.busy=644µs time.idle=5.53ms
+```
+
+That is the whole feature: the caller's id on every span on both sides of the
+process boundary, so a `grep` on one id assembles the tool call out of the
+agent's trace and Nebula's.
+
+**Four rules that are not obvious:**
+
+1. **A malformed `traceparent` starts a new trace; it does not fail the
+   request.** The W3C spec requires this, and it is the only sane trade — a
+   caller's broken instrumentation must not take down their tool calls. The
+   spec's explicit invalid encodings (all-zero ids) are rejected too, or every
+   request emitting one would join a single enormous trace.
+2. **Sampling flags are carried verbatim.** The decision belongs to whoever
+   started the trace. Rewriting it here would silently drop a caller out of
+   their own sample.
+3. **The trace id is stamped on every exit, failures included** — `401`, `404`,
+   `503`, a replayed answer. A trace id present only on success is missing
+   exactly when it is wanted.
+4. **A replay reports the trace that asked for it**, not the one that produced
+   the stored body. §22.4 replays the answer; the id belongs to *this* request,
+   and returning the original would point a caller at a trace it was never part
+   of.
+
+The MCP adapter forwards an incoming `traceparent` verbatim rather than parsing
+it — the gateway already validates and mints, and a second parser is a second
+place to disagree about the format. It does check the value is hex-and-dashes
+before writing it into a hand-built request, because a `\r\n` in a forwarded
+header is request splitting.
+
+**`request_id` is now the trace id.** It used to be `format!("{function_id}-{}",
+plan.len())`, which is identical for every request to a given function — it
+named a *function*, not a request. The trace id is unique per request and is the
+same id the caller and the worker both log, which is the only property that
+makes a request id worth carrying.
+
+ponytail: no OpenTelemetry exporter and no collector. §14's position holds —
+`tracing` alone answers "where did the time go", and a collector is
+infrastructure to run rather than a question to answer. A `trace_id` field joins
+Nebula's spans to whatever the caller already uses. An exporter earns itself
+when someone wants the spans rendered *inside* their UI rather than joined by
+id, and that is a dependency and a deployment, not an afternoon.
+
+Trace ids are minted from a hashed counter and clock, not a CSPRNG: a trace id
+is a correlation handle, nothing authorizes on it, and a collision costs two
+requests sharing a line in a log viewer. If that ever stops being true it needs
+a real RNG, and the comment in `trace.rs` says so.
 
 ### 22.7 Egress — the one every agent workload asks for, and the one to gate
 
@@ -1909,7 +1973,7 @@ refusal the guest can handle, not a trap.
 | 2 | **Tool metadata + `GET /tools`** (§22.2) | Describing purpose-built wasm tools | A registry field and a version bump | Do — but §22.3 took it off the critical path |
 | 3 | **MCP server** (§22.3) | Any MCP client, no glue | A thin crate, no control-plane dependency | **Built.** The step where an off-the-shelf agent connects |
 | 4 | **Idempotency keys** (§22.4) | Safe retries when the *client* lost the answer | One bounded map | **Built.** It does not fix `502` — §22.4 retracts that claim |
-| 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse | Do |
+| 5 | **Trace context** (§22.6) | Nebula visible inside agent traces | A header parse, forwarded through the mesh | **Built.** Also fixed a `request_id` that named a function, not a request |
 | 6 | **Session state** (§22.5) | Multi-step agent work | KV namespacing + sticky routing | Do, and say plainly that it is best-effort |
 | 7 | **Per-tenant rate limits** (§21) | Survival | A token bucket per tenant | Before any untrusted caller — an agent in a retry loop *is* a load test |
 | 8 | **Egress** (§22.7) | Network-using tools | Its own threat model | Gate behind §13 review, never ship it casually |

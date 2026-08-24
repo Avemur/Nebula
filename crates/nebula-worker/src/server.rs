@@ -28,6 +28,25 @@ pub const MAX_ARTIFACT_BYTES: usize = 32 << 20;
 /// to prevent.
 pub const MAX_DEADLINE_MS: u32 = 5_000;
 
+/// W3C trace context, forwarded by the gateway (§22.6).
+pub const TRACEPARENT_METADATA: &str = "traceparent";
+
+/// The trace id out of a `traceparent`, if it looks like one.
+///
+/// The gateway validated the header and re-emitted it, and §13 makes the mesh
+/// trusted, so this does not re-parse — it takes the field by position. The
+/// length and hex checks are here only so a malformed value produces no
+/// `trace_id` rather than a confusing one; there is nothing to defend against.
+fn trace_id_of(request: &Request<ExecuteRequest>) -> Option<String> {
+    let raw = request
+        .metadata()
+        .get(TRACEPARENT_METADATA)?
+        .to_str()
+        .ok()?;
+    let id = raw.split('-').nth(1)?;
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum FetchError {
     NotFound,
@@ -205,6 +224,9 @@ impl NebulaWorker for WorkerService {
         name = "grpc_execute",
         skip_all,
         fields(
+            // Recorded before anything can fail, so a shed or draining request
+            // still lands in the caller's trace (§22.6).
+            trace_id = tracing::field::Empty,
             function_id = tracing::field::Empty,
             tenant = tracing::field::Empty,
             cold = tracing::field::Empty,
@@ -215,6 +237,10 @@ impl NebulaWorker for WorkerService {
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
+        if let Some(trace_id) = trace_id_of(&request) {
+            tracing::Span::current().record("trace_id", trace_id.as_str());
+        }
+
         if self.draining.load(Ordering::Relaxed) {
             return Err(Status::resource_exhausted("worker is draining"));
         }
@@ -301,5 +327,63 @@ impl NebulaWorker for WorkerService {
         Ok(Response::new(DrainResponse {
             in_flight: self.pool.in_flight() as u32,
         }))
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use nebula_control::trace::TraceContext;
+
+    /// The worker reads what the gateway writes — asserted against the real
+    /// producer rather than a string someone typed here.
+    ///
+    /// This is the whole integration risk in one test. Both sides could be
+    /// individually correct about a format they disagree on, and the symptom
+    /// would be a `trace_id` field that is silently never populated: nothing
+    /// fails, no test goes red, and a trace just quietly stops at the gateway.
+    #[test]
+    fn the_worker_reads_the_traceparent_the_gateway_writes() {
+        let context = TraceContext::adopt(Some(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        ));
+        let on_the_wire = context.outgoing("aaaaaaaaaaaaaaaa");
+
+        let mut request = Request::new(ExecuteRequest::default());
+        request
+            .metadata_mut()
+            .insert(TRACEPARENT_METADATA, on_the_wire.parse().unwrap());
+
+        assert_eq!(trace_id_of(&request), Some(context.trace_id));
+    }
+
+    #[test]
+    fn a_minted_trace_survives_the_hop_too() {
+        // A request the caller did not trace still gets an id, and the worker
+        // has to pick that one up as well or half the traces stop at the
+        // gateway for no visible reason.
+        let context = TraceContext::adopt(None);
+        let mut request = Request::new(ExecuteRequest::default());
+        request.metadata_mut().insert(
+            TRACEPARENT_METADATA,
+            context.outgoing("bbbbbbbbbbbbbbbb").parse().unwrap(),
+        );
+
+        assert_eq!(trace_id_of(&request), Some(context.trace_id));
+    }
+
+    #[test]
+    fn an_absent_or_unusable_traceparent_is_simply_no_trace_id() {
+        // Nothing here is a defence — §13 makes the mesh trusted. It only has
+        // to produce *no* id rather than a confusing one.
+        assert_eq!(trace_id_of(&Request::new(ExecuteRequest::default())), None);
+
+        for bad in ["", "garbage", "00-short-00f067aa0ba902b7-01"] {
+            let mut request = Request::new(ExecuteRequest::default());
+            request
+                .metadata_mut()
+                .insert(TRACEPARENT_METADATA, bad.parse().unwrap());
+            assert_eq!(trace_id_of(&request), None, "{bad:?}");
+        }
     }
 }

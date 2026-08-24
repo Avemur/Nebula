@@ -21,6 +21,7 @@ use tonic::Code;
 use crate::idempotency;
 use crate::membership::Membership;
 use crate::registry::{Deployments, Registry, MAX_ARTIFACT_BYTES};
+use crate::trace;
 use crate::wizer;
 
 /// §6.4 caps a request body at 1 MiB.
@@ -233,12 +234,23 @@ impl Gateway {
     /// One dispatch attempt. Instrumented per attempt rather than per request,
     /// so a retry shows up as a second span instead of hiding inside the first.
     #[tracing::instrument(name = "route_to_worker", skip_all, fields(worker = %address, outcome = tracing::field::Empty))]
-    async fn dispatch(&self, address: &str, request: ExecuteRequest) -> Attempt {
+    async fn dispatch(&self, address: &str, request: ExecuteRequest, traceparent: &str) -> Attempt {
         let span = tracing::Span::current();
         let Some(mut client) = self.client(address).await else {
             span.record("outcome", "not_sent");
             return Attempt::NotSent;
         };
+
+        // Trace context rides in gRPC metadata rather than in `ExecuteRequest`,
+        // for the same reason it rides in an HTTP header rather than a JSON
+        // body: it describes the call, not the work (§22.6).
+        let mut request = tonic::Request::new(request);
+        if let Ok(value) = traceparent.parse() {
+            request
+                .metadata_mut()
+                .insert(trace::TRACEPARENT_HEADER, value);
+        }
+
         match client.execute(request).await {
             Ok(response) => {
                 span.record("outcome", "answered");
@@ -340,6 +352,9 @@ async fn publish(
     fields(
         function_id = %function_id,
         bytes = body.len(),
+        // Recorded first thing in the body, so every span underneath this one
+        // carries the caller's trace id (§22.6).
+        trace_id = tracing::field::Empty,
         tenant = tracing::field::Empty,
         deadline_ms = tracing::field::Empty,
     )
@@ -350,28 +365,45 @@ async fn execute(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(tenant) = tenant_of(&headers) else {
-        return unauthorized().into_response();
+    // Before anything that can fail: a rejected request is exactly the one a
+    // caller most wants to find in its own trace.
+    let trace = trace::TraceContext::adopt(
+        headers
+            .get(trace::TRACEPARENT_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    );
+    tracing::Span::current().record("trace_id", trace.trace_id.as_str());
+
+    // Answered as an `Answer` throughout so the trace id can be stamped on
+    // every exit in one place — including the ones that never reach a worker.
+    let answer = answer_for(&gateway, &function_id, &headers, body, &trace).await;
+    answer.with_trace(&trace).into_response()
+}
+
+async fn answer_for(
+    gateway: &Gateway,
+    function_id: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    trace: &trace::TraceContext,
+) -> Answer {
+    let Some(tenant) = tenant_of(headers) else {
+        return unauthorized();
     };
     tracing::Span::current().record("tenant", tenant.as_str());
 
-    let Some(deadline_ms) = deadline_of(&headers) else {
+    let Some(deadline_ms) = deadline_of(headers) else {
         return fault(
             StatusCode::BAD_REQUEST,
             "invalid_deadline",
             format!("{DEADLINE_HEADER} must be a whole number of milliseconds"),
-        )
-        .into_response();
+        );
     };
     tracing::Span::current().record("deadline_ms", deadline_ms);
 
     // Unkeyed is the common path and stays exactly as it was.
-    let key = match idempotency_key_of(&headers) {
-        None => {
-            return run(&gateway, &function_id, tenant, deadline_ms, body)
-                .await
-                .into_response()
-        }
+    let key = match idempotency_key_of(headers) {
+        None => return run(gateway, function_id, tenant, deadline_ms, body, trace).await,
         Some(Err(())) => {
             return fault(
                 StatusCode::BAD_REQUEST,
@@ -381,14 +413,13 @@ async fn execute(
                     idempotency::MAX_KEY_BYTES
                 ),
             )
-            .into_response()
         }
         Some(Ok(key)) => key,
     };
 
     let slot = idempotency::Slot {
         tenant: tenant.clone(),
-        function_id: function_id.clone(),
+        function_id: function_id.to_string(),
         key,
     };
 
@@ -396,7 +427,7 @@ async fn execute(
         idempotency::Claim::Replay(mut answer) => {
             tracing::info!(status = answer.status.as_u16(), "replayed a keyed request");
             answer.replayed = true;
-            answer.into_response()
+            answer
         }
         // §22.4: a duplicate arriving while the first is still running is told
         // to wait, not served a second execution. Returning the *original*
@@ -406,16 +437,15 @@ async fn execute(
             StatusCode::CONFLICT,
             "idempotency_in_flight",
             "a request with this Idempotency-Key is already running",
-        )
-        .into_response(),
+        ),
         // The claim is a guard: if this future is dropped — a client that hung
         // up mid-request, which is precisely the case the key exists for — the
         // slot is released rather than left answering 409 until the TTL runs
         // out.
         idempotency::Claim::Proceed(claim) => {
-            let answer = run(&gateway, &function_id, tenant, deadline_ms, body).await;
+            let answer = run(gateway, function_id, tenant, deadline_ms, body, trace).await;
             claim.finish(&answer, answer.replayable(), answer.weight());
-            answer.into_response()
+            answer
         }
     }
 }
@@ -426,6 +456,7 @@ async fn run(
     tenant: String,
     deadline_ms: u32,
     body: Bytes,
+    trace: &trace::TraceContext,
 ) -> Answer {
     let Some(content_hash) = gateway.content_hash_of(function_id) else {
         return fault(
@@ -451,16 +482,26 @@ async fn run(
         function_id: function_id.to_string(),
         content_hash,
         body: body.to_vec(),
-        request_id: format!("{function_id}-{}", plan.len()),
+        // The trace id, not a synthesised label: it is unique per request
+        // and it is the same id the caller and the worker both log, which is
+        // the only property that makes a request id worth having.
+        request_id: trace.trace_id.clone(),
         deadline_ms,
         partition_key: None,
         tenant,
     };
 
+    // A fresh parent per attempt: a retry is a second hop and should appear
+    // in the trace as one, not as a mysterious repeat of the first (§22.6).
+    let traceparent = trace.outgoing(&trace::current_span_id());
+
     // §10.2: at most one retry, and only when the first attempt was never sent.
     let mut last_status = None;
     for (index, (_node, address)) in plan.iter().take(2).enumerate() {
-        match gateway.dispatch(address, request.clone()).await {
+        match gateway
+            .dispatch(address, request.clone(), &traceparent)
+            .await
+        {
             Attempt::Answered(response) => return to_http(response, deadline_ms),
             Attempt::NotSent => continue,
             Attempt::Failed(status) => {
@@ -540,6 +581,7 @@ fn to_http(response: ExecuteResponse, deadline_ms: u32) -> Answer {
         // and silently got 5 s would otherwise read a `timeout` fault as a bug.
         deadline_ms: Some(deadline_ms),
         replayed: false,
+        trace_id: None,
     }
 }
 
@@ -589,6 +631,10 @@ pub struct Answer {
     deadline_ms: Option<u32>,
     /// Set on a replay so a caller can tell one from a fresh execution.
     replayed: bool,
+    /// The trace this request belonged to (§22.6). Stamped on every exit, so a
+    /// caller can find a rejected request in its own trace — those are the ones
+    /// it most wants to find.
+    trace_id: Option<String>,
 }
 
 impl Answer {
@@ -603,6 +649,14 @@ impl Answer {
             self.fault,
             None | Some("trap") | Some("timeout") | Some("fuel_exhausted") | Some("memory_limit")
         )
+    }
+
+    /// Stamps the current trace, overwriting whatever a replayed answer
+    /// carried — the id belongs to *this* request, not to the one that
+    /// originally produced the body.
+    fn with_trace(mut self, trace: &trace::TraceContext) -> Self {
+        self.trace_id = Some(trace.trace_id.clone());
+        self
     }
 
     /// What this costs the idempotency store, for its byte budget.
@@ -651,6 +705,13 @@ impl IntoResponse for Answer {
         if self.replayed {
             headers.insert(REPLAY_HEADER, HeaderValue::from_static("true"));
         }
+        if let Some(value) = self
+            .trace_id
+            .as_deref()
+            .and_then(|id| HeaderValue::from_str(id).ok())
+        {
+            headers.insert(trace::TRACE_ID_HEADER, value);
+        }
 
         (self.status, headers, self.body).into_response()
     }
@@ -666,6 +727,7 @@ fn fault(status: StatusCode, kind: &'static str, detail: impl Into<String>) -> A
         exec_micros: None,
         deadline_ms: None,
         replayed: false,
+        trace_id: None,
     }
 }
 

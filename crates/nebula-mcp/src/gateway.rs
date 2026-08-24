@@ -18,6 +18,13 @@ pub const FAULT_HEADER: &str = "x-nebula-fault";
 /// Read by the gateway; echoed back with the budget that was actually applied.
 pub const DEADLINE_HEADER: &str = "x-nebula-deadline-ms";
 
+/// W3C trace context, forwarded verbatim (§22.6).
+///
+/// Passed through rather than parsed: the gateway validates it and mints a
+/// fresh trace when it cannot, so a second parser here would be a second place
+/// to disagree about the format for no gain.
+pub const TRACEPARENT_HEADER: &str = "traceparent";
+
 /// Where to reach the cluster, and as whom.
 #[derive(Clone)]
 pub struct Gateway {
@@ -52,8 +59,19 @@ impl Gateway {
         &self,
         function_id: &str,
         deadline_ms: u32,
+        traceparent: Option<&str>,
         body: &[u8],
     ) -> io::Result<Reply> {
+        // A tool call that does not carry the agent's trace is precisely the
+        // opaque gap §22.6 exists to close, so this hop forwards what it was
+        // given. A header value with a newline in it would be request
+        // splitting, so anything that is not the shape of a `traceparent` is
+        // dropped and the gateway mints a fresh trace instead.
+        let trace = match traceparent {
+            Some(value) if is_traceparent(value) => format!("{TRACEPARENT_HEADER}: {value}\r\n"),
+            _ => String::new(),
+        };
+
         let head = format!(
             "POST /execute/{function_id} HTTP/1.1\r\n\
              Host: nebula\r\n\
@@ -61,7 +79,8 @@ impl Gateway {
              Authorization: Bearer {}\r\n\
              Content-Type: application/octet-stream\r\n\
              Content-Length: {}\r\n\
-             {DEADLINE_HEADER}: {deadline_ms}\r\n\r\n",
+             {DEADLINE_HEADER}: {deadline_ms}\r\n\
+             {trace}\r\n",
             self.token,
             body.len()
         );
@@ -74,6 +93,12 @@ impl Gateway {
         stream.read_to_end(&mut raw).await?;
         parse(&raw)
     }
+}
+
+/// Hex, dashes, and a sane length — enough that a forwarded value cannot
+/// smuggle a second header, which is the only thing that would matter here.
+fn is_traceparent(value: &str) -> bool {
+    (11..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
 fn parse(raw: &[u8]) -> io::Result<Reply> {

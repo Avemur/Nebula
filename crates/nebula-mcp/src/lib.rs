@@ -35,7 +35,7 @@ pub mod gateway;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -162,7 +162,14 @@ fn tool_result(id: Value, text: String, is_error: bool) -> Response {
     )
 }
 
-async fn handle(State(server): State<Arc<Server>>, body: String) -> Response {
+async fn handle(State(server): State<Arc<Server>>, headers: HeaderMap, body: String) -> Response {
+    // Forwarded so the sandbox call lands inside the agent's own trace rather
+    // than as an unexplained gap in it (§22.6).
+    let traceparent = headers
+        .get(crate::gateway::TRACEPARENT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
     let Ok(rpc) = serde_json::from_str::<Rpc>(&body) else {
         // No id could be parsed, so the spec's null-id form is the only honest
         // answer.
@@ -186,12 +193,17 @@ async fn handle(State(server): State<Arc<Server>>, body: String) -> Response {
         ),
         "ping" => result(id, json!({})),
         "tools/list" => result(id, json!({"tools": [server.descriptor()]})),
-        "tools/call" => call_tool(&server, id, rpc.params).await,
+        "tools/call" => call_tool(&server, id, rpc.params, traceparent.as_deref()).await,
         other => error(id, METHOD_NOT_FOUND, format!("unknown method `{other}`")),
     }
 }
 
-async fn call_tool(server: &Server, id: Value, params: Value) -> Response {
+async fn call_tool(
+    server: &Server,
+    id: Value,
+    params: Value,
+    traceparent: Option<&str>,
+) -> Response {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -223,7 +235,12 @@ async fn call_tool(server: &Server, id: Value, params: Value) -> Response {
 
     let reply = match server
         .gateway
-        .execute(&server.function_id, timeout_ms, source.as_bytes())
+        .execute(
+            &server.function_id,
+            timeout_ms,
+            traceparent,
+            source.as_bytes(),
+        )
         .await
     {
         Ok(reply) => reply,

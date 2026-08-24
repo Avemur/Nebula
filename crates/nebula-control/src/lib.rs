@@ -13,6 +13,7 @@ pub mod membership;
 pub mod registry;
 pub mod ring;
 pub mod server;
+pub mod trace;
 pub mod wizer;
 
 /// Structured span output on stdout (§14).

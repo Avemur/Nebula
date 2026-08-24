@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use nebula_mcp::gateway::{Gateway, DEADLINE_HEADER, FAULT_HEADER};
+use nebula_mcp::gateway::{Gateway, DEADLINE_HEADER, FAULT_HEADER, TRACEPARENT_HEADER};
 use nebula_mcp::{Server, MAX_TIMEOUT_MS, PROTOCOL_VERSION, TOOL_NAME};
 use serde_json::{json, Value};
 
@@ -29,6 +29,7 @@ struct Seen {
     function_id: String,
     token: String,
     deadline_ms: String,
+    traceparent: String,
     body: String,
 }
 
@@ -64,6 +65,7 @@ async fn stub_execute(
         function_id,
         token: header("authorization"),
         deadline_ms: header(DEADLINE_HEADER),
+        traceparent: header(TRACEPARENT_HEADER),
         body,
     });
 
@@ -163,8 +165,12 @@ impl Harness {
     /// One JSON-RPC round trip. Returns `(status, parsed body)`; the body is
     /// `Null` for the 202 that acknowledges a notification.
     async fn rpc(&self, request: Value) -> (u16, Value) {
+        self.rpc_with(request, &[]).await
+    }
+
+    async fn rpc_with(&self, request: Value, extra: &[(&str, &str)]) -> (u16, Value) {
         let body = request.to_string();
-        let raw = raw_post(&self.mcp, "/mcp", &body).await;
+        let raw = raw_post_with(&self.mcp, "/mcp", &body, extra).await;
         let split = raw
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
@@ -204,14 +210,22 @@ impl Harness {
 }
 
 async fn raw_post(addr: &str, path: &str, body: &str) -> Vec<u8> {
+    raw_post_with(addr, path, body, &[]).await
+}
+
+async fn raw_post_with(addr: &str, path: &str, body: &str, extra: &[(&str, &str)]) -> Vec<u8> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
-    let head = format!(
+    let mut head = format!(
         "POST {path} HTTP/1.1\r\nHost: mcp\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+         Content-Type: application/json\r\nContent-Length: {}\r\n",
         body.len()
     );
+    for (name, value) in extra {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await.unwrap();
     stream.write_all(body.as_bytes()).await.unwrap();
 
@@ -468,4 +482,61 @@ async fn an_unreachable_cluster_is_a_tool_error_not_a_transport_error() {
 fn the_header_names_still_match_the_gateways() {
     assert_eq!(FAULT_HEADER, nebula_control::gateway::FAULT_HEADER);
     assert_eq!(DEADLINE_HEADER, nebula_control::gateway::DEADLINE_HEADER);
+    assert_eq!(
+        TRACEPARENT_HEADER,
+        nebula_control::trace::TRACEPARENT_HEADER
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trace context (§22.6)
+// ---------------------------------------------------------------------------
+
+const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+#[tokio::test]
+async fn an_agents_trace_is_carried_into_the_sandbox_call() {
+    let harness = Harness::start().await;
+    harness.answer_with(StatusCode::OK, None, "ok");
+
+    // Without this the tool call is an unexplained gap in the agent's trace,
+    // which is the exact complaint §22.6 opens with.
+    harness
+        .rpc_with(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": TOOL_NAME, "arguments": {"source": "1"}}
+            }),
+            &[("traceparent", TRACEPARENT)],
+        )
+        .await;
+
+    assert_eq!(harness.last_seen().traceparent, TRACEPARENT);
+}
+
+#[tokio::test]
+async fn an_untraced_call_forwards_nothing_and_a_dangerous_one_is_dropped() {
+    let harness = Harness::start().await;
+    harness.answer_with(StatusCode::OK, None, "ok");
+
+    harness.call(json!({"source": "1"})).await;
+    assert_eq!(
+        harness.last_seen().traceparent,
+        "",
+        "nothing to forward means forward nothing; the gateway mints an id"
+    );
+
+    // A forwarded header is attacker-influenced text going into a request this
+    // server writes by hand. A CR in it would be a second header, so anything
+    // that is not the shape of a traceparent never reaches the wire.
+    harness
+        .rpc_with(
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": TOOL_NAME, "arguments": {"source": "1"}}
+            }),
+            &[("traceparent", "00-abc-def-01 evil")],
+        )
+        .await;
+    assert_eq!(harness.last_seen().traceparent, "");
 }

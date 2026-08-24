@@ -831,3 +831,134 @@ async fn a_client_that_disconnects_does_not_wedge_its_own_key() {
         "a retry after a disconnect must run, not hit a wedged slot"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Trace context (§22.6)
+// ---------------------------------------------------------------------------
+
+/// A well-formed W3C `traceparent`, from the spec's own example.
+const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+const CALLER_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+#[tokio::test]
+async fn a_callers_trace_id_is_adopted_and_reported_back() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    let response = cluster
+        .post_with("echo", "acme", &[("traceparent", TRACEPARENT)], b"hi")
+        .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.header("x-nebula-trace-id"),
+        Some(CALLER_TRACE_ID),
+        "the tool call must appear inside the caller's trace, not a new one"
+    );
+}
+
+#[tokio::test]
+async fn a_request_without_a_traceparent_still_gets_an_id_it_can_be_told() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    let first = cluster.post("echo", "acme", b"hi").await;
+    let second = cluster.post("echo", "acme", b"hi").await;
+
+    let (Some(a), Some(b)) = (
+        first.header("x-nebula-trace-id"),
+        second.header("x-nebula-trace-id"),
+    ) else {
+        panic!("a minted trace id is useless if the caller is never told it");
+    };
+    assert_eq!(a.len(), 32);
+    assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(a, b, "two requests must not share a trace id");
+}
+
+#[tokio::test]
+async fn broken_caller_instrumentation_does_not_break_the_call() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    // W3C says a malformed header starts a new trace. Refusing the request
+    // would mean a caller's tracing bug takes down its tool calls, which is a
+    // spectacularly bad trade.
+    for bad in ["garbage", "00-tooshort-00f067aa0ba902b7-01", ""] {
+        let response = cluster
+            .post_with("echo", "acme", &[("traceparent", bad)], b"hi")
+            .await;
+        assert_eq!(
+            response.status, 200,
+            "traceparent {bad:?} broke the request"
+        );
+
+        let id = response
+            .header("x-nebula-trace-id")
+            .expect("a fresh trace should still be reported");
+        assert_eq!(id.len(), 32, "{bad:?} produced {id}");
+        assert_ne!(id, CALLER_TRACE_ID);
+    }
+}
+
+#[tokio::test]
+async fn a_rejected_request_is_still_findable_in_the_callers_trace() {
+    let cluster = Cluster::start(Duration::from_secs(5)).await;
+
+    // The failures are the ones a caller most wants to find. A trace id
+    // stamped only on success is a trace id that is missing exactly when it is
+    // needed, so every exit gets one — including the ones that never reach a
+    // worker at all.
+    let unauthorized = http(
+        &cluster.http_addr,
+        "POST",
+        "/execute/echo",
+        None,
+        &[("traceparent", TRACEPARENT)],
+        b"hi",
+    )
+    .await;
+    assert_eq!(unauthorized.status, 401);
+    assert_eq!(
+        unauthorized.header("x-nebula-trace-id"),
+        Some(CALLER_TRACE_ID)
+    );
+
+    let unknown = cluster
+        .post_with("nothing-here", "acme", &[("traceparent", TRACEPARENT)], b"")
+        .await;
+    assert_eq!(unknown.status, 404);
+    assert_eq!(unknown.header("x-nebula-trace-id"), Some(CALLER_TRACE_ID));
+
+    cluster.publish("echo", ECHO).await;
+    let no_worker = cluster
+        .post_with("echo", "acme", &[("traceparent", TRACEPARENT)], b"")
+        .await;
+    assert_eq!(no_worker.status, 503);
+    assert_eq!(no_worker.header("x-nebula-trace-id"), Some(CALLER_TRACE_ID));
+}
+
+#[tokio::test]
+async fn a_replayed_answer_reports_the_trace_that_asked_for_it() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+    cluster.publish("echo", ECHO).await;
+
+    let key = ("Idempotency-Key", "traced");
+    let first = cluster
+        .post_with("echo", "acme", &[key, ("traceparent", TRACEPARENT)], b"hi")
+        .await;
+    assert_eq!(first.header("x-nebula-trace-id"), Some(CALLER_TRACE_ID));
+
+    // The body is replayed; the trace id is not. It belongs to *this* request,
+    // and reporting the original one would point a caller at a trace it was
+    // never part of.
+    let second = cluster.post_with("echo", "acme", &[key], b"hi").await;
+    assert_eq!(second.header("x-nebula-idempotent-replay"), Some("true"));
+    let replayed = second
+        .header("x-nebula-trace-id")
+        .expect("a replay is still a request");
+    assert_ne!(replayed, CALLER_TRACE_ID);
+}
