@@ -43,6 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry_dir =
         std::env::var("NEBULA_REGISTRY_DIR").unwrap_or_else(|_| "/tmp/nebula-registry".to_string());
 
+    // §13. All three variables or none; half a configuration is refused rather
+    // than silently downgraded.
+    let mesh_tls = nebula_proto::tls::MeshTls::from_env()?;
+
     let membership = Arc::new(Membership::with_defaults());
     let registry = Arc::new(Registry::new(&registry_dir)?);
 
@@ -51,7 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_addr =
         std::env::var("NEBULA_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let enforcing = auth.is_enforcing();
-    let gateway = Arc::new(Gateway::open(membership.clone(), registry.clone())?.with_auth(auth));
+    let gateway = Arc::new(
+        Gateway::open(membership.clone(), registry.clone())?
+            .with_auth(auth)
+            .with_mesh_tls(mesh_tls.clone()),
+    );
     let listener = tokio::net::TcpListener::bind(&http_addr).await?;
     tokio::spawn(async move {
         let _ = gateway::serve(listener, gateway).await;
@@ -63,13 +71,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // knows they have none.
     if enforcing {
         println!("nebula-control: bearer tokens must be signed; mint with `nebula-control mint <tenant>`");
+        if mesh_tls.is_some() {
+            println!("nebula-control: internal gRPC requires mutual TLS");
+        } else {
+            println!(
+            "nebula-control: WARNING internal gRPC is unauthenticated plaintext. Anyone who can              reach this port can act as any tenant. Set {}, {} and {} to require              mutual TLS.",
+            nebula_proto::tls::CA_ENV,
+            nebula_proto::tls::CERT_ENV,
+            nebula_proto::tls::KEY_ENV
+        );
+        }
     } else {
         println!(
             "nebula-control: WARNING authentication is OFF -- the bearer token is taken as the              tenant id, so any caller can be any tenant. Set {} to require signed tokens.",
             nebula_control::auth::SECRET_ENV
         );
     }
-    Server::builder()
+    let mut server = Server::builder();
+    if let Some(tls) = &mesh_tls {
+        server = server.tls_config(tls.server())?;
+    }
+    server
         .add_service(NebulaControlServer::new(ControlService::new(
             membership, registry,
         )))

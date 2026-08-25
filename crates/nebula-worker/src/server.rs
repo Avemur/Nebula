@@ -87,12 +87,26 @@ impl WorkerService {
         pool: Arc<ExecPool>,
         control_endpoint: &str,
     ) -> Result<Self, tonic::transport::Error> {
-        let channel =
-            tonic::transport::Endpoint::from_shared(control_endpoint.to_string())?.connect_lazy();
+        Self::with_mesh_tls(runtime, pool, control_endpoint, None)
+    }
+
+    /// As [`WorkerService::new`], speaking mutual TLS to the control plane (§13).
+    pub fn with_mesh_tls(
+        runtime: Arc<Runtime>,
+        pool: Arc<ExecPool>,
+        control_endpoint: &str,
+        tls: Option<nebula_proto::tls::MeshTls>,
+    ) -> Result<Self, tonic::transport::Error> {
+        let url = nebula_proto::tls::endpoint(control_endpoint, tls.is_some());
+        let endpoint = tonic::transport::Endpoint::from_shared(url)?;
+        let endpoint = match &tls {
+            Some(tls) => endpoint.tls_config(tls.client())?,
+            None => endpoint,
+        };
         Ok(Self {
             runtime,
             pool,
-            control: NebulaControlClient::new(channel),
+            control: NebulaControlClient::new(endpoint.connect_lazy()),
             artifacts: Mutex::new(HashMap::new()),
             draining: AtomicBool::new(false),
         })

@@ -14,5 +14,6 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 # The mesh test drives a real control plane, not a mock of one.
 nebula-control.workspace = true
+rcgen = "0.14.9"
 # Only the §22.2 tool-descriptor tests need it, and only to read a response.
 serde_json.workspace = true

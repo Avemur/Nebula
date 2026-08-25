@@ -1009,6 +1009,23 @@ another tenant's data, or escape to the host.
 | Poisoned AOT cache | L2 keyed by artifact hash + engine config + wasmtime version; worker-writable only |
 | Compile bombs | Size cap and compile timeout at deploy time, not request time |
 
+**The mesh authenticates its own members (§21, now built).** The bearer token
+on the gateway was the front door; the worker's gRPC port was the side door.
+`Execute` carries a `tenant` field the worker trusts, and everything §22
+isolates keys on it, so anyone able to route a packet to a worker could act as
+any tenant no matter what the gateway checked.
+
+Mutual TLS closes that. A node is admitted by holding a key signed by the mesh
+CA, and every node presents a certificate for the same name rather than for its
+address: identity belongs to the certificate, not to DNS, so a worker can move
+without being reissued and the ring's addresses stay out of the trust model.
+Issuing a certificate is the act that admits a node.
+
+There is no revocation list and no rotation story beyond reissuing and
+restarting. A CRL needs somewhere to publish it and something to poll it, which
+is infrastructure rather than a question; short-lived certificates are the
+answer when that stops being enough.
+
 **Authentication is HMAC-signed bearer tokens.** A token is `tenant.signature`,
 where the signature is a SHA-256 HMAC over the tenant id under a secret only the
 control plane holds. That makes the tenant a *fact* rather than a claim, which
@@ -1064,8 +1081,11 @@ a decision about that host rather than about this code.
   list. Rotating `NEBULA_AUTH_SECRET` invalidates everything at once. **Off
   unless that variable is set**, and the control plane says so loudly at
   startup; see §13.
-- **Internal gRPC is unauthenticated plaintext** on a trusted network. mTLS is a
-  known, deferred hardening step.
+- **Internal gRPC speaks mutual TLS** when `NEBULA_TLS_CA`, `NEBULA_TLS_CERT`
+  and `NEBULA_TLS_KEY` are set, and unauthenticated plaintext when they are not.
+  Both binaries say which at startup. Setting some but not all is refused rather
+  than downgraded: a port that presents a certificate and does not demand one is
+  encrypted and open, which reads as secure and is not.
 
 ### Invariants for review
 
@@ -1624,7 +1644,6 @@ v1, they replace Phase 4. They do not fit alongside it.
 | S3-backed registry, workers pulling directly | When cold-start rate makes the control plane a measured bottleneck |
 | Replicated pre-warming (N nodes per function) | When failover cold starts show up in p99 |
 | Adaptive concurrency limiter (AIMD/Vegas) | When a static limit is measurably wrong across workloads |
-| mTLS on internal gRPC | Before any deployment on an untrusted network |
 | Multi-instance control plane | When the SPOF matters more than the simplicity |
 | WASI preview 2 / component model | When guest toolchains emit components as reliably as p1 modules |
 | Per-tenant rate limiting at the gateway | Before multi-tenant exposure to untrusted callers, an agent in a retry loop is one. **Built**, §22.7 |

@@ -115,6 +115,8 @@ pub struct Gateway {
     workers: Mutex<HashMap<String, NebulaWorkerClient<Channel>>>,
     /// Answers to already-served keyed requests (§22.4).
     idempotency: idempotency::Store<Answer>,
+    /// Mesh TLS, when the operator configured it (§13).
+    mesh_tls: Option<nebula_proto::tls::MeshTls>,
     /// Per-tenant fairness (§22.7). Two buckets, because a deploy runs Wizer
     /// and an execution does not.
     execute_limit: Limiter,
@@ -183,10 +185,21 @@ impl Gateway {
             functions: Mutex::new(functions),
             workers: Mutex::new(HashMap::new()),
             idempotency: idempotency::Store::new(),
+            mesh_tls: None,
             execute_limit: Limiter::new(Limit::EXECUTE),
             deploy_limit: Limiter::new(Limit::DEPLOY),
             auth: Auth::Insecure,
         })
+    }
+
+    /// Speaks mutual TLS to the workers (§13).
+    ///
+    /// Both halves of the mesh have to agree: a gateway with TLS and a worker
+    /// without will fail to connect, which is why the binaries print which mode
+    /// they are in.
+    pub fn with_mesh_tls(mut self, tls: Option<nebula_proto::tls::MeshTls>) -> Self {
+        self.mesh_tls = tls;
+        self
     }
 
     /// Requires signed bearer tokens (§13).
@@ -388,11 +401,16 @@ impl Gateway {
         if let Some(existing) = self.workers.lock().unwrap().get(address) {
             return Some(existing.clone());
         }
-        let channel = Endpoint::from_shared(format!("http://{address}"))
-            .ok()?
-            .connect()
-            .await
-            .ok()?;
+        let endpoint = Endpoint::from_shared(nebula_proto::tls::endpoint(
+            address,
+            self.mesh_tls.is_some(),
+        ))
+        .ok()?;
+        let endpoint = match &self.mesh_tls {
+            Some(tls) => endpoint.tls_config(tls.client()).ok()?,
+            None => endpoint,
+        };
+        let channel = endpoint.connect().await.ok()?;
         let client = NebulaWorkerClient::new(channel);
         self.workers
             .lock()

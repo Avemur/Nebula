@@ -1,8 +1,15 @@
 //! Generated gRPC contracts for Nebula (README.md §11.2).
 //!
-//! Nothing is hand-written here. The source of truth is `proto/nebula.proto`;
-//! this crate exists so codegen and `protoc` are a dependency of one crate
-//! rather than of every crate that speaks gRPC.
+//! Almost nothing is hand-written here. The source of truth is
+//! `proto/nebula.proto`, and this crate exists so codegen and `protoc` are a
+//! dependency of one crate rather than of every crate that speaks gRPC.
+//!
+//! The exception is [`tls`], which configures the transport the generated
+//! clients and servers run on. It lives here because both halves of the mesh
+//! need identical settings and a mesh whose two sides disagree about TLS is a
+//! mesh that fails at connect time with a message about a URL scheme.
+
+pub mod tls;
 
 tonic::include_proto!("nebula.v1");
 

@@ -27,14 +27,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Expensive: reserves the pooling allocator's address space and starts the
     // epoch ticker. One per process, never per request.
+    // §13. All three variables or none.
+    let mesh_tls = nebula_proto::tls::MeshTls::from_env()?;
+
     let runtime = Arc::new(Runtime::new(&cache_dir)?.with_egress(egress.clone()));
     let pool = Arc::new(ExecPool::with_default_size(runtime.clone()));
-    let service = WorkerService::new(runtime.clone(), pool.clone(), &control)?;
+    let service =
+        WorkerService::with_mesh_tls(runtime.clone(), pool.clone(), &control, mesh_tls.clone())?;
 
     let identity = Identity::new(format!("worker-{addr}"), &addr);
-    let mut client = NebulaControlClient::new(
-        tonic::transport::Endpoint::from_shared(control.clone())?.connect_lazy(),
-    );
+    let heartbeat_endpoint = tonic::transport::Endpoint::from_shared(nebula_proto::tls::endpoint(
+        &control,
+        mesh_tls.is_some(),
+    ))?;
+    let heartbeat_endpoint = match &mesh_tls {
+        Some(tls) => heartbeat_endpoint.tls_config(tls.client())?,
+        None => heartbeat_endpoint,
+    };
+    let mut client = NebulaControlClient::new(heartbeat_endpoint.connect_lazy());
 
     // A worker that cannot reach the control plane yet still serves; the
     // heartbeat loop keeps trying, and cold starts recover once it is up.
@@ -61,12 +71,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Printed either way. An operator who meant to enable egress and typoed the
     // variable would otherwise find out from a guest's `-1`, and an operator
     // who did *not* mean to enable it should see that it is on.
+    if mesh_tls.is_some() {
+        println!("nebula-worker: internal gRPC requires mutual TLS");
+    } else {
+        println!(
+            "nebula-worker: WARNING internal gRPC is unauthenticated plaintext. Anyone who can              reach this port can act as any tenant. Set {}, {} and {} to require              mutual TLS.",
+            nebula_proto::tls::CA_ENV,
+            nebula_proto::tls::CERT_ENV,
+            nebula_proto::tls::KEY_ENV
+        );
+    }
     if egress.is_enabled() {
         println!("nebula-worker: outbound HTTP enabled for {egress:?}");
     } else {
         println!("nebula-worker: outbound HTTP disabled (set NEBULA_EGRESS_ALLOW to enable)");
     }
-    Server::builder()
+    let mut server = Server::builder();
+    if let Some(tls) = &mesh_tls {
+        server = server.tls_config(tls.server())?;
+    }
+    server
         .add_service(NebulaWorkerServer::new(service))
         .serve(addr.parse()?)
         .await?;
