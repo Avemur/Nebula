@@ -348,8 +348,11 @@ impl Cluster {
 #[tokio::test(flavor = "multi_thread")]
 async fn http_execute_round_trips_through_the_cluster() {
     let mut cluster = Cluster::start(Duration::from_secs(30)).await;
-    cluster.add_worker(2, 4).await;
 
+    // Deployed before any worker exists, so nothing precompiles it (§19) and
+    // the first request is genuinely cold. With a worker already up this would
+    // report warm, which is the point of precompilation and would make the
+    // assertion below untrue for a reason unrelated to what this test is for.
     let deployed = http(
         &cluster.http_addr,
         "PUT",
@@ -362,6 +365,7 @@ async fn http_execute_round_trips_through_the_cluster() {
     assert_eq!(deployed.status, 201);
     assert!(deployed.text().contains("content_hash"));
 
+    cluster.add_worker(2, 4).await;
     let response = cluster.post("echo", "acme", b"hello over http").await;
     assert_eq!(response.status, 200, "body was {}", response.text());
     assert_eq!(response.body, b"hello over http");
@@ -1289,10 +1293,15 @@ async fn a_malformed_partition_key_is_refused_rather_than_ignored() {
 #[tokio::test]
 async fn sessions_of_one_function_spread_across_workers() {
     let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+
+    // Deployed first, so deploy-time compilation (§19) reaches nobody and every
+    // worker starts genuinely cold. Precompilation warms the two ring
+    // candidates, which would leave exactly one worker able to report a cold
+    // start and quietly turn the count below into a constant.
+    cluster.publish("notepad", NOTEPAD).await;
     for _ in 0..3 {
         cluster.add_worker(2, 4).await;
     }
-    cluster.publish("notepad", NOTEPAD).await;
 
     // The test the two above cannot be: consistent hashing already pins one
     // *function* to one worker, so a notepad accumulates correctly even if the
@@ -1548,4 +1557,110 @@ async fn a_malformed_tenant_id_is_refused_even_without_signing() {
         assert_eq!(response.status, 401, "tenant {bad:?} was accepted");
     }
     assert_eq!(cluster.post("echo", "acme-prod_2", b"x").await.status, 200);
+}
+
+// ---------------------------------------------------------------------------
+// Deploy-time precompilation (§19)
+// ---------------------------------------------------------------------------
+
+/// Enough functions that Cranelift takes a measurable amount of time, which is
+/// the whole point: a trivial module compiles too fast to tell the difference.
+fn sized_module(seed: usize, target: usize) -> String {
+    let mut wat = String::with_capacity(target + 4096);
+    wat.push_str(
+        ECHO.trim_end()
+            .trim_end_matches(|c: char| c.is_whitespace()),
+    );
+    // ECHO closes the module on its last line; reopen by trimming that paren.
+    wat.pop();
+    let mut n = 0;
+    while wat.len() < target {
+        wat.push_str(&format!(
+            "\n  (func $f{seed}_{n} (param i32) (result i32) (i32.add (local.get 0) (i32.const {n})))"
+        ));
+        n += 1;
+    }
+    wat.push_str("\n)");
+    wat
+}
+
+#[tokio::test]
+async fn a_deployed_function_is_already_compiled_before_its_first_request() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+
+    let wat = sized_module(1, 512 << 10);
+    let deployed = http(
+        &cluster.http_addr,
+        "PUT",
+        "/functions/sized",
+        Some("acme"),
+        &[],
+        wat.as_bytes(),
+    )
+    .await;
+    assert_eq!(deployed.status, 201);
+
+    // The first request must not be the one that pays for Cranelift. §19
+    // measured cold start as compilation and almost nothing else, so a request
+    // that still had to compile would report itself cold.
+    let first = cluster
+        .post_with("sized", "acme", &[("X-Nebula-Deadline-Ms", "5000")], b"x")
+        .await;
+    assert_eq!(first.status, 200);
+    assert_eq!(
+        first.header("x-nebula-cold"),
+        Some("false"),
+        "the first request compiled the module, so precompilation did not happen"
+    );
+}
+
+#[tokio::test]
+async fn a_module_that_cannot_compile_is_refused_at_deploy() {
+    let mut cluster = Cluster::start(Duration::from_secs(5)).await;
+    cluster.add_worker(2, 4).await;
+
+    // Valid enough to pass the shape checks on the control plane, which has no
+    // compiler (§11.1), and rejected by the one place that does.
+    let broken = r#"(module (func (export "run") (i32.const 1)))"#;
+    let response = http(
+        &cluster.http_addr,
+        "PUT",
+        "/functions/broken",
+        Some("acme"),
+        &[],
+        broken.as_bytes(),
+    )
+    .await;
+
+    assert_eq!(response.status, 400, "{}", response.text());
+    assert!(
+        response.text().contains("does not compile"),
+        "{}",
+        response.text()
+    );
+
+    // And nothing was registered: a refused deploy must not leave the id
+    // pointing at an artifact nothing can run.
+    assert_eq!(cluster.post("broken", "acme", b"x").await.status, 404);
+}
+
+#[tokio::test]
+async fn a_deploy_still_succeeds_when_no_worker_can_precompile() {
+    let cluster = Cluster::start(Duration::from_secs(5)).await;
+
+    // No workers at all. Precompilation is an optimisation, and refusing to
+    // deploy because an optimisation could not run would trade a slow first
+    // request for no service.
+    let response = http(
+        &cluster.http_addr,
+        "PUT",
+        "/functions/echo",
+        Some("acme"),
+        &[],
+        ECHO.as_bytes(),
+    )
+    .await;
+    assert_eq!(response.status, 201);
+    assert_eq!(cluster.gateway.deployed(), 1);
 }

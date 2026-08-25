@@ -37,14 +37,31 @@ pub enum PoolError {
 #[derive(Debug)]
 pub struct Admitted(OwnedSemaphorePermit);
 
+/// What a pool thread was handed.
+///
+/// Compilation shares the pool with execution rather than going to
+/// `spawn_blocking`, and that is the same argument §5.2 makes for execution:
+/// Cranelift is unbounded CPU work, and unbounded CPU work on the reactor is
+/// the failure the pool exists to prevent. A precompile that has to wait for a
+/// slot is a precompile behaving correctly.
+enum Work {
+    Execute {
+        tenant: String,
+        /// The caller's partition key, namespacing the KV shim (§22.5).
+        session: String,
+        body: Vec<u8>,
+        deadline_ticks: u64,
+        reply: oneshot::Sender<wasmtime::Result<HostCtx>>,
+    },
+    /// Compile into L1 and L2 and report how long it took (§19).
+    Compile {
+        reply: oneshot::Sender<wasmtime::Result<u64>>,
+    },
+}
+
 struct Job {
     wasm: Arc<Vec<u8>>,
-    tenant: String,
-    /// The caller's partition key, namespacing the KV shim (§22.5).
-    session: String,
-    body: Vec<u8>,
-    deadline_ticks: u64,
-    reply: oneshot::Sender<wasmtime::Result<HostCtx>>,
+    work: Work,
     permit: OwnedSemaphorePermit,
     /// The span the request arrived on.
     ///
@@ -119,41 +136,57 @@ impl ExecPool {
 
                     let Job {
                         wasm,
-                        tenant,
-                        session,
-                        body,
-                        deadline_ticks,
-                        reply,
+                        work,
                         permit,
                         parent,
                     } = job;
 
                     queued.fetch_sub(1, Ordering::Relaxed);
                     in_flight.fetch_add(1, Ordering::Relaxed);
-                    let result = {
+                    {
                         let _parent = parent.enter();
-                        let span = tracing::info_span!(
-                            "wasm_execute",
-                            tenant = %tenant,
-                            deadline_ms = deadline_ticks,
-                            bytes = wasm.len()
-                        );
-                        let _entered = span.enter();
-                        runtime.execute_with_deadline(
-                            &wasm,
-                            HANDLER_EXPORT,
-                            &tenant,
-                            &session,
-                            body,
-                            deadline_ticks,
-                        )
-                    };
+                        match work {
+                            Work::Execute {
+                                tenant,
+                                session,
+                                body,
+                                deadline_ticks,
+                                reply,
+                            } => {
+                                let span = tracing::info_span!(
+                                    "wasm_execute",
+                                    tenant = %tenant,
+                                    deadline_ms = deadline_ticks,
+                                    bytes = wasm.len()
+                                );
+                                let _entered = span.enter();
+                                let result = runtime.execute_with_deadline(
+                                    &wasm,
+                                    HANDLER_EXPORT,
+                                    &tenant,
+                                    &session,
+                                    body,
+                                    deadline_ticks,
+                                );
+                                // Send first, then release the slot: a caller
+                                // that sees its result must not race a new
+                                // admission into a thread that has not finished
+                                // tidying up.
+                                let _ = reply.send(result);
+                            }
+                            Work::Compile { reply } => {
+                                let span = tracing::info_span!("precompile", bytes = wasm.len());
+                                let _entered = span.enter();
+                                let started = std::time::Instant::now();
+                                let result = runtime
+                                    .cache()
+                                    .get_or_compile(runtime.engine(), runtime.linker(), &wasm)
+                                    .map(|_| started.elapsed().as_micros() as u64);
+                                let _ = reply.send(result);
+                            }
+                        }
+                    }
                     in_flight.fetch_sub(1, Ordering::Relaxed);
-
-                    // Send first, then release the slot: a caller that sees its
-                    // result must not race a new admission into a thread that
-                    // has not finished tidying up.
-                    let _ = reply.send(result);
                     drop(permit);
                 }
             });
@@ -196,13 +229,39 @@ impl ExecPool {
         deadline_ticks: u64,
     ) -> Result<wasmtime::Result<HostCtx>, PoolError> {
         let (reply, wait) = oneshot::channel();
+        self.submit(
+            admitted,
+            wasm,
+            Work::Execute {
+                tenant,
+                session,
+                body,
+                deadline_ticks,
+                reply,
+            },
+        )?;
+        wait.await.map_err(|_| PoolError::Stopped)
+    }
+
+    /// Compiles `wasm` into this worker's caches, returning how long it took.
+    ///
+    /// The same admission control as an execution, because it is the same
+    /// resource: a precompile that jumped the queue would be a way to starve
+    /// the requests the queue exists to protect.
+    pub async fn compile(
+        &self,
+        admitted: Admitted,
+        wasm: Arc<Vec<u8>>,
+    ) -> Result<wasmtime::Result<u64>, PoolError> {
+        let (reply, wait) = oneshot::channel();
+        self.submit(admitted, wasm, Work::Compile { reply })?;
+        wait.await.map_err(|_| PoolError::Stopped)
+    }
+
+    fn submit(&self, admitted: Admitted, wasm: Arc<Vec<u8>>, work: Work) -> Result<(), PoolError> {
         let job = Job {
             wasm,
-            tenant,
-            session,
-            body,
-            deadline_ticks,
-            reply,
+            work,
             permit: admitted.0,
             parent: tracing::Span::current(),
         };
@@ -215,8 +274,7 @@ impl ExecPool {
                 TrySendError::Disconnected(_) => PoolError::Stopped,
             });
         }
-
-        wait.await.map_err(|_| PoolError::Stopped)
+        Ok(())
     }
 
     pub fn in_flight(&self) -> usize {

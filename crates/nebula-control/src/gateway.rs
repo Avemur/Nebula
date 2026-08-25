@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::Router;
 use nebula_proto::nebula_worker_client::NebulaWorkerClient;
-use nebula_proto::{ExecuteRequest, ExecuteResponse, Outcome};
+use nebula_proto::{ExecuteRequest, ExecuteResponse, Outcome, PrecompileRequest};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Code;
 
@@ -54,6 +54,12 @@ pub const FAULT_HEADER: &str = "x-nebula-fault";
 /// already the body, and a tool descriptor is metadata about the request rather
 /// than a second document to negotiate.
 pub const TOOL_SCHEMA_HEADER: &str = "x-nebula-tool-schema";
+
+/// How many ring candidates are asked to precompile a new artifact (§19).
+///
+/// Two: the owner and the node failover would reach first. A third would be
+/// paying for a case where two nodes have already gone.
+pub const PRECOMPILE_FANOUT: usize = 2;
 
 /// Bound on a tool descriptor. Generous — a real JSON Schema with descriptions
 /// on every property is a few kilobytes — and still a bound.
@@ -132,6 +138,9 @@ pub enum PublishError {
     InvalidId,
     /// The caller's module failed its own initializer. A 400.
     Wizer(String),
+    /// A worker could not compile the artifact. A 400, and the only moment
+    /// anyone can tell the caller (§19).
+    Compile(String),
     /// The `X-Nebula-Tool-Schema` header was not usable. A 400.
     InvalidTool(String),
     Io(std::io::Error),
@@ -142,6 +151,7 @@ impl std::fmt::Display for PublishError {
         match self {
             Self::InvalidId => f.write_str("function id must be 1..=128 bytes"),
             Self::Wizer(detail) => write!(f, "pre-initialization failed: {detail}"),
+            Self::Compile(detail) => write!(f, "the module does not compile: {detail}"),
             Self::InvalidTool(detail) => write!(f, "{TOOL_SCHEMA_HEADER} is unusable: {detail}"),
             Self::Io(err) => write!(f, "{err}"),
         }
@@ -204,6 +214,45 @@ impl Gateway {
         self.execute_limit = Limiter::new(execute);
         self.deploy_limit = Limiter::new(deploy);
         self
+    }
+
+    /// Asks the workers that would serve `function_id` to compile it now.
+    ///
+    /// The ring candidates rather than every worker: that is where requests go,
+    /// and compiling on a hundred nodes for a function two of them will serve is
+    /// work nobody asked for. A request routed by partition key (§22.5) can
+    /// still land elsewhere and compile lazily, which is the pre-existing
+    /// behaviour and remains the fallback everywhere.
+    ///
+    /// **A worker being unreachable is not a deploy failure.** Precompilation
+    /// is an optimisation; refusing to deploy because an optimisation could not
+    /// run would trade a slow first request for no service at all.
+    async fn precompile(&self, content_hash: &str, function_id: &str) -> Result<(), PublishError> {
+        let plan = self.membership.route_plan(function_id);
+        let request = PrecompileRequest {
+            content_hash: content_hash.to_string(),
+        };
+
+        for (_node, address) in plan.iter().take(PRECOMPILE_FANOUT) {
+            let Some(mut client) = self.client(address).await else {
+                continue;
+            };
+            match client.precompile(request.clone()).await {
+                Ok(response) => {
+                    let response = response.into_inner();
+                    if !response.compiled {
+                        return Err(PublishError::Compile(response.error));
+                    }
+                    tracing::info!(worker = %address, micros = response.micros, "precompiled");
+                }
+                Err(status) => {
+                    // Shed, unreachable, draining. All of them mean "not now",
+                    // none of them means "this artifact is bad".
+                    tracing::warn!(worker = %address, %status, "precompile skipped");
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn content_hash_of(&self, function_id: &str) -> Option<String> {
@@ -282,6 +331,17 @@ impl Gateway {
         tracing::Span::current().record("wizened", wizened);
 
         let content_hash = self.registry.put(&artifact).map_err(PublishError::Io)?;
+        // Compiled *before* the function is registered, not after. A failed
+        // compile must not leave `function_id` pointing at an artifact nothing
+        // can run: the deploy is refused, the map is untouched, and the orphaned
+        // artifact is collected once it goes stale.
+        //
+        // §11.1 named this as the fix "if that trade stops being acceptable".
+        // §19 measured that it had: cold start was 368 ms at 2 MiB, all of it
+        // Cranelift, and a malformed module surfaced as an `INTERNAL` on
+        // somebody's first request rather than as a 400 here.
+        self.precompile(&content_hash, function_id).await?;
+
         let described = tool.is_some();
         let mut functions = self.functions.lock().unwrap();
         functions
@@ -510,7 +570,10 @@ async fn publish(
         // A module whose own initializer fails is a bad artifact, and the caller
         // is the only one who can fix it.
         Err(
-            err @ (PublishError::Wizer(_) | PublishError::InvalidId | PublishError::InvalidTool(_)),
+            err @ (PublishError::Wizer(_)
+            | PublishError::InvalidId
+            | PublishError::InvalidTool(_)
+            | PublishError::Compile(_)),
         ) => (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
         Err(PublishError::Io(err)) => {
             tracing::error!("deploy of {function_id} failed: {err}");

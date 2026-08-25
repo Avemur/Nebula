@@ -392,10 +392,31 @@ async fn losing_a_worker_reshuffles_only_its_share_of_the_keyspace() {
     let survivors: Vec<String> = nodes.iter().filter(|n| **n != victim).cloned().collect();
     let compiles_before = cluster.compiles(&survivors);
     let lookups_before = cluster.lookups(&survivors);
+
+    // Where each function is served from, taken from the ring itself.
+    //
+    // This used to be inferred from new compiles on the survivors, which worked
+    // while a moved function had to be recompiled where it landed. Deploy-time
+    // compilation (§19) warms the failover candidate too, so a move now leaves
+    // no trace in the compile counter. Asking the ring is immune to that and is
+    // a more direct test of the claim, which is about consistent hashing rather
+    // than about caches.
+    let owner_before: Vec<String> = (0..FUNCTIONS)
+        .map(|n| {
+            cluster.membership.route_plan(&format!("fn-{n}"))[0]
+                .0
+                .clone()
+        })
+        .collect();
+    // Deploying compiles on the ring candidates ahead of any request (§19), so
+    // the steady-state count is that fanout and nothing more. A function served
+    // by a worker outside its candidates would add a compile, which is still
+    // exactly what this is watching for.
+    let expected = FUNCTIONS * nebula_control::gateway::PRECOMPILE_FANOUT;
     let cluster_compiles = cluster.compiles(&nodes);
     assert_eq!(
-        cluster_compiles, FUNCTIONS,
-        "steady state should compile each function exactly once"
+        cluster_compiles, expected,
+        "steady state should compile each function once per ring candidate"
     );
 
     // Kill one worker and let the reconciler notice, by beating only the others.
@@ -409,14 +430,24 @@ async fn losing_a_worker_reshuffles_only_its_share_of_the_keyspace() {
     // Phase 2: the same traffic against two workers.
     drive(&cluster, FUNCTIONS, ROUNDS).await;
 
-    let moved = cluster.compiles(&survivors) - compiles_before;
+    let moved = (0..FUNCTIONS)
+        .filter(|n| cluster.membership.route_plan(&format!("fn-{n}"))[0].0 != owner_before[*n])
+        .count();
+    let recompiles = cluster.compiles(&survivors) - compiles_before;
     let lookups = cluster.lookups(&survivors) - lookups_before;
-    let hit_ratio = (lookups - moved) as f64 / lookups as f64;
+    let hit_ratio = (lookups - recompiles) as f64 / lookups as f64;
     eprintln!(
-        "after losing 1 of 3: {moved} of {FUNCTIONS} functions moved \
-         ({:.0}% of the keyspace), phase-2 hit ratio {:.1}%",
+        "after losing 1 of 3: {moved} of {FUNCTIONS} functions moved          ({:.0}% of the keyspace), {recompiles} recompiles,          phase-2 hit ratio {:.1}%",
         100.0 * moved as f64 / FUNCTIONS as f64,
         hit_ratio * 100.0
+    );
+
+    // Failover is warm. A function moves to a node that was one of its
+    // deploy-time candidates (§19), so it already holds the compiled module and
+    // the move costs a route change and nothing else.
+    assert_eq!(
+        recompiles, 0,
+        "a moved function had to be recompiled, so precompilation missed its          failover candidate"
     );
 
     // A third of the keyspace, give or take the sampling noise of 100 keys over
@@ -584,7 +615,10 @@ async fn fifty_functions_spread_across_three_workers_and_stay_put() {
         let cache = cluster.worker(node).runtime.cache();
         compiles += cache.cranelift_compiles();
         hits += cache.l1_hits();
-        per_worker.push(cache.cranelift_compiles() + cache.l1_hits());
+        // L1 hits alone are the request count now. A compile used to be a
+        // request that missed; since §19 they happen at deploy, so counting
+        // them here would credit a worker with traffic it never served.
+        per_worker.push(cache.l1_hits());
     }
 
     let total = FUNCTIONS * ROUNDS;
@@ -593,15 +627,19 @@ async fn fifty_functions_spread_across_three_workers_and_stay_put() {
          {hits} L1 hits, per-worker {per_worker:?}"
     );
 
-    // Every function compiled exactly once across the whole cluster. That is a
-    // stronger claim than a hit ratio: it says no function was ever served by
-    // two different workers, which is precisely what ring affinity means. A
-    // ratio alone would still look healthy if a few functions flapped.
+    // Every function compiled exactly once per ring candidate, and never on a
+    // third worker. That is a stronger claim than a hit ratio: it says no
+    // function was ever served by a worker outside its candidates, which is
+    // precisely what ring affinity means. A ratio alone would still look
+    // healthy if a few functions flapped.
     assert_eq!(
-        compiles, FUNCTIONS,
-        "a function compiled more than once means it moved between workers"
+        compiles,
+        FUNCTIONS * nebula_control::gateway::PRECOMPILE_FANOUT,
+        "a function compiled more often than its ring candidates means it moved"
     );
-    assert_eq!(hits, total - FUNCTIONS);
+    // Deploy-time compilation means the requests themselves never miss: every
+    // function was already in L1 on the worker that serves it.
+    assert_eq!(hits, total);
 
     let hit_ratio = hits as f64 / total as f64;
     assert!(

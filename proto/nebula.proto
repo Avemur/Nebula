@@ -11,6 +11,10 @@ package nebula.v1;
 service NebulaWorker {
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
   rpc Drain(DrainRequest) returns (DrainResponse);
+  // Compile an artifact into this worker's cache before anyone asks for it.
+  // §19 measured cold start as dominated by Cranelift, so this moves that cost
+  // off the request path and onto the deploy.
+  rpc Precompile(PrecompileRequest) returns (PrecompileResponse);
 }
 
 // Served by the control plane, called by workers.
@@ -94,6 +98,20 @@ enum Outcome {
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
+
+message PrecompileRequest {
+  string content_hash = 1;
+}
+
+message PrecompileResponse {
+  // False when the artifact could not be compiled. `error` says why, and the
+  // control plane turns that into a 400: a module that cannot compile is the
+  // caller's to fix, and finding out at deploy beats finding out on someone's
+  // first request.
+  bool compiled = 1;
+  string error = 2;
+  uint64 micros = 3;
+}
 
 message DrainRequest {}
 

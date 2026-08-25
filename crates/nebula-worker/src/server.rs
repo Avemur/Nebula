@@ -10,6 +10,7 @@ use nebula_proto::nebula_control_client::NebulaControlClient;
 use nebula_proto::nebula_worker_server::NebulaWorker;
 use nebula_proto::{
     DrainRequest, DrainResponse, ExecuteRequest, ExecuteResponse, FetchModuleRequest, Outcome,
+    PrecompileRequest, PrecompileResponse,
 };
 use nebula_runtime::wasmtime::Trap;
 use nebula_runtime::{wasmtime, HostCtx, MemoryLimitExceeded, Runtime};
@@ -330,6 +331,58 @@ impl NebulaWorker for WorkerService {
         // answer for the question the gateway asks.
         response.cold = cold;
         Ok(Response::new(response))
+    }
+
+    /// §19. Compiles an artifact before anyone asks for it.
+    ///
+    /// Cold start is dominated by Cranelift and Cranelift scales with code
+    /// size, so a 2 MiB module cost 368 ms on its first request. Doing that
+    /// work here leaves the request path with a fetch, a `deserialize_file`,
+    /// and an instantiate.
+    #[tracing::instrument(name = "grpc_precompile", skip_all, fields(hash = tracing::field::Empty))]
+    async fn precompile(
+        &self,
+        request: Request<PrecompileRequest>,
+    ) -> Result<Response<PrecompileResponse>, Status> {
+        let request = request.into_inner();
+        tracing::Span::current().record("hash", request.content_hash.as_str());
+
+        // Admission first, as with an execution: a precompile is Cranelift on a
+        // pool thread, and it must not be a way around the queue that protects
+        // the requests already running.
+        let Some(admitted) = self.pool.try_admit() else {
+            return Err(Status::resource_exhausted("worker at capacity"));
+        };
+
+        let (wasm, _) = match self.artifact(&request.content_hash).await {
+            Ok(found) => found,
+            Err(FetchError::NotFound) => {
+                return Err(Status::not_found("unknown content_hash"));
+            }
+            Err(other) => {
+                eprintln!("nebula-worker: precompile fetch failed: {other:?}");
+                return Err(Status::unavailable("could not fetch the artifact"));
+            }
+        };
+
+        match self.pool.compile(admitted, wasm).await {
+            Ok(Ok(micros)) => Ok(Response::new(PrecompileResponse {
+                compiled: true,
+                error: String::new(),
+                micros,
+            })),
+            // A module that will not compile is the caller's to fix, and this
+            // is the only moment anyone can tell them. Reported as a *successful*
+            // RPC carrying a failure, for the same reason guest faults are
+            // (§11.2): it is not the worker that went wrong.
+            Ok(Err(err)) => Ok(Response::new(PrecompileResponse {
+                compiled: false,
+                error: format!("{err}"),
+                micros: 0,
+            })),
+            Err(PoolError::Full) => Err(Status::resource_exhausted("execution queue full")),
+            Err(PoolError::Stopped) => Err(Status::internal("execution pool stopped")),
+        }
     }
 
     async fn drain(
