@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/nebula-bench",
     "crates/nebula-control",
     "crates/nebula-mcp",
     "crates/nebula-proto",
@@ -45,6 +46,7 @@ prost = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process", "fs"] }
 
 nebula-control = { path = "crates/nebula-control" }
+nebula-worker = { path = "crates/nebula-worker" }
 nebula-mcp = { path = "crates/nebula-mcp" }
 nebula-proto = { path = "crates/nebula-proto" }
 nebula-runtime = { path = "crates/nebula-runtime" }

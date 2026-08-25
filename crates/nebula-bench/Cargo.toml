@@ -1,0 +1,14 @@
+[package]
+name = "nebula-bench"
+version.workspace = true
+edition.workspace = true
+
+# Needs both halves of the cluster to measure M2 and M3, which is the same
+# reason the gateway tests live in `nebula-worker`.
+[dependencies]
+nebula-control.workspace = true
+nebula-proto.workspace = true
+nebula-runtime.workspace = true
+nebula-worker.workspace = true
+tokio.workspace = true
+tonic.workspace = true

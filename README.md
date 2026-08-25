@@ -49,8 +49,8 @@ magnitude below a microVM platform.
 
 | # | Goal | Measured by |
 |---|------|-------------|
-| G1 | Sub-millisecond hot-start execution | p99 instantiate+execute of a trivial handler, in-process, < 1 ms |
-| G2 | Cold start an order of magnitude below microVMs | p99 end-to-end cold start < 50 ms for a ≤ 2 MiB module |
+| G1 | Sub-millisecond hot-start execution | p99 instantiate+execute of a trivial handler, in-process, < 1 ms. **Met: measured 0.024 ms (§19)** |
+| G2 | Cold start an order of magnitude below microVMs | p99 end-to-end cold start < 50 ms for a ≤ 2 MiB module. **Missed: measured 368 ms at 2 MiB (§19).** Met at ~500 B |
 | G3 | Safe execution of untrusted multi-tenant code | Adversarial guest corpus (§15) cannot crash, hang, or starve a worker |
 | G4 | Deterministic, enforced resource ceilings | Every limit in §6 has a test that proves the trap fires |
 | G5 | Survive node loss without operator action | Killing a worker under load reroutes traffic within 3 s, zero 5xx after reconvergence |
@@ -1221,9 +1221,10 @@ nebula/
 │   ├── nebula-worker/          # bin: gRPC server wrapping nebula-runtime
 │   │   ├── src/{server,exec_pool,heartbeat}.rs
 │   │   └── tests/{mesh,gateway,scale}_tests.rs
-│   └── nebula-mcp/             # bin: Model Context Protocol adapter (§22.3)
-│       ├── src/{lib,gateway,main}.rs
-│       └── tests/mcp_tests.rs
+│   ├── nebula-mcp/             # bin: Model Context Protocol adapter (§22.3)
+│   │   ├── src/{lib,gateway,main}.rs
+│   │   └── tests/mcp_tests.rs
+│   └── nebula-bench/           # bin: the M1/M2/M3 harness of §19
 └── guests/
     ├── build.sh                # builds every guest and its wizened twin
     ├── examples/heavy_init/    # the §4.3 pre-initialization demonstration
@@ -1408,6 +1409,11 @@ M1 is the WASM claim. M2 is the system claim. **M3 is what gets compared against
 Firecracker's 125-200 ms boot floor**, and that comparison is the honest one for
 G2, not M1 against a microVM cold start, which measures two different things.
 
+It also has to say which artifact it used, which the first draft of this section
+did not. M3 on a half-kilobyte module and M3 on a 2 MiB one differ by a factor
+of two hundred, and only one of them is a fair comparison against a microVM. See
+the measurements below.
+
 ### Conditions
 
 - Fixed hardware; core count, CPU model, and OS recorded in the results.
@@ -1417,6 +1423,79 @@ G2, not M1 against a microVM cold start, which measures two different things.
   ~500 KiB), **heavy** (framework init, ~5 MiB, measured wizened and raw).
 - Percentiles from microsecond histograms, never from averages.
 - Three runs; median reported; spread published.
+
+### Measured
+
+`cargo run --release -p nebula-bench`, on 12 logical cores. Every number below
+came out of that command; none of them is a target.
+
+| Measurement | Artifact | p50 | p99 | max | Target | |
+|---|---|---|---|---|---|---|
+| M1 in process | ~500 B `.wat` | 0.007 | 0.024 | 0.25 | p99 < 1 ms | **met** |
+| M1 in process | 7 MiB interpreter | 3.93 | 6.75 | 7.17 | none | |
+| M2 hot end to end | ~500 B `.wat` | 0.53 | 1.17 | 3.28 | p99 < 5 ms | **met** |
+| M3 cold end to end | ~500 B `.wat` | 1.76 | 3.59 | 43.0 | p99 < 50 ms | **met** |
+| M3 cold end to end | 2 MiB | 361 | 368 | 368 | p99 < 50 ms | **missed** |
+| M3 cold end to end | 7 MiB interpreter | 699 | 701 | 701 | p99 < 50 ms | **missed** |
+
+Milliseconds throughout.
+
+**G1 is met with two orders of magnitude to spare.** A warm instantiate and call
+is 7 microseconds at the median. The pooling allocator and the cached
+`InstancePre` do what §5.1 and §8.3 said they would.
+
+**G2 is missed, and not narrowly.** The goal is a p99 cold start under 50 ms for
+a module of up to 2 MiB. At exactly that size the measured p99 is 368 ms, which
+is out by a factor of seven, and at 7 MiB it is 701 ms. The trivial tier passes
+at 3.6 ms, which is why this went unnoticed for so long: every cold-start test
+in the repository uses a module of a few hundred bytes.
+
+#### Why, and what it means for the Firecracker comparison
+
+Cold start is dominated by Cranelift, and Cranelift scales with the amount of
+code it is given. The other terms do not: the fetch is one streamed copy over
+loopback, and instantiation of a 7 MiB module is around 4 ms (the M1 interpreter
+row, which is instantiate-and-execute with compilation already done).
+
+That makes the headline comparison in this section conditional in a way it was
+not written to be. Against Firecracker's 125-200 ms boot floor:
+
+| Artifact | Nebula cold start | Versus a microVM boot |
+|---|---|---|
+| ~500 B | 1.8 ms | ~70x faster |
+| 2 MiB | 361 ms | ~2x slower |
+| 7 MiB | 699 ms | ~4x slower |
+
+A microVM boots in roughly constant time regardless of what it is going to run.
+Nebula does not. "An order of magnitude below microVMs" is true for small
+modules and false for the size of artifact an agent workload actually deploys,
+which is the case §22.1 exists to serve.
+
+#### The fix is already written down
+
+§11.1 ends with this, about deploy-time validation: *"if that trade stops being
+acceptable, the fix is not to move the compiler, it is to have a worker validate
+on deploy and report back."* The same move solves this. A worker that compiles at
+deploy and stores the result in L2 turns a cold start into a fetch, a
+`deserialize_file`, and an instantiate, with no Cranelift on the request path at
+all. The M1 interpreter row is the evidence for what that would leave: about
+4 ms.
+
+That was a hypothesis when §11.1 was written. It is now the measured answer to a
+measured problem, and it is the next thing worth building.
+
+#### What was actually run
+
+Honesty about the conditions matters as much as the numbers. The default run is
+not the full §19 protocol above: it is a fixed sample count per measurement
+(5000, 1000, 200, 5, 3) rather than a 30 second warmup and a 60 second window,
+single run rather than three, sustained rather than burst, and loopback only
+(R5). The sample counts are environment variables so the full protocol is a
+matter of setting them, and the small counts on the large-artifact rows are why
+those rows report p99 and max as the same number.
+
+None of that changes the conclusion. A seven-fold miss is not a measurement
+artifact, and the mechanism behind it is understood.
 
 ### Recorded even when unflattering
 
