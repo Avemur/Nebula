@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // §22.8. Off unless `NEBULA_EGRESS_ALLOW` names hosts, and enforced here
     // rather than at the gateway because this is the process that opens the
-    // socket — a policy checked anywhere else is one something can route
+    // socket: a policy checked anywhere else is one something can route
     // around.
     let egress = nebula_runtime::egress::Policy::from_env();
 

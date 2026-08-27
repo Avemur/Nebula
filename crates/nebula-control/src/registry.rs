@@ -71,7 +71,7 @@ impl Registry {
     ///
     /// `hash` arrives from the network on every `FetchModule`. Without this
     /// check a caller could ask for `../../etc/passwd` and the registry would
-    /// hand it over — `Path::join` is perfectly happy to escape its parent.
+    /// hand it over: `Path::join` is perfectly happy to escape its parent.
     /// Validating the *shape* is the fix, not sanitising the string.
     fn path(&self, hash: &str) -> io::Result<PathBuf> {
         if !is_content_hash(hash) {
@@ -145,8 +145,8 @@ impl Registry {
 
     /// Reads the deployment table, or an empty one on a fresh node.
     ///
-    /// A missing file is normal. A *corrupt* one is not silently discarded —
-    /// that would look like every function vanishing with no explanation — so it
+    /// A missing file is normal. A *corrupt* one is not silently discarded:
+    /// that would look like every function vanishing with no explanation, so it
     /// surfaces as an error the caller has to decide about.
     pub fn load_deployments(&self) -> io::Result<Deployments> {
         match fs::read(self.deployments_path()) {

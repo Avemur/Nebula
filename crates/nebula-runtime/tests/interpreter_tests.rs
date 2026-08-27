@@ -9,7 +9,7 @@
 //!    source on every request.
 //! 3. **The cost is where the measurement says it is.** Instantiating a 7 MiB
 //!    module dominates everything else this guest does, which is why it is no
-//!    longer wizened — §22.1 measured the snapshot as buying nothing, and
+//!    longer wizened: §22.1 measured the snapshot as buying nothing, and
 //!    §22.8 needed the import slot Wizer was standing in.
 //!
 //! Requires the artifacts from `bash guests/build.sh`; without them these skip
@@ -120,7 +120,7 @@ fn a_thrown_exception_is_reported_not_swallowed() {
     let runtime = Runtime::new(common::temp_dir("js-throw")).expect("runtime");
 
     // §22.1: an uncaught exception is a successful execution of the sandbox.
-    // The tenant's program ran and threw, exactly as `node -e` would report —
+    // The tenant's program ran and threw, exactly as `node -e` would report,
     // and `X-Nebula-Fault` stays reserved for Nebula failing, which is the
     // distinction an agent has to act on differently.
     let output = eval(&runtime, &wasm, "null.x");
@@ -151,7 +151,7 @@ fn one_scripts_globals_cannot_reach_the_next_request() {
 
     // The snapshot is mapped copy-on-write into a *fresh instance per request*
     // (§4.2). This is the test that would catch someone "optimising" that into
-    // a reused instance — the change that would make §13 need an argument
+    // a reused instance: the change that would make §13 need an argument
     // instead of a structure.
     assert_eq!(
         eval(&runtime, &wasm, "globalThis.leak = 'secret'; 'set'"),
@@ -206,7 +206,7 @@ fn the_interpreter_is_bounded_by_the_same_ceilings_as_any_other_guest() {
 ///
 /// This is a build-breaking invariant, not a preference. `PUT /functions/{id}`
 /// runs Wizer on anything exporting `_initialize` (§11.1), and Wizer has to
-/// instantiate the module to run it — which it cannot do, because
+/// instantiate the module to run it, which it cannot do, because
 /// `nebula.http_get` is not a WASI import. Re-adding the export would turn
 /// every deploy of this guest into a `400`, and the only clue would be a Wizer
 /// error about an unsatisfiable import.
@@ -268,8 +268,8 @@ fn instantiation_cost_tracks_artifact_size() {
     assert!(
         big_time > tiny_time * 3,
         "expected artifact size to dominate instantiation: tiny {tiny_time:?} \
-         vs {big_time:?}. If this stops being true the guidance in §22.1 — that \
-         interpreter size is the lever — needs remeasuring."
+         vs {big_time:?}. If this stops being true the guidance in §22.1 (that \
+         interpreter size is the lever) needs remeasuring."
     );
 }
 
@@ -361,7 +361,7 @@ fn an_allowed_host_comes_back_to_the_script_whole() {
 ///
 /// A deliberately generous deadline. These tests are about what survives
 /// between requests, not about latency, and the default 50 ms is tight enough
-/// that a machine running the whole suite in parallel can trip it — which shows
+/// that a machine running the whole suite in parallel can trip it, which shows
 /// up as a state test failing for a reason that has nothing to do with state.
 /// `instantiation_cost_tracks_artifact_size` is where timing is asserted.
 const SESSION_DEADLINE_TICKS: u64 = 2_000;
@@ -416,7 +416,7 @@ fn one_conversations_scratchpad_is_invisible_to_another() {
 
     eval_in(&runtime, &wasm, "chat-1", "session.set('secret', 'mine')");
 
-    // `null`, not `''` — a script has to tell "never written" from "written
+    // `null`, not `''`: a script has to tell "never written" from "written
     // empty", or the second step of every conversation guesses.
     assert_eq!(
         eval_in(&runtime, &wasm, "chat-2", "String(session.get('secret'))"),
@@ -441,7 +441,7 @@ fn session_state_survives_a_fresh_instance_but_globals_do_not() {
 
     // The distinction §22.5 rests on: state is *data* in the host's store, not
     // a live instance pinned to a worker. `globalThis` still dies with the
-    // instance, so §4.2's fresh-instance invariant is untouched — which is why
+    // instance, so §4.2's fresh-instance invariant is untouched, which is why
     // this costs a KV namespace instead of leases and fencing tokens (§21).
     eval_in(
         &runtime,

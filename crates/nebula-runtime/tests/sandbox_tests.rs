@@ -5,7 +5,7 @@
 //! freshness).
 //!
 //! The guest-facing tests assert a *specific* outcome, not merely "did not
-//! crash" — README.md §15.
+//! crash" (README.md §15).
 
 mod common;
 
@@ -26,7 +26,7 @@ fn assert_trap(err: Error, want: Trap) {
 }
 
 // ---------------------------------------------------------------------------
-// host.rs — checked_range
+// host.rs: checked_range
 //
 // The arithmetic that has to be right, tested directly. `guest_slice` cannot be
 // called without a live `Caller`, which is why this is a separate function.
@@ -74,7 +74,7 @@ fn checked_range_rejects_everything_against_empty_memory() {
 }
 
 // ---------------------------------------------------------------------------
-// host.rs — nebula.log
+// host.rs: nebula.log
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -128,7 +128,7 @@ fn log_payload_is_truncated_not_trapped() {
 }
 
 // ---------------------------------------------------------------------------
-// host.rs — guest_slice traps
+// host.rs: guest_slice traps
 //
 // Each of these reaches guest_slice through a real host call with
 // attacker-controlled arguments.
@@ -193,7 +193,7 @@ fn guest_slice_traps_when_guest_exports_no_memory() {
 }
 
 // ---------------------------------------------------------------------------
-// engine.rs — resource ceilings
+// engine.rs: resource ceilings
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -224,7 +224,7 @@ fn store_limiter_refuses_growth_the_pooling_slot_would_allow() {
 
 #[test]
 fn memory_growth_beyond_the_pooling_slot_is_refused() {
-    // 100 000 pages is 6.25 GiB — past both ceilings. This is the backstop, and
+    // 100 000 pages is 6.25 GiB: past both ceilings. This is the backstop, and
     // it passes with or without the limiter; the test above is the one that
     // isolates `StoreLimits`. The guest traps itself if the grow unexpectedly
     // succeeds, so a clean run is the assertion.
@@ -252,7 +252,7 @@ fn memory_growth_within_the_ceiling_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// lib.rs — store lifecycle
+// lib.rs: store lifecycle
 // ---------------------------------------------------------------------------
 
 #[test]

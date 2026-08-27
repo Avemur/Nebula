@@ -2,15 +2,15 @@
 //!
 //! This stands in for a framework or language runtime that spends tens of
 //! milliseconds building its heap before it can serve anything. The point is
-//! that the cost is paid *once*, at build time, by Wizer — and that the runtime
+//! that the cost is paid *once*, at build time, by Wizer, and that the runtime
 //! needs no special path to benefit from it.
 //!
 //! Two exports:
 //!
-//! * `_initialize` — does the expensive work and parks the result in a static.
+//! * `_initialize`: does the expensive work and parks the result in a static.
 //!   Wizer runs this ahead of time and snapshots the resulting linear memory
 //!   back into the module's data segments, then drops the export.
-//! * `run` — the handler. Reads the precomputed result and prints a summary.
+//! * `run`: the handler. Reads the precomputed result and prints a summary.
 //!   It never recomputes: if the static is empty it says so loudly, so a
 //!   benchmark can never mistake an uninitialized module for a fast one.
 //!
@@ -24,11 +24,11 @@ use std::sync::OnceLock;
 /// snapshot, and the snapshot is a checked-in artifact.
 const SIEVE_LIMIT: usize = 200_000;
 
-/// Hash rounds. This is the tuning knob for boot cost — it burns CPU without
+/// Hash rounds. This is the tuning knob for boot cost: it burns CPU without
 /// growing the heap, so the boot can be made slow without making the wizened
 /// artifact large.
 ///
-/// Tuned to roughly 22 ms of boot — a little under half the 50 ms epoch
+/// Tuned to roughly 22 ms of boot: a little under half the 50 ms epoch
 /// deadline (README.md §6.4). Enough to show that boot eats a serious share of
 /// the request budget, with enough headroom left that a loaded machine does not
 /// trip the deadline and turn the benchmark into a flaky trap.
@@ -42,7 +42,7 @@ struct Boot {
 static BOOT: OnceLock<Boot> = OnceLock::new();
 
 /// The expensive boot: a sieve whose output is kept on the heap, then a hash
-/// chain over it. Both halves matter — the `Vec` proves heap state survives
+/// chain over it. Both halves matter: the `Vec` proves heap state survives
 /// snapshotting, the hash chain provides the wall-clock cost.
 fn boot() -> Boot {
     let mut composite = vec![false; SIEVE_LIMIT];
@@ -80,7 +80,7 @@ pub extern "C" fn initialize() {
     let _ = BOOT.set(boot());
 }
 
-/// The handler. Pure lookup — no fallback to recomputing.
+/// The handler. Pure lookup: no fallback to recomputing.
 #[export_name = "run"]
 pub extern "C" fn run() {
     match BOOT.get() {

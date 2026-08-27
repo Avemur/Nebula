@@ -1,7 +1,7 @@
 //! Control plane binary (§3.1).
 //!
-//! Serves the `NebulaControl` gRPC surface and runs the membership reconciler.
-//! The axum API gateway of §11.1 is not wired yet.
+//! Serves the `NebulaControl` gRPC surface, the axum API gateway of §11.1,
+//! and the membership reconciler.
 
 use std::sync::Arc;
 

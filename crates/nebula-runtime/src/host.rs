@@ -1,7 +1,7 @@
 //! Host functions and the single guest-memory access path.
 //!
 //! See README.md §7. The set of imports registered here *is* the security
-//! policy — a guest can reach nothing the linker did not hand it.
+//! policy: a guest can reach nothing the linker did not hand it.
 
 use std::ops::Range;
 
@@ -26,7 +26,7 @@ pub const MAX_STDIO_BYTES: usize = 64 << 10; // 64 KiB
 ///
 /// This is the only place a guest pointer is validated (§13, invariant 1);
 /// everything else routes through it. It is split out from [`guest_slice`] so
-/// it is directly testable — a `Caller` cannot be fabricated outside a live host
+/// it is directly testable: a `Caller` cannot be fabricated outside a live host
 /// call, and this is the arithmetic that actually has to be right.
 ///
 /// The addition is checked in `u32`, the width a guest can express. Widening to
@@ -76,7 +76,7 @@ pub fn guest_slice<'a>(
 ///
 /// Integer returns follow one convention throughout: a non-negative count on
 /// success, `-1` on refusal. Refusals are recoverable conditions the guest can
-/// handle — the precedent is WebAssembly's own `memory.grow`. Traps are reserved
+/// handle: the precedent is WebAssembly's own `memory.grow`. Traps are reserved
 /// for a guest that hands the host an invalid pointer, which is not recoverable.
 pub fn add_to_linker(linker: &mut Linker<HostCtx>) -> Result<()> {
     linker.func_wrap(
@@ -186,8 +186,8 @@ pub fn add_to_linker(linker: &mut Linker<HostCtx>) -> Result<()> {
         },
     )?;
 
-    // §22.8. Writes the raw HTTP response — status line, headers, blank line,
-    // body — into the guest buffer and returns its full length, or `-1` on any
+    // §22.8. Writes the raw HTTP response (status line, headers, blank line,
+    // body) into the guest buffer and returns its full length, or `-1` on any
     // refusal. The full length rather than the written length so a guest can
     // detect truncation, which is the `kv_get` convention.
     //

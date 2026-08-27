@@ -43,7 +43,7 @@ pub const DEADLINE_HEADER: &str = "x-nebula-deadline-ms";
 
 /// Set on **every** non-200 response.
 ///
-/// A status code is shared by several unrelated failures — 503 is both "no
+/// A status code is shared by several unrelated failures: 503 is both "no
 /// worker" and "worker shed", 500 is both a guest trap and a memory ceiling. A
 /// client branching on the status cannot tell them apart; this names the reason.
 pub const FAULT_HEADER: &str = "x-nebula-fault";
@@ -61,8 +61,8 @@ pub const TOOL_SCHEMA_HEADER: &str = "x-nebula-tool-schema";
 /// paying for a case where two nodes have already gone.
 pub const PRECOMPILE_FANOUT: usize = 2;
 
-/// Bound on a tool descriptor. Generous — a real JSON Schema with descriptions
-/// on every property is a few kilobytes — and still a bound.
+/// Bound on a tool descriptor. Generous (a real JSON Schema with descriptions
+/// on every property is a few kilobytes) and still a bound.
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 16 << 10;
 
 /// Routes a request to a stable worker and namespaces its scratchpad (§22.5).
@@ -92,7 +92,7 @@ const DEFAULT_DEADLINE_MS: u32 = 50;
 /// Bounds on a caller-supplied deadline.
 ///
 /// The ceiling mirrors the worker's own `MAX_DEADLINE_MS`. It is duplicated
-/// rather than shared because the worker clamps independently — a gateway is
+/// rather than shared because the worker clamps independently: a gateway is
 /// not a trust boundary the worker gets to rely on, and the worker is the one
 /// whose execution thread is at stake.
 const MIN_DEADLINE_MS: u32 = 10;
@@ -163,7 +163,7 @@ impl std::fmt::Display for PublishError {
 /// What happened to one dispatch attempt.
 enum Attempt {
     Answered(ExecuteResponse),
-    /// Never sent — the connection could not be established. Safe to retry.
+    /// Never sent: the connection could not be established. Safe to retry.
     NotSent,
     /// Sent, and then something went wrong. **Never** retried: the guest may
     /// have run and had effects, and nothing here knows whether its host calls
@@ -221,7 +221,7 @@ impl Gateway {
     /// Replaces the default rate limits.
     ///
     /// Exists for tests, which cannot wait out a 50/s bucket without becoming
-    /// slow and flaky — and a limiter nobody can test at its edges is a limiter
+    /// slow and flaky, and a limiter nobody can test at its edges is a limiter
     /// nobody knows the edges of.
     pub fn with_limits(mut self, execute: Limit, deploy: Limit) -> Self {
         self.execute_limit = Limiter::new(execute);
@@ -485,7 +485,7 @@ pub fn router(state: Arc<Gateway>) -> Router {
 /// Reads [`TOOL_SCHEMA_HEADER`].
 ///
 /// `Ok(None)` is absent. Anything present and unusable is an error rather than
-/// a silent drop — a caller that sent a descriptor is expecting its function to
+/// a silent drop: a caller that sent a descriptor is expecting its function to
 /// be callable by an agent, and quietly deploying it undescribed looks like
 /// success and produces a tool nobody can find.
 fn tool_of(headers: &HeaderMap) -> Result<Option<Tool>, String> {
@@ -556,7 +556,7 @@ async fn publish(
         return unauthorized().into_response();
     };
     // Checked before `publish`, which is where Wizer runs the caller's guest
-    // code in a subprocess (§11.1) — the single most expensive thing this
+    // code in a subprocess (§11.1): the single most expensive thing this
     // endpoint can be asked to do.
     if let Decision::Limited { retry_after } = gateway.deploy_limit.check(&tenant) {
         return rate_limited(retry_after).into_response();
@@ -629,7 +629,7 @@ async fn execute(
     tracing::Span::current().record("trace_id", trace.trace_id.as_str());
 
     // Answered as an `Answer` throughout so the trace id can be stamped on
-    // every exit in one place — including the ones that never reach a worker.
+    // every exit in one place, including the ones that never reach a worker.
     let answer = answer_for(&gateway, &function_id, &headers, body, &trace).await;
     answer.with_trace(&trace).into_response()
 }
@@ -716,15 +716,15 @@ async fn answer_for(
         }
         // §22.4: a duplicate arriving while the first is still running is told
         // to wait, not served a second execution. Returning the *original*
-        // request's answer is impossible — it does not exist yet — and running
+        // request's answer is impossible (it does not exist yet), and running
         // the script again is the exact thing the key was sent to prevent.
         idempotency::Claim::InFlight => fault(
             StatusCode::CONFLICT,
             "idempotency_in_flight",
             "a request with this Idempotency-Key is already running",
         ),
-        // The claim is a guard: if this future is dropped — a client that hung
-        // up mid-request, which is precisely the case the key exists for — the
+        // The claim is a guard: if this future is dropped (a client that hung
+        // up mid-request, which is precisely the case the key exists for), the
         // slot is released rather than left answering 409 until the TTL runs
         // out.
         idempotency::Claim::Proceed(claim) => {
@@ -836,7 +836,7 @@ async fn run(
 fn to_http(response: ExecuteResponse, deadline_ms: u32) -> Answer {
     let outcome = Outcome::try_from(response.outcome).unwrap_or(Outcome::Internal);
 
-    // §12. Guest fault detail goes back to the caller — it is their code. The
+    // §12. Guest fault detail goes back to the caller: it is their code. The
     // `Internal` arm carries none, because the worker withheld it deliberately.
     let (status, fault, body) = match outcome {
         Outcome::Ok => (StatusCode::OK, None, response.body),
@@ -934,7 +934,7 @@ pub struct Answer {
     /// Set on a replay so a caller can tell one from a fresh execution.
     replayed: bool,
     /// The trace this request belonged to (§22.6). Stamped on every exit, so a
-    /// caller can find a rejected request in its own trace — those are the ones
+    /// caller can find a rejected request in its own trace: those are the ones
     /// it most wants to find.
     trace_id: Option<String>,
     /// Whole seconds, when the answer can say something more useful than the
@@ -946,7 +946,7 @@ impl Answer {
     /// Whether a retry with the same key should receive this verbatim (§22.4).
     ///
     /// A completed execution is replayable whether it succeeded or the guest
-    /// faulted — the script ran, and running it again would produce the same
+    /// faulted: the script ran, and running it again would produce the same
     /// thing. Everything else means "no answer exists", and storing it would
     /// pin a transient failure for the whole TTL.
     fn replayable(&self) -> bool {
@@ -957,7 +957,7 @@ impl Answer {
     }
 
     /// Stamps the current trace, overwriting whatever a replayed answer
-    /// carried — the id belongs to *this* request, not to the one that
+    /// carried: the id belongs to *this* request, not to the one that
     /// originally produced the body.
     fn with_trace(mut self, trace: &trace::TraceContext) -> Self {
         self.trace_id = Some(trace.trace_id.clone());
@@ -981,7 +981,7 @@ impl IntoResponse for Answer {
             headers.insert(FAULT_HEADER, HeaderValue::from_static(kind));
         }
         // `Retry-After` rides along with 503 and 429 because both statuses
-        // *mean* "try again" — not a special case, just the definition. 502
+        // *mean* "try again", not a special case, just the definition. 502
         // still does not get one: §22.4 explains why a key does not make that
         // safe either.
         if self.status == StatusCode::SERVICE_UNAVAILABLE {
@@ -1086,7 +1086,7 @@ fn partition_key_of(headers: &HeaderMap) -> Result<Option<String>, ()> {
 
 /// Reads `Idempotency-Key`.
 ///
-/// `None` means absent — the request runs unkeyed. An over-long or non-ASCII
+/// `None` means absent: the request runs unkeyed. An over-long or non-ASCII
 /// key is `Some(Err)`: a client that sent one meant to be protected, and
 /// silently dropping the protection is the worst of the three options.
 #[allow(clippy::result_unit_err)]
@@ -1105,8 +1105,8 @@ fn idempotency_key_of(headers: &HeaderMap) -> Option<Result<String, ()>> {
 /// A malformed value is a 400 rather than a silent fall back to the default.
 /// Defaulting would hand a client asking for 5 s a 50 ms budget and then a
 /// `timeout` fault, which is the most confusing failure this endpoint could
-/// produce — and the one a tool-calling agent is least able to diagnose.
-/// `None` means the header was present and unparseable — an absent header
+/// produce, and the one a tool-calling agent is least able to diagnose.
+/// `None` means the header was present and unparseable: an absent header
 /// yields the default, so the two cases never blur.
 fn deadline_of(headers: &HeaderMap) -> Option<u32> {
     let Some(raw) = headers.get(DEADLINE_HEADER) else {

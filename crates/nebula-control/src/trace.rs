@@ -2,7 +2,7 @@
 //!
 //! §14 produces a real span tree and it is an island. An agent run is already
 //! traced end to end by LangSmith, Langfuse, or a plain OTel collector, and the
-//! interesting question is always "which step was slow" — which nobody can
+//! interesting question is always "which step was slow", which nobody can
 //! answer if the tool call is an opaque gap in the parent trace.
 //!
 //! This is the smallest thing that closes that gap: adopt the caller's
@@ -10,7 +10,7 @@
 //! every span as a field, and pass it down the mesh so the worker's spans carry
 //! the same id.
 //!
-//! ponytail: no OpenTelemetry exporter and no collector — §14's position is
+//! ponytail: no OpenTelemetry exporter and no collector. §14's position is
 //! that `tracing` alone answers "where did the time go", and a collector is
 //! infrastructure to run rather than a question to answer. A `trace_id` field
 //! is enough to join Nebula's spans to someone else's trace in whatever they
@@ -42,7 +42,7 @@ pub struct TraceContext {
     pub trace_id: String,
     /// 16 lower-case hex characters: the span that sent this request.
     pub parent_id: String,
-    /// 2 hex characters. Carried verbatim — the sampling decision belongs to
+    /// 2 hex characters. Carried verbatim: the sampling decision belongs to
     /// whoever started the trace, not to us.
     pub flags: String,
 }
@@ -67,7 +67,7 @@ impl TraceContext {
 
     /// The `traceparent` to send onward, naming `span_id` as the parent.
     ///
-    /// The outgoing parent is *this* hop, not the one that called us — that is
+    /// The outgoing parent is *this* hop, not the one that called us: that is
     /// what makes the receiving side a child rather than a sibling.
     pub fn outgoing(&self, span_id: &str) -> String {
         format!("{VERSION}-{}-{span_id}-{}", self.trace_id, self.flags)
@@ -112,7 +112,7 @@ fn is_hex(value: &str, len: usize) -> bool {
 /// A `len`-character hex id.
 ///
 /// ponytail: a hashed counter and clock, not a CSPRNG. A trace id is a
-/// correlation handle, not a secret or a capability — nothing authorizes on it,
+/// correlation handle, not a secret or a capability: nothing authorizes on it,
 /// and a collision costs two requests sharing a line in a log viewer. The
 /// counter is what makes it unique within a process; the clock is what keeps
 /// two processes started at the same moment apart. If trace ids ever become
@@ -140,7 +140,7 @@ fn mint(len: usize) -> String {
 /// This hop's span id, for the outgoing `traceparent`.
 ///
 /// `tracing` hands out a `span::Id` only when a subscriber is installed, so the
-/// fallback is not hypothetical — it is what happens in a test binary that
+/// fallback is not hypothetical: it is what happens in a test binary that
 /// never calls `init_tracing`.
 pub fn current_span_id() -> String {
     match tracing::Span::current().id() {
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn minted_ids_do_not_repeat() {
         // The clock has millisecond-ish resolution in practice, so ids minted in
-        // one tight loop would collide without the counter — which is exactly
+        // one tight loop would collide without the counter, which is exactly
         // the pattern a burst of requests produces.
         let ids: std::collections::HashSet<String> = (0..1000).map(|_| mint(32)).collect();
         assert_eq!(ids.len(), 1000, "minted trace ids collided");

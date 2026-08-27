@@ -1,9 +1,9 @@
 //! Who a caller is (README.md §13).
 //!
 //! v1 made the bearer token *be* the tenant id, which meant the tenant was a
-//! claim rather than a fact. Every isolation guarantee in §22 is keyed on it —
+//! claim rather than a fact. Every isolation guarantee in §22 is keyed on it:
 //! the session scratchpad of §22.5, the replay store of §22.4, the egress
-//! allowlist of §22.8, the buckets of §22.7 — so an unverified tenant made all
+//! allowlist of §22.8, the buckets of §22.7, so an unverified tenant made all
 //! of them "isolated, provided everyone is honest".
 //!
 //! A signed token closes that without a database: the tenant travels in the
@@ -14,7 +14,7 @@
 //! ```
 //!
 //! ponytail: no expiry, no revocation list, no refresh. A token is a bearer
-//! credential that says one thing — "this is tenant X" — and rotating the
+//! credential that says one thing, "this is tenant X", and rotating the
 //! secret invalidates every token at once, which is the whole of the revocation
 //! story until someone needs finer. Expiry needs a clock in the token and a
 //! decision about skew; neither is free, and neither is load-bearing while the
@@ -34,8 +34,8 @@ pub enum Auth {
     /// **Development only.** The bearer token is taken as the tenant id, so any
     /// caller can be any tenant.
     ///
-    /// Kept as the default because the alternative — refusing every request
-    /// until a secret is configured — means `cargo run` does not work, and the
+    /// Kept as the default because the alternative (refusing every request
+    /// until a secret is configured) means `cargo run` does not work, and the
     /// predictable response to that is a secret of `x` that everybody assumes
     /// is security. The binaries announce this mode loudly at startup instead.
     Insecure,
@@ -82,7 +82,7 @@ impl Auth {
             Self::Insecure => is_valid_tenant(token).then(|| token.to_string()),
             Self::Signed(key) => {
                 // `rsplit_once` so a tenant containing a dot could never be
-                // spelled to move the boundary — though `is_valid_tenant`
+                // spelled to move the boundary, though `is_valid_tenant`
                 // already forbids one, and both checks are cheap.
                 let (tenant, signature) = token.rsplit_once('.')?;
                 if !is_valid_tenant(tenant) {
@@ -104,7 +104,7 @@ impl Auth {
 ///
 /// The charset is not cosmetic. A tenant id is the first element of the KV key
 /// (§22.5), the idempotency slot (§22.4) and the egress lookup (§22.8), and it
-/// is the part of the token before the separator — so forbidding `.` is what
+/// is the part of the token before the separator, so forbidding `.` is what
 /// makes the token split unambiguous.
 pub fn is_valid_tenant(tenant: &str) -> bool {
     !tenant.is_empty()
@@ -207,7 +207,7 @@ mod tests {
         assert!(!auth.is_enforcing());
         assert_eq!(auth.tenant_of("acme").as_deref(), Some("acme"));
 
-        // Still validated as a tenant id — the charset guards four different
+        // Still validated as a tenant id: the charset guards four different
         // stores, and that is true whether or not anyone checked a signature.
         assert_eq!(auth.tenant_of("has a space"), None);
         assert_eq!(auth.tenant_of(""), None);

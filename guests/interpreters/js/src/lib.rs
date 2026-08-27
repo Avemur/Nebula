@@ -2,22 +2,22 @@
 //!
 //! This is the guest that makes Nebula usable by an LLM agent. An agent writes
 //! JavaScript; it does not compile Rust to `wasm32-wasip1`. So rather than
-//! deploying a module per snippet — a toolchain, a `PUT`, a new `function_id`
-//! and a guaranteed cache miss every time — this module is deployed **once**
+//! deploying a module per snippet (a toolchain, a `PUT`, a new `function_id`
+//! and a guaranteed cache miss every time), this module is deployed **once**
 //! and the agent's source arrives as the **request body**. Every snippet then
 //! runs on the hot path of §4.2 and hits the module cache.
 //!
 //! # Interface
 //!
-//! * **stdin** — the source to evaluate. The runtime pipes the request body in.
-//! * **stdout** — the response body: whatever `console.log` printed, followed by
+//! * **stdin**: the source to evaluate. The runtime pipes the request body in.
+//! * **stdout**: the response body, whatever `console.log` printed, followed by
 //!   the completion value when it is not `undefined`.
-//! * **`session.get/set`** — state that survives between requests sharing a
+//! * **`session.get/set`**: state that survives between requests sharing a
 //!   partition key (§22.5).
-//! * **`httpGet(url)`** — the network, when an operator allows it (§22.8).
+//! * **`httpGet(url)`**: the network, when an operator allows it (§22.8).
 //!
 //! The request arrives on stdin rather than through `nebula.request_read`
-//! because that is what a wizenable guest can do — and this guest is no longer
+//! because that is what a wizenable guest can do, and this guest is no longer
 //! wizened. The channel stayed because it works and because swapping it would
 //! change the contract in §22.1 for no gain.
 //!
@@ -25,7 +25,7 @@
 //!
 //! It was, until egress landed. Wizer has to instantiate a module to run its
 //! initializer, so **every import must be satisfiable at build time** (README.md
-//! R2) — which means a wizenable guest can import nothing but WASI, and
+//! R2), which means a wizenable guest can import nothing but WASI, and
 //! `nebula.http_get` would be unsatisfiable.
 //!
 //! Giving that up cost nothing, and that is measured rather than assumed: §22.1
@@ -50,7 +50,7 @@ use boa_engine::{
 
 // Outbound HTTP (README.md §22.8). Refused unless an operator allowlisted the
 // host, which is why the JS side reports a refusal as an exception rather than
-// as an empty string — a script must be able to tell "blocked" from "the page
+// as an empty string: a script must be able to tell "blocked" from "the page
 // was empty".
 #[link(wasm_import_module = "nebula")]
 extern "C" {
@@ -77,7 +77,7 @@ thread_local! {
 /// Console shim, in JS because it is shorter in JS.
 ///
 /// `__nebula_fmt` exists because `String({a: 1})` is `"[object Object]"`, which
-/// tells an agent nothing. JSON first, `String` as the fallback — and the
+/// tells an agent nothing. JSON first, `String` as the fallback, and the
 /// `catch` covers cyclic structures, which throw rather than returning
 /// `undefined`.
 const PRELUDE: &str = r#"
@@ -108,8 +108,8 @@ fn print(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVal
     Ok(JsValue::undefined())
 }
 
-/// Backs `httpGet`. Returns the raw HTTP response — status line, headers,
-/// blank line, body — because a script that cannot tell `200` from `404` will
+/// Backs `httpGet`. Returns the raw HTTP response (status line, headers,
+/// blank line, body) because a script that cannot tell `200` from `404` will
 /// treat an error page as data.
 fn fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let url = args
@@ -130,7 +130,7 @@ fn fetch(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVal
     };
 
     if written < 0 {
-        // The host deliberately does not say *why* — a script told which hosts
+        // The host deliberately does not say *why*: a script told which hosts
         // are blocked can enumerate the allowlist one request at a time (§22.8).
         return Err(JsNativeError::error()
             .with_message(format!("httpGet refused: {url}"))
@@ -235,7 +235,7 @@ fn build() -> Context {
 /// Diagnostic export: builds the realm and prints nothing else.
 ///
 /// Deliberately *not* `_initialize`. That name is the WASI reactor convention
-/// (§4.3) and the control plane's deploy pipeline wizens anything exporting it —
+/// (§4.3) and the control plane's deploy pipeline wizens anything exporting it,
 /// which would fail here, because Wizer cannot satisfy `nebula.http_get`. This
 /// exists so a benchmark can time instantiation without also timing a parse.
 #[export_name = "realm_probe"]
@@ -268,8 +268,8 @@ pub extern "C" fn run() {
 ///
 /// **An uncaught exception is a 200, not a fault.** The sandbox did its job:
 /// the tenant's program ran and threw, exactly as `node -e` would report it.
-/// `X-Nebula-Fault` (§11.1) stays reserved for Nebula failing — a timeout, a
-/// memory ceiling, an unreachable worker — because those are the ones an agent
+/// `X-Nebula-Fault` (§11.1) stays reserved for Nebula failing (a timeout, a
+/// memory ceiling, an unreachable worker), because those are the ones an agent
 /// must handle differently from "my code has a bug in it".
 fn eval(ctx: &mut Context, source: &[u8]) {
     let value = match ctx.eval(Source::from_bytes(source)) {

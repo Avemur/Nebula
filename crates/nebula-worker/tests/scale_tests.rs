@@ -83,7 +83,7 @@ struct Worker {
     runtime: Arc<Runtime>,
     pool: Arc<ExecPool>,
     /// Closes the server and its established connections. Aborting the accept
-    /// task is not enough — tonic runs each connection in its own task.
+    /// task is not enough: tonic runs each connection in its own task.
     kill: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -459,7 +459,7 @@ async fn losing_a_worker_reshuffles_only_its_share_of_the_keyspace() {
     );
     assert!(
         hit_ratio >= 0.90,
-        "phase-2 hit ratio {:.1}% — losing one worker should not cold-start the \
+        "phase-2 hit ratio {:.1}%: losing one worker should not cold-start the \
          whole cluster",
         hit_ratio * 100.0
     );
@@ -470,7 +470,7 @@ async fn a_saturated_worker_sheds_and_keeps_its_heartbeat() {
     // The proof that §5.2 was worth its complexity. Every execution thread is
     // busy for seconds on end. If guest execution ran on the tokio reactor the
     // heartbeats would stop, the reconciler would evict a perfectly healthy
-    // worker, and the cluster would shed load off a node that was merely busy —
+    // worker, and the cluster would shed load off a node that was merely busy,
     // which looks exactly like a crash from the outside.
     let mut cluster = Cluster::start(membership::LIVENESS_TIMEOUT).await;
     let node = cluster.add_worker(2, 2).await;
@@ -542,7 +542,7 @@ async fn a_saturated_worker_sheds_and_keeps_its_heartbeat() {
     assert_eq!(
         (admitted, shed),
         (2, 8),
-        "capacity 2 must admit 2 and shed 8 — queueing them would be the bug"
+        "capacity 2 must admit 2 and shed 8: queueing them would be the bug"
     );
 
     // Assertion 2: stay saturated for longer than the liveness timeout, and
@@ -556,7 +556,7 @@ async fn a_saturated_worker_sheds_and_keeps_its_heartbeat() {
         total_shed += shed;
         assert!(
             cluster.membership.contains(&node),
-            "the worker left the ring while saturated — heartbeats are not \
+            "the worker left the ring while saturated: heartbeats are not \
              flowing independently of guest execution"
         );
     }
@@ -588,7 +588,7 @@ async fn fifty_functions_spread_across_three_workers_and_stay_put() {
     // Publishing the same bytes under fifty names would prove nothing about
     // routing: the module cache is keyed by content hash, so fifty names sharing
     // one artifact compile once per worker no matter where requests land. That
-    // deduplication is a real and welcome property of content addressing — it is
+    // deduplication is a real and welcome property of content addressing: it is
     // simply not the property under test here.
     for n in 0..FUNCTIONS {
         let distinct = format!("{ECHO}\n(; unique {n} ;)");
@@ -657,12 +657,12 @@ async fn fifty_functions_spread_across_three_workers_and_stay_put() {
         let share = *served as f64 / total as f64;
         assert!(
             share > 0.10,
-            "{node} served only {:.1}% — the ring is not spreading 50 keys",
+            "{node} served only {:.1}%: the ring is not spreading 50 keys",
             share * 100.0
         );
         assert!(
             share < 0.60,
-            "{node} served {:.1}% — one worker is carrying the cluster",
+            "{node} served {:.1}%: one worker is carrying the cluster",
             share * 100.0
         );
     }

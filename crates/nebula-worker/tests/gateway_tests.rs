@@ -73,7 +73,7 @@ const MEMORY_HOG: &str = r#"
 
 const TRAPPER: &str = r#"(module (func (export "run") (unreachable)))"#;
 
-/// Burns roughly 100 ms — comfortably past the 50 ms default budget, and
+/// Burns roughly 100 ms: comfortably past the 50 ms default budget, and
 /// comfortably inside anything a tool-calling client would ask for.
 const SLOW: &str = r#"
     (module
@@ -295,7 +295,7 @@ impl Cluster {
         });
     }
 
-    /// Registers a node whose address nothing is listening on — a worker the
+    /// Registers a node whose address nothing is listening on: a worker the
     /// gateway can never establish a connection to.
     fn add_phantom(&self, node_id: &str) {
         // Port 1 on loopback: reserved, and reliably refuses.
@@ -410,8 +410,8 @@ async fn the_bearer_token_namespaces_the_kv_store() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_memory_ceiling_breach_maps_to_memory_limit() {
-    // Before the limiter recorded its refusal this came back as a plain TRAP —
-    // the guest's out-of-bounds access — which names the symptom, not the cause.
+    // Before the limiter recorded its refusal this came back as a plain TRAP,
+    // the guest's out-of-bounds access, which names the symptom, not the cause.
     let mut cluster = Cluster::start(Duration::from_secs(30)).await;
     cluster.add_worker(1, 2).await;
     cluster.publish("hog", MEMORY_HOG).await;
@@ -502,7 +502,7 @@ async fn a_malformed_deadline_is_rejected_rather_than_defaulted() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn every_failure_names_its_own_cause() {
-    // A client — an LLM tool wrapper especially — has to branch on *why*. Status
+    // A client, an LLM tool wrapper especially, has to branch on *why*. Status
     // codes collide: 503 is both "no worker" and "worker shed", 500 is both a
     // guest trap and a memory ceiling.
     let mut cluster = Cluster::start(Duration::from_secs(30)).await;
@@ -543,8 +543,8 @@ async fn every_failure_names_its_own_cause() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_killed_mid_flight_is_reported_not_retried() {
     // `kill -9`: the connection was live, so the request may already have run.
-    // §10.2 forbids re-executing it — the gateway cannot know whether the
-    // guest's host calls were idempotent — so this is a 502, not a retry.
+    // §10.2 forbids re-executing it (the gateway cannot know whether the
+    // guest's host calls were idempotent), so this is a 502, not a retry.
     let mut cluster = Cluster::start(Duration::from_secs(30)).await;
     let victim = cluster.add_worker(1, 2).await;
     cluster.publish("echo", ECHO).await;
@@ -574,7 +574,7 @@ async fn a_worker_that_cannot_be_reached_is_retried_onto_a_live_one() {
 
     // Twenty distinct function ids, not twenty calls to one. A single id hashes
     // to a single ring position, so repeating it just asks the same question
-    // twenty times — and whether the live worker leads that one walk is decided
+    // twenty times, and whether the live worker leads that one walk is decided
     // by the hash, not by the failover logic under test.
     let mut served = 0;
     for n in 0..20 {
@@ -685,7 +685,7 @@ async fn a_repeated_key_replays_instead_of_running_again() {
 
     // The whole point: the guest is *not* invoked a second time. Without the
     // store this would answer "2", because the KV entry from the first run is
-    // still there — which is exactly the double execution §10.2 warns about
+    // still there, which is exactly the double execution §10.2 warns about
     // and every agent framework causes by retrying.
     let second = cluster.post_with("counter", "acme", &key, b"").await;
     assert_eq!(second.status, 200);
@@ -747,7 +747,7 @@ async fn one_tenants_key_cannot_read_anothers_answer() {
     cluster.publish("echo", ECHO).await;
 
     // Not a nicety. Without the tenant in the slot, an `Idempotency-Key` is an
-    // oracle for whatever another tenant happened to name the same thing —
+    // oracle for whatever another tenant happened to name the same thing,
     // which would make this feature a cross-tenant read primitive.
     let key = [("Idempotency-Key", "shared-name")];
     let acme = cluster
@@ -951,7 +951,7 @@ async fn a_rejected_request_is_still_findable_in_the_callers_trace() {
 
     // The failures are the ones a caller most wants to find. A trace id
     // stamped only on success is a trace id that is missing exactly when it is
-    // needed, so every exit gets one — including the ones that never reach a
+    // needed, so every exit gets one, including the ones that never reach a
     // worker at all.
     let unauthorized = http(
         &cluster.http_addr,
@@ -1009,7 +1009,7 @@ async fn a_replayed_answer_reports_the_trace_that_asked_for_it() {
 // Per-tenant rate limiting (§22.7)
 // ---------------------------------------------------------------------------
 
-/// Two requests up front, then one every ten seconds — so within a test, the
+/// Two requests up front, then one every ten seconds, so within a test, the
 /// third request is refused and stays refused.
 const TWO_THEN_NOTHING: Limit = Limit {
     per_second: 0.1,
@@ -1306,7 +1306,7 @@ async fn sessions_of_one_function_spread_across_workers() {
     // The test the two above cannot be: consistent hashing already pins one
     // *function* to one worker, so a notepad accumulates correctly even if the
     // partition key is ignored for routing entirely. What only partition
-    // routing produces is *spread* — different sessions of one function landing
+    // routing produces is *spread*: different sessions of one function landing
     // on different nodes.
     //
     // `X-Nebula-Cold` makes that observable: a worker reports cold the first
@@ -1327,12 +1327,12 @@ async fn sessions_of_one_function_spread_across_workers() {
     assert!(
         cold > 1,
         "every session landed on one worker, so the partition key is not \
-         reaching the ring — {cold} cold start(s) across 3 workers"
+         reaching the ring: {cold} cold start(s) across 3 workers"
     );
 
     // And the cost of that spread, stated rather than hidden: each worker pays
-    // its own compile. That is the trade §22.5 makes — state affinity instead
-    // of cache affinity — and it is only paid by callers who ask for it.
+    // its own compile. That is the trade §22.5 makes: state affinity instead
+    // of cache affinity, and it is only paid by callers who ask for it.
     assert!(cold <= 3, "more cold starts than workers: {cold}");
 }
 
@@ -1493,7 +1493,7 @@ async fn one_tenants_token_cannot_be_edited_into_another() {
         .expect("mint");
     let signature = token.split_once('.').unwrap().1;
 
-    // Everything §22 isolates is keyed on the tenant — the session scratchpad
+    // Everything §22 isolates is keyed on the tenant: the session scratchpad
     // (§22.5), the replay store (§22.4), the egress allowlist (§22.8). Moving
     // the name in front of a valid signature is the cheapest possible attack on
     // all three at once.

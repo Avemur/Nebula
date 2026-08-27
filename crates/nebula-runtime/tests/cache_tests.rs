@@ -111,7 +111,7 @@ fn l2_replays_after_a_restart_without_invoking_cranelift() {
     assert_eq!(before.cranelift_compiles(), 1);
     drop(before);
 
-    // Same directory, empty L1 — this is what a restarted worker sees.
+    // Same directory, empty L1: this is what a restarted worker sees.
     let after = Cache::new(&dir).unwrap();
     let restored = after
         .get_or_compile(runtime.engine(), runtime.linker(), &wasm)
@@ -269,7 +269,7 @@ fn the_most_recently_used_module_survives_eviction() {
     }
 
     // `keep` was touched after every insert, so it must never have been the
-    // eviction victim — it is still served from L1, never recompiled.
+    // eviction victim: it is still served from L1, never recompiled.
     assert_eq!(
         cache.cranelift_compiles(),
         10,

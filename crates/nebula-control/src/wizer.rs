@@ -48,8 +48,8 @@ impl std::fmt::Display for WizerError {
 
 /// Whether this artifact should go through Wizer.
 ///
-/// Two conditions. It has to be a *binary* module — Wizer cannot read `.wat`
-/// text, which the runtime happily accepts and the tests lean on — and it has
+/// Two conditions. It has to be a *binary* module (Wizer cannot read `.wat`
+/// text, which the runtime happily accepts and the tests lean on), and it has
 /// to actually export an initializer, since Wizer fails outright when the
 /// function it was told to run is missing.
 pub fn should_wizen(artifact: &[u8]) -> bool {
@@ -58,8 +58,8 @@ pub fn should_wizen(artifact: &[u8]) -> bool {
 
 /// Reads the export section with `wasmparser`.
 ///
-/// Parsing the section is cheap and exact. The alternative — running Wizer and
-/// treating "no such function" as "nothing to do" — cannot tell that apart from
+/// Parsing the section is cheap and exact. The alternative (running Wizer and
+/// treating "no such function" as "nothing to do") cannot tell that apart from
 /// a module whose initializer genuinely failed, which is the one distinction
 /// this whole path exists to make.
 fn exports_initializer(artifact: &[u8]) -> bool {
@@ -174,7 +174,7 @@ mod tests {
         );
         assert!(
             !should_wizen(&wizened),
-            "an already-wizened guest must not be wizened twice — Wizer consumed \
+            "an already-wizened guest must not be wizened twice: Wizer consumed \
              and dropped the export, which is exactly the signal this reads"
         );
     }

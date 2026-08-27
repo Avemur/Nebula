@@ -2,7 +2,7 @@
 target/
 
 # The JS interpreter's artifacts are ~7 MiB each, and a rebuild writes a fresh
-# pair — that is 14 MiB of blob per change to the guest, forever. heavy_init's
+# pair, which is 14 MiB of blob per change to the guest, forever. heavy_init's
 # dist is committed because it is under a megabyte; this one is not. Build it
 # with `bash guests/build.sh`; the tests skip with a pointer when it is absent.
 guests/interpreters/js/dist/

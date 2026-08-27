@@ -2,7 +2,7 @@
 //!
 //! Compares a heavy-boot guest against its Wizer-preinitialized twin. The claim
 //! under test is narrow and specific: the wizened module is faster *because the
-//! boot already happened*, not because it does less work — so the test asserts
+//! boot already happened*, not because it does less work, so the test asserts
 //! both that the answers are identical and that the speedup is large.
 //!
 //! Requires the guest artifacts. Build them with `bash guests/build.sh`; without
@@ -45,7 +45,7 @@ fn execute(runtime: &Runtime, wasm: &[u8]) -> nebula_runtime::HostCtx {
         Err(err) if err.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt) => {
             panic!(
                 "the guest hit the {}ms epoch deadline while booting. That is the \
-                 measurement being too slow, not the sandbox being wrong — lower \
+                 measurement being too slow, not the sandbox being wrong: lower \
                  HASH_ROUNDS in guests/examples/heavy_init and rebuild.",
                 nebula_runtime::engine::DEFAULT_DEADLINE_TICKS
             )
@@ -90,7 +90,7 @@ fn wizened_module_pays_no_boot_cost_at_request_time() {
     // The mechanism, asserted directly: the raw module still exports the
     // initializer and so gets it called on every request; the wizened module had
     // it run at build time and no longer exports it. Nothing in the runtime
-    // branches on "is this wizened" — the export's absence is the whole signal.
+    // branches on "is this wizened": the export's absence is the whole signal.
     let raw_module = runtime
         .cache()
         .get_or_compile(runtime.engine(), runtime.linker(), &raw)

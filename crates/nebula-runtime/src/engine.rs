@@ -1,6 +1,6 @@
 //! Engine configuration, resource ceilings, and the epoch ticker.
 //!
-//! See README.md §5.1 (engine config), §6.1 (epochs), §6.3–6.4 (limits).
+//! See README.md §5.1 (engine config), §6.1 (epochs), §6.3-6.4 (limits).
 
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -22,7 +22,7 @@ pub const MAX_MEMORY_BYTES: usize = 128 << 20; // 128 MiB
 /// The pooling allocator reserves this much address space per slot, so it must
 /// be at least any per-function ceiling (§6.3). Deliberately kept *above*
 /// [`MAX_MEMORY_BYTES`] so the per-store limiter is the binding constraint and
-/// the pool is only the backstop — if the two were equal, dropping the limiter
+/// the pool is only the backstop: if the two were equal, dropping the limiter
 /// would go unnoticed because the pool would silently enforce the same number.
 pub const POOL_MAX_MEMORY_BYTES: usize = 256 << 20; // 256 MiB
 pub const MAX_WASM_STACK_BYTES: usize = 512 << 10; // 512 KiB
@@ -37,7 +37,7 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(1);
 pub const DEFAULT_DEADLINE_TICKS: u64 = 50;
 
 /// One engine per process, shared across all tenants. Construction is
-/// expensive — it reserves the pooling allocator's address space up front —
+/// expensive (it reserves the pooling allocator's address space up front),
 /// so this is called once at startup, never per request.
 pub fn engine() -> Result<Engine> {
     let mut cfg = Config::new();
@@ -70,7 +70,7 @@ pub fn engine() -> Result<Engine> {
 /// `StoreLimits` plus a record of whether it ever refused a growth request.
 ///
 /// Wasmtime turns a refusal into `memory.grow` returning `-1`, which a
-/// well-written guest handles — so a refusal on its own is not a failure. But
+/// well-written guest handles, so a refusal on its own is not a failure. But
 /// when execution *does* fail after one, the ceiling is the reason, and §12
 /// wants that reported as `MEMORY_LIMIT` rather than as whatever trap the guest
 /// happened to hit next. Nothing downstream can tell the difference after the
@@ -141,7 +141,7 @@ pub fn store_limits() -> Limits {
 /// Drives `Engine::increment_epoch` so epoch deadlines actually fire.
 ///
 /// Without this thread running, `set_epoch_deadline` never trips and an
-/// infinite-loop guest hangs forever — the ticker is load-bearing, not
+/// infinite-loop guest hangs forever: the ticker is load-bearing, not
 /// optional. Holds a weak reference so the thread exits once the last `Engine`
 /// clone is dropped.
 pub fn spawn_epoch_ticker(engine: &Engine) -> JoinHandle<()> {

@@ -76,7 +76,7 @@ impl Mesh {
 /// Binds both servers on port 0 and serves them.
 ///
 /// `TcpListener::bind` is already listening by the time this returns, so a
-/// client can connect immediately — no sleeping and hoping the server came up.
+/// client can connect immediately: no sleeping and hoping the server came up.
 async fn start_mesh(threads: usize, max_concurrent: usize, liveness: Duration) -> Mesh {
     let membership = Arc::new(Membership::new(liveness));
     let registry = Arc::new(Registry::new(temp_dir("registry")).expect("registry"));
@@ -280,7 +280,7 @@ async fn an_overloaded_worker_sheds_with_resource_exhausted() {
         "§10.3 sheds with RESOURCE_EXHAUSTED"
     );
 
-    // And the request that did get in still finishes — as a timeout, since it
+    // And the request that did get in still finishes, as a timeout, since it
     // spins until the epoch deadline.
     let finished = occupied.await.expect("task").expect("execute").into_inner();
     assert_eq!(finished.outcome, Outcome::Timeout as i32);
@@ -312,7 +312,7 @@ async fn guest_faults_map_to_outcomes_not_grpc_errors() {
     assert_eq!(trapped.outcome, Outcome::Trap as i32);
     assert!(
         !trapped.fault_detail.is_empty(),
-        "guest fault detail goes back to the caller — it is their code"
+        "guest fault detail goes back to the caller: it is their code"
     );
 
     let timed_out = worker

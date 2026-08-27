@@ -34,7 +34,7 @@ impl Ring {
         Self::default()
     }
 
-    /// Adds a worker. Idempotent — re-inserting a live node rewrites the same
+    /// Adds a worker. Idempotent: re-inserting a live node rewrites the same
     /// points, so a duplicate `Register` cannot skew the ring.
     pub fn insert(&mut self, node: &str) {
         for replica in 0..VIRTUAL_NODES {
@@ -85,7 +85,7 @@ impl Ring {
     ///
     /// Not written as `candidates(key).next()`: that would allocate a `HashSet`
     /// for deduplication on every request, and the owner lookup needs no
-    /// deduplication at all. This is the hot path — one hash, one `range`, no
+    /// deduplication at all. This is the hot path: one hash, one `range`, no
     /// allocation.
     pub fn route(&self, key: &str) -> Option<&str> {
         let start = hash64(key.as_bytes());
@@ -98,7 +98,7 @@ impl Ring {
 
     /// Physical workers in ring order from `key`'s position, each yielded once.
     ///
-    /// The first is the owner; the rest are the failover walk of §9.1 — the
+    /// The first is the owner; the rest are the failover walk of §9.1: the
     /// caller takes the first healthy one. This is deliberately not
     /// replication: the next node has no warm cache and will cold-start.
     pub fn candidates(&self, key: &str) -> impl Iterator<Item = &str> {
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn ten_thousand_keys_land_within_ten_percent_of_even_across_three_workers() {
         // The Phase 3 requirement, exactly: 10 000 keys, 3 workers, 10% bound.
-        // Fixed seed, so this is reproducible rather than a coin flip — see
+        // Fixed seed, so this is reproducible rather than a coin flip: see
         // `distribution_holds_across_many_key_sets` for why that distinction is
         // not pedantry here.
         let ring = ring_of(&NODES);
@@ -203,7 +203,7 @@ mod tests {
     fn distribution_holds_across_many_key_sets() {
         // A single key set says very little about a distribution bound.
         // Consistent hashing's imbalance falls off as 1/sqrt(V), so V=160 gives
-        // roughly 8% — close enough to the 10% line that the answer depends on
+        // roughly 8%: close enough to the 10% line that the answer depends on
         // which keys you picked.
         //
         // Measured here over 200 key sets of 10 000 keys on a 3-worker ring:
@@ -212,7 +212,7 @@ mod tests {
         // So 10% is the *typical* case at V=160, not a guarantee, and the
         // single-seed test above passes on a representative draw rather than a
         // lucky one. If a hard worst-case bound is ever required, raise
-        // VIRTUAL_NODES — error shrinks as 1/sqrt(V), so a 10% worst case wants
+        // VIRTUAL_NODES: error shrinks as 1/sqrt(V), so a 10% worst case wants
         // roughly 640. Do not instead quietly widen the numbers below.
         let ring = ring_of(&NODES);
         let mut drifts: Vec<f64> = (0..64u64)
@@ -233,7 +233,7 @@ mod tests {
 
         assert!(
             median <= 0.10,
-            "typical drift {:.1}% exceeds 10% — the ring got worse, not just unlucky",
+            "typical drift {:.1}% exceeds 10%: the ring got worse, not just unlucky",
             median * 100.0
         );
         assert!(

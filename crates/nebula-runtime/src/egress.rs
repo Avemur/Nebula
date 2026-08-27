@@ -24,7 +24,7 @@
 //!    ask again, and that request is checked like any other.
 //! 6. **Time comes out of the request budget, never on top of it.** Epoch
 //!    interruption (§6.1) only fires at WASM instruction boundaries, so a guest
-//!    parked in a host call cannot be interrupted at all — without an explicit
+//!    parked in a host call cannot be interrupted at all: without an explicit
 //!    socket timeout the deadline would stop being a bound.
 
 use std::collections::HashMap;
@@ -45,7 +45,7 @@ pub const MAX_RESPONSE_BYTES: usize = 1 << 20;
 ///
 /// **Both the policy and its enforcement live on the worker**, and that is the
 /// point. The worker is the process that opens the socket, so a policy checked
-/// anywhere else is one something can route around — and a policy *sent* to the
+/// anywhere else is one something can route around, and a policy *sent* to the
 /// worker in a request would be a policy the request could influence. This one
 /// is local configuration, and nothing on the wire can change it.
 #[derive(Clone, Debug, Default)]
@@ -93,7 +93,7 @@ impl Policy {
     /// Replacement rather than union so that reading the configuration answers
     /// "what can this tenant reach" in one line. A union would mean the answer
     /// is always two lines and the shared list can never be narrowed for
-    /// anyone — which is the case an operator most often wants.
+    /// anyone, which is the case an operator most often wants.
     pub fn for_tenant<I, S>(mut self, tenant: &str, hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -116,7 +116,7 @@ impl Policy {
     /// **This switches off the single most important check in this module**, so
     /// it is spelled out rather than inferred and it is never on by default.
     /// The legitimate use is an operator who has deliberately allowlisted an
-    /// internal service — the allowlist is still enforced, so this widens what
+    /// internal service: the allowlist is still enforced, so this widens what
     /// an *already permitted* host may resolve to and nothing else. It does not
     /// permit `169.254.169.254` unless somebody put it on the list.
     ///
@@ -185,7 +185,7 @@ pub enum Refusal {
     Disabled,
     /// Not `http://…`, or unparseable.
     BadUrl,
-    /// The TLS handshake failed — an untrusted certificate, a name mismatch, or
+    /// The TLS handshake failed: an untrusted certificate, a name mismatch, or
     /// a peer that does not speak TLS on that port. Named separately because it
     /// is the one failure a caller can usually fix.
     Tls,
@@ -273,7 +273,7 @@ fn parse(url: &str) -> Result<Target, Refusal> {
 ///
 /// Roots come from `webpki-roots` rather than the platform store: a container
 /// with no `ca-certificates` package installed would otherwise fail every
-/// handshake with an error that looks like the remote's fault. Built once —
+/// handshake with an error that looks like the remote's fault. Built once:
 /// parsing a few hundred certificates per request would dwarf the request.
 fn tls_config() -> Result<Arc<ClientConfig>, Refusal> {
     static CONFIG: OnceLock<Option<Arc<ClientConfig>>> = OnceLock::new();
@@ -336,7 +336,7 @@ impl Write for Transport {
 /// Written as an allowlist of "not one of these" rather than using
 /// `IpAddr::is_global`, which is still unstable. The list is the one that
 /// matters in practice: loopback, the RFC 1918 ranges, carrier-grade NAT, and
-/// above all `169.254.0.0/16` — because `169.254.169.254` is the cloud metadata
+/// above all `169.254.0.0/16`, because `169.254.169.254` is the cloud metadata
 /// endpoint and is the single most valuable thing an SSRF can reach.
 fn is_public(ip: &IpAddr) -> bool {
     match ip {
@@ -351,7 +351,7 @@ fn is_public(ip: &IpAddr) -> bool {
                 || v4.is_multicast()
                 // 100.64.0.0/10, carrier-grade NAT.
                 || (a == 100 && (64..128).contains(&b))
-                // 0.0.0.0/8, "this network" — and `0.0.0.0` itself routes to
+                // 0.0.0.0/8, "this network", and `0.0.0.0` itself routes to
                 // localhost on Linux.
                 || a == 0
                 // 192.0.0.0/24, IETF protocol assignments.
@@ -380,7 +380,7 @@ fn is_public(ip: &IpAddr) -> bool {
 /// Fetches `url`, or explains why it did not.
 ///
 /// `budget` is what remains of the request's deadline, and it bounds the whole
-/// operation — resolution, connect, and read. Returns the **raw response**:
+/// operation: resolution, connect, and read. Returns the **raw response**:
 /// status line, headers, blank line, body. Handing back only the body would
 /// hide the status code from the guest, and a script that cannot tell `200`
 /// from `404` will treat an error page as data.
@@ -523,7 +523,7 @@ mod tests {
         let policy = Policy::new(["api.example.com", "Example.ORG"]);
         assert!(policy.allows("acme", "api.example.com"));
         // Host comparison is case-insensitive in DNS, so the allowlist has to
-        // be too — otherwise `API.example.com` is a bypass.
+        // be too, otherwise `API.example.com` is a bypass.
         assert!(policy.allows("acme", "API.EXAMPLE.COM"));
         assert!(policy.allows("acme", "example.org"));
 
@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn the_metadata_endpoint_is_not_reachable() {
         // 169.254.169.254 is the single most valuable thing an SSRF can reach,
-        // and it is inside link-local rather than any RFC 1918 range — a
+        // and it is inside link-local rather than any RFC 1918 range: a
         // private-address check that only covers 10/172/192 misses it.
         assert!(!is_public(&ip("169.254.169.254")));
         assert!(!is_public(&ip("::ffff:169.254.169.254")));
@@ -677,7 +677,7 @@ not tls at all",
     ///
     /// It earns that: nothing else proves the root store, the handshake, and
     /// certificate verification work *together*. A `Refusal::Tls` is
-    /// deliberately not in the skip list — that is the failure this exists to
+    /// deliberately not in the skip list: that is the failure this exists to
     /// catch.
     #[test]
     fn a_real_https_host_can_actually_be_fetched() {
@@ -773,7 +773,7 @@ not tls at all",
     fn an_allowlisted_host_that_resolves_inward_is_still_refused() {
         // The check that matters. `localhost` is a perfectly ordinary hostname
         // an operator could be talked into allowlisting, and it resolves to
-        // loopback — so allowlisting a *name* must never be enough on its own.
+        // loopback, so allowlisting a *name* must never be enough on its own.
         let policy = Policy::new(["localhost"]);
         assert_eq!(
             fetch(&policy, "t", "http://localhost:1/", Duration::from_secs(1)),

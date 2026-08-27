@@ -32,7 +32,7 @@ pub fn temp_dir(tag: &str) -> PathBuf {
 /// A single-shot HTTP server on loopback, returning its port.
 ///
 /// A real socket rather than a mock: the client under test is hand-written, and
-/// the bugs it can have — framing, the `Host` header, reading to EOF — are
+/// the bugs it can have (framing, the `Host` header, reading to EOF) are
 /// exactly the ones a mock would paper over.
 pub fn one_shot_server(response: &'static str) -> u16 {
     use std::io::{Read, Write};

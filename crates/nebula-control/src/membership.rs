@@ -133,7 +133,7 @@ impl Membership {
     /// Ordered dispatch plan of `(node_id, address)` for `key`.
     ///
     /// The ring's owner leads, unless it is carrying more than
-    /// [`BOUNDED_LOAD_FACTOR`] times the mean cluster load — then the walk
+    /// [`BOUNDED_LOAD_FACTOR`] times the mean cluster load, then the walk
     /// starts at the next node instead (§9.2). Everything after the lead stays
     /// in ring order, so failover is unaffected by the load check.
     ///
@@ -300,7 +300,7 @@ mod tests {
 
         // Same id, new generation: the process died and came back.
         assert!(!beat(&membership, "worker-a", 999));
-        // The old entry is untouched until it either re-registers or ages out —
+        // The old entry is untouched until it either re-registers or ages out:
         // a beat from an unknown generation must not refresh someone else's
         // liveness.
         assert!(membership.contains("worker-a"));

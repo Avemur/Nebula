@@ -26,7 +26,7 @@ pub const HANDLER_EXPORT: &str = "run";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolError {
-    /// The queue is full — the second, earlier shed signal of §10.3.
+    /// The queue is full: the second, earlier shed signal of §10.3.
     Full,
     /// The pool is gone, or a worker thread died mid-job.
     Stopped,
@@ -68,7 +68,7 @@ struct Job {
     /// Carried explicitly because this job crosses from a tokio task to a plain
     /// OS thread, and nothing propagates context across a channel. Without it
     /// `wasm_execute` would appear at the root of the trace rather than under
-    /// the request that caused it — which is exactly the link you open a
+    /// the request that caused it, which is exactly the link you open a
     /// latency trace to follow.
     parent: tracing::Span,
 }
@@ -101,7 +101,7 @@ pub fn default_threads() -> usize {
 impl ExecPool {
     /// `max_concurrent` is the admission limit and bounds the queue: it is what
     /// §10.3 actually controls. Little's Law says `L = λW`, so bounding
-    /// concurrency `L` bounds latency `W` — which is why this is a concurrency
+    /// concurrency `L` bounds latency `W`, which is why this is a concurrency
     /// limit and not a latency threshold.
     ///
     /// Sizing it above `threads` allows a little queueing; sizing it equal
@@ -281,7 +281,7 @@ impl ExecPool {
         self.in_flight.load(Ordering::Relaxed)
     }
 
-    /// Queue depth — a leading indicator of shedding (§14).
+    /// Queue depth: a leading indicator of shedding (§14).
     pub fn queue_depth(&self) -> usize {
         self.queued.load(Ordering::Relaxed)
     }

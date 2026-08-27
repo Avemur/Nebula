@@ -17,7 +17,7 @@
 //! to return. §22.1 then landed the interpreter guest, and the agent-facing
 //! surface collapsed to a single tool: an agent does not deploy a module per
 //! snippet, it sends source. The per-function story is still wanted for
-//! purpose-built wasm tools, and it is still §22.2 — it is just no longer on
+//! purpose-built wasm tools, and it is still §22.2: it is just no longer on
 //! the path to a working MCP server.
 //!
 //! # Transport
@@ -150,7 +150,7 @@ fn error(id: Value, code: i32, message: impl Into<String>) -> Response {
 /// This is §11.2's rule one level further out. There, a guest trap is an
 /// `Outcome` inside a successful RPC rather than a gRPC status, because a
 /// tenant's infinite loop is not a transport failure. Here, a script that threw
-/// is content the model can read and correct — a JSON-RPC error would be
+/// is content the model can read and correct: a JSON-RPC error would be
 /// handled by the client's plumbing and never reach the model at all.
 fn tool_result(id: Value, text: String, is_error: bool) -> Response {
     result(
@@ -177,7 +177,7 @@ async fn handle(State(server): State<Arc<Server>>, headers: HeaderMap, body: Str
     };
 
     let Some(id) = rpc.id else {
-        // A notification — `notifications/initialized` is the one that matters.
+        // A notification: `notifications/initialized` is the one that matters.
         // Nothing to say, and saying it anyway would be a protocol violation.
         return StatusCode::ACCEPTED.into_response();
     };
@@ -372,7 +372,7 @@ fn explain(reply: &crate::gateway::Reply, timeout_ms: u32, function_id: &str) ->
             .to_string(),
         "trap" => format!(
             "The sandbox aborted the script: {detail}. This is a fault in the \
-             interpreter rather than an ordinary exception — an uncaught JavaScript \
+             interpreter rather than an ordinary exception: an uncaught JavaScript \
              error would have come back as normal output."
         ),
         "unknown_function" | "module_not_found" => format!(

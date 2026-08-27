@@ -81,7 +81,7 @@ fn wasi_stdin_carries_the_request_body() {
 }
 
 /// A guest that answers on stdout gets stdout as its body; one that uses
-/// `response_write` gets that instead. Same reason as the test above — the
+/// `response_write` gets that instead. Same reason as the test above: the
 /// wizenable guests have no `nebula.response_write` to call.
 #[test]
 fn the_response_body_falls_back_to_stdout_only_when_nothing_was_written() {
@@ -280,7 +280,7 @@ fn kv_missing_key_returns_minus_one() {
 #[test]
 fn kv_rejects_an_oversized_value_without_storing_anything() {
     // 65537 bytes is one past MAX_VALUE_BYTES. The write must be refused
-    // outright — storing a truncated value would be silent data corruption.
+    // outright: storing a truncated value would be silent data corruption.
     run_as(
         "kv-big-value",
         r#"
@@ -385,7 +385,7 @@ fn kv_is_isolated_between_tenants() {
 // KV caps, tested directly against a fresh store
 //
 // These fill the store to capacity, so they use their own `Kv` rather than the
-// shared runtime's — otherwise they would starve every other test in this
+// shared runtime's, otherwise they would starve every other test in this
 // binary.
 // ---------------------------------------------------------------------------
 
@@ -541,8 +541,8 @@ const FETCHER: &str = r#"
 /// A single-shot HTTP server on loopback. Returns its port.
 ///
 /// A real socket rather than a mock: the thing under test is a hand-written
-/// HTTP client, and the bugs it can have — framing, the `Host` header, reading
-/// to EOF — are exactly the ones a mock would paper over.
+/// HTTP client, and the bugs it can have (framing, the `Host` header, reading
+/// to EOF) are exactly the ones a mock would paper over.
 fn one_shot_server(response: &'static str) -> u16 {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -576,7 +576,7 @@ fn a_guest_cannot_reach_the_network_unless_an_operator_said_so() {
     let port = one_shot_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
 
     // The default. Every other test in this file passes an explicit policy, so
-    // this is the one that pins the default itself — and the default is the
+    // this is the one that pins the default itself, and the default is the
     // only thing standing between a fresh deployment and an SSRF proxy.
     let answer = fetch_via_guest(
         nebula_runtime::egress::Policy::default(),
@@ -589,7 +589,7 @@ fn a_guest_cannot_reach_the_network_unless_an_operator_said_so() {
 fn an_allowed_host_comes_back_whole() {
     let port = one_shot_server("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot there");
 
-    // Loopback is not a public address, so this needs the escape hatch — the
+    // Loopback is not a public address, so this needs the escape hatch: the
     // only way to point the client at a server the test controls. The address
     // check is asserted on its own, against the whole list of ranges it has to
     // reject; what this test is for is the client itself, which is hand-written
@@ -658,7 +658,7 @@ fn a_refusal_is_recoverable_rather_than_a_trap() {
         .expect("a refused fetch must not trap the guest");
 
     assert_eq!(ctx.response, b"REFUSED");
-    // The reason goes to the host, never to the guest — a guest told *why* a
+    // The reason goes to the host, never to the guest: a guest told *why* a
     // host was blocked can enumerate the allowlist one request at a time.
     assert!(
         ctx.logs
@@ -697,7 +697,7 @@ fn the_tenant_selects_the_allowlist() {
     assert!(fetch_as("allowed").starts_with("HTTP/1.1 200 OK"));
     assert_eq!(fetch_as("denied"), "REFUSED");
     // A tenant with no entry of its own falls back to the shared list, which is
-    // empty here — so an unknown caller reaches nothing rather than everything.
+    // empty here, so an unknown caller reaches nothing rather than everything.
     assert_eq!(fetch_as("unknown"), "REFUSED");
 }
 
@@ -725,7 +725,7 @@ fn two_sessions_of_one_tenant_cannot_read_each_other() {
         b"second conversation"
     );
 
-    // And an unscoped request is its own namespace, not a shared one — so it
+    // And an unscoped request is its own namespace, not a shared one, so it
     // never sees a session's scratchpad by accident.
     assert!(kv.get("acme", "", b"draft").is_none());
 }
@@ -737,7 +737,7 @@ fn an_expired_entry_is_neither_served_nor_left_holding_space() {
     assert_eq!(kv.len(), 1);
     assert!(kv.bytes() > 0);
 
-    // Nothing has expired yet, so a sweep must leave a live entry alone —
+    // Nothing has expired yet, so a sweep must leave a live entry alone:
     // a sweep that dropped everything would pass the assertions below while
     // making the store useless.
     assert_eq!(kv.expire(), 0);

@@ -35,7 +35,7 @@ pub const TRACEPARENT_METADATA: &str = "traceparent";
 /// The trace id out of a `traceparent`, if it looks like one.
 ///
 /// The gateway validated the header and re-emitted it, and §13 makes the mesh
-/// trusted, so this does not re-parse — it takes the field by position. The
+/// trusted, so this does not re-parse: it takes the field by position. The
 /// length and hex checks are here only so a malformed value produces no
 /// `trace_id` rather than a confusing one; there is nothing to defend against.
 fn trace_id_of(request: &Request<ExecuteRequest>) -> Option<String> {
@@ -64,7 +64,7 @@ pub struct WorkerService {
     ///
     /// Separate from the runtime's module cache because `Runtime::execute` takes
     /// bytes: the cache holds *compiled* modules, this holds the source they
-    /// were compiled from. Concurrent misses for one hash can fetch twice —
+    /// were compiled from. Concurrent misses for one hash can fetch twice:
     /// wasteful but harmless, since the compile behind it is single-flighted.
     artifacts: Mutex<HashMap<String, Arc<Vec<u8>>>>,
     draining: AtomicBool,
@@ -206,7 +206,7 @@ fn classify(result: wasmtime::Result<HostCtx>) -> ExecuteResponse {
                 }
             };
 
-            // §12: guest fault detail goes back to the caller — it is their
+            // §12. Guest fault detail goes back to the caller: it is their
             // code. Host internal detail does not; it is logged here and the
             // caller gets an opaque outcome.
             let fault_detail = if outcome == Outcome::Internal {
@@ -277,7 +277,7 @@ impl NebulaWorker for WorkerService {
         span.record("function_id", request.function_id.as_str());
         span.record("tenant", request.tenant.as_str());
 
-        // The permit is held across the fetch as well as the execution — a cold
+        // The permit is held across the fetch as well as the execution: a cold
         // start is in-flight work and should count against capacity. Dropping
         // out of this function early releases it either way.
         let (wasm, cold) = match self.artifact(&request.content_hash).await {
@@ -308,7 +308,7 @@ impl NebulaWorker for WorkerService {
 
         // §22.5. The gateway routed this request to *this* worker because of the
         // partition key, so the session's scratchpad is in this process's KV
-        // shim — that is the whole mechanism, and it is why the state is
+        // shim: that is the whole mechanism, and it is why the state is
         // best-effort: a ring rebalance sends the next request elsewhere.
         let session = request.partition_key.unwrap_or_default();
 
@@ -415,7 +415,7 @@ mod trace_tests {
     use super::*;
     use nebula_control::trace::TraceContext;
 
-    /// The worker reads what the gateway writes — asserted against the real
+    /// The worker reads what the gateway writes: asserted against the real
     /// producer rather than a string someone typed here.
     ///
     /// This is the whole integration risk in one test. Both sides could be
@@ -454,7 +454,7 @@ mod trace_tests {
 
     #[test]
     fn an_absent_or_unusable_traceparent_is_simply_no_trace_id() {
-        // Nothing here is a defence — §13 makes the mesh trusted. It only has
+        // Nothing here is a defence: §13 makes the mesh trusted. It only has
         // to produce *no* id rather than a confusing one.
         assert_eq!(trace_id_of(&Request::new(ExecuteRequest::default())), None);
 

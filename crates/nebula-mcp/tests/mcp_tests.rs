@@ -1,8 +1,8 @@
 //! MCP protocol and fault-translation tests (README.md §22.3).
 //!
 //! The gateway is a stub rather than a real cluster, for two reasons. It can
-//! produce faults a real cluster will not produce on demand — `worker_shed`,
-//! `cluster_at_capacity`, a dropped connection — and it can *assert what it was
+//! produce faults a real cluster will not produce on demand (`worker_shed`,
+//! `cluster_at_capacity`, a dropped connection), and it can *assert what it was
 //! sent*, which is where the integration risk actually lives: a wrong header
 //! name or a wrong path would sail past a test that only checked the JSON.
 //!
@@ -680,7 +680,7 @@ async fn an_unreachable_cluster_still_leaves_the_interpreter_listed() {
     let harness = Harness::unreachable().await;
 
     // `tools/list` returning an error would leave a client with *no* tools at
-    // all, including the built-in one — a worse answer than the built-in one
+    // all, including the built-in one: a worse answer than the built-in one
     // on its own.
     let (_, response) = harness
         .rpc(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))

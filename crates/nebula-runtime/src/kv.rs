@@ -23,7 +23,7 @@ pub const MAX_BYTES: usize = 16 << 20; // 16 MiB
 ///
 /// Long enough for an agent to think between steps; short enough that abandoned
 /// sessions cannot hold the node's budget forever. Without it the store fills
-/// once and then refuses every write for the life of the process — a cap with
+/// once and then refuses every write for the life of the process: a cap with
 /// no expiry is a cap that becomes permanent.
 pub const TTL: Duration = Duration::from_secs(600);
 
@@ -36,7 +36,7 @@ pub const MAX_KEY_BYTES: usize = 1024;
 pub const MAX_VALUE_BYTES: usize = 64 << 10; // 64 KiB
 
 /// Keys are `(tenant, session, key)` tuples rather than a concatenated string,
-/// so no choice of key bytes can land a guest in another tenant's namespace — or
+/// so no choice of key bytes can land a guest in another tenant's namespace, or
 /// another session's. A delimiter scheme would need an argument about escaping;
 /// a tuple needs none.
 ///
@@ -93,7 +93,7 @@ impl Kv {
     ///
     /// The sweep happens here rather than on a timer or on every write: it costs
     /// a full scan, and the common path should not pay for the rare one. It also
-    /// cannot happen inside `try_set` — `retain` touches every shard and would
+    /// cannot happen inside `try_set`: `retain` touches every shard and would
     /// deadlock against the `entry` lock that function holds.
     pub fn set(
         &self,
@@ -126,7 +126,7 @@ impl Kv {
 
         // `entry` holds this key's shard lock for the whole read-modify-write.
         // Nothing inside may call a `DashMap` method that touches all shards
-        // (`len`, `iter`, `clear`) — that would deadlock against the lock we are
+        // (`len`, `iter`, `clear`): that would deadlock against the lock we are
         // already holding. Hence the separate `entries` counter below.
         match self
             .map
@@ -165,7 +165,7 @@ impl Kv {
     /// Called when a write is refused rather than on a timer: a sweep costs a
     /// full scan, and doing it on every write would make the common path pay
     /// for the rare one. `retain` touches every shard, so this must never be
-    /// called while an `entry` lock is held — it would deadlock against it.
+    /// called while an `entry` lock is held: it would deadlock against it.
     pub fn expire(&self) -> usize {
         let now = Instant::now();
         let mut freed = 0;

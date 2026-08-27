@@ -63,7 +63,7 @@ pub async fn register(
 
 /// Beats until cancelled.
 ///
-/// Re-registers when the control plane says it does not recognise this node —
+/// Re-registers when the control plane says it does not recognise this node,
 /// which is what a control plane restart looks like from here. Transport errors
 /// are logged and retried on the next tick rather than ending the loop: the
 /// control plane being briefly unreachable is not a reason for a healthy worker

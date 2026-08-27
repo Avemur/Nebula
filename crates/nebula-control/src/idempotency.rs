@@ -7,7 +7,7 @@
 //!
 //! An `Idempotency-Key` closes the half of that gap the gateway can see. What
 //! it covers and what it does not is stated precisely in §22.4 and is not
-//! guesswork — see [`Store::finish`].
+//! guesswork: see [`Store::finish`].
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -75,7 +75,7 @@ pub enum Claim<'a, T> {
 ///
 /// The guard is the whole reason this is not a bare `claim`/`finish` pair. A
 /// client that hangs up mid-request has its handler future dropped, so `finish`
-/// never runs — and a slot left claimed answers `409` for the entire TTL. That
+/// never runs, and a slot left claimed answers `409` for the entire TTL. That
 /// would make the key a liability in exactly the case it exists to serve: the
 /// client lost the answer and is about to retry.
 pub struct Claimed<'a, T> {
@@ -113,7 +113,7 @@ pub struct Store<T> {
 struct State<T> {
     map: HashMap<Slot, Entry<T>>,
     /// Sum of the stored answers' sizes, maintained on insert and removal
-    /// rather than recomputed — walking the map on the request path is the kind
+    /// rather than recomputed: walking the map on the request path is the kind
     /// of thing that is fine right up until it is not.
     bytes: usize,
 }
@@ -148,7 +148,7 @@ impl<T: Clone> Store<T> {
     ///
     /// The in-flight marker is written *before* the request is dispatched, and
     /// that ordering is the point. Without it two concurrent retries would both
-    /// miss, both execute, and both store — an idempotency key that permits
+    /// miss, both execute, and both store: an idempotency key that permits
     /// double execution under exactly the concurrency it exists to handle.
     pub fn claim(&self, slot: &Slot) -> Claim<'_, T> {
         let mut state = self.entries.lock().expect("idempotency store");
@@ -199,7 +199,7 @@ impl<T: Clone> Store<T> {
     /// **`replayable` is the whole design.** Only an answer that a retry should
     /// receive verbatim gets stored:
     ///
-    /// * A completed execution — success or guest fault — is stored. The script
+    /// * A completed execution, success or guest fault, is stored. The script
     ///   ran and produced this; running it again would produce it again.
     /// * "Nothing ran" (`503`, no worker, shed) releases the slot, because a
     ///   retry *should* actually retry.
@@ -208,7 +208,7 @@ impl<T: Clone> Store<T> {
     ///   because the gateway never got one. §22.4 says so out loud.
     ///
     /// An answer too large for the remaining budget is not stored either. A
-    /// retry then re-runs, which is the guarantee that existed before the key —
+    /// retry then re-runs, which is the guarantee that existed before the key:
     /// the alternative is letting one caller's 1 MiB responses evict everyone
     /// else's.
     fn finish(&self, slot: &Slot, answer: &T, replayable: bool, bytes: usize) {
@@ -282,7 +282,7 @@ mod tests {
     fn claimed<T: Clone>(store: &Store<T>, slot: &Slot) -> &'static str {
         match store.claim(slot) {
             // Dropping the guard here releases the claim, which is exactly what
-            // a probe should do — it is not going to answer.
+            // a probe should do: it is not going to answer.
             Claim::Proceed(_) => "proceed",
             Claim::Replay(_) => "replay",
             Claim::InFlight => "in-flight",
@@ -332,7 +332,7 @@ mod tests {
 
         // A client that hangs up has its handler future dropped, so the answer
         // never arrives. Without the guard the slot would answer 409 for the
-        // whole TTL — to the very retry the key exists to serve.
+        // whole TTL: to the very retry the key exists to serve.
         match store.claim(&slot) {
             Claim::Proceed(claim) => drop(claim),
             _ => panic!("expected a free slot"),
@@ -392,7 +392,7 @@ mod tests {
         let big = "x".repeat(1 << 20); // one response body at the §7.2 cap
 
         // Far fewer than MAX_ENTRIES, so a count cap alone would let every one
-        // of these in — which at 1 MiB each is how a keyed client turns the
+        // of these in, which at 1 MiB each is how a keyed client turns the
         // gateway into ten gigabytes of held memory.
         for n in 0..200 {
             served(&store, &slot("a", &format!("big{n}")), &big, true);

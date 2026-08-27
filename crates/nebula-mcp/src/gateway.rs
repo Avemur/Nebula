@@ -3,7 +3,7 @@
 //! ponytail: hand-rolled HTTP/1.1 over `TcpStream`, one connection per call.
 //! Every request sends `Connection: close`, so "read to EOF" is the whole
 //! response framing and there is no chunked decoding to get wrong. The ceiling
-//! is the connection setup per tool call — negligible against a sandboxed
+//! is the connection setup per tool call: negligible against a sandboxed
 //! script, and the upgrade path is a pooled `hyper-util` client if a tool call
 //! ever gets cheap enough for a TCP handshake to show up next to it.
 
@@ -48,7 +48,7 @@ impl Reply {
         String::from_utf8_lossy(&self.body).trim_end().to_string()
     }
 
-    /// The fault name, or `unknown` when a non-200 arrived without one — which
+    /// The fault name, or `unknown` when a non-200 arrived without one, which
     /// would mean something other than the gateway answered.
     pub fn fault_or_unknown(&self) -> &str {
         self.fault.as_deref().unwrap_or("unknown")
@@ -56,7 +56,7 @@ impl Reply {
 }
 
 impl Gateway {
-    /// `GET /tools` — the descriptors of every deployed function that has one
+    /// `GET /tools`: the descriptors of every deployed function that has one
     /// (§22.2).
     ///
     /// Returns an empty list rather than an error when the cluster is
@@ -126,7 +126,7 @@ impl Gateway {
     }
 }
 
-/// Hex, dashes, and a sane length — enough that a forwarded value cannot
+/// Hex, dashes, and a sane length: enough that a forwarded value cannot
 /// smuggle a second header, which is the only thing that would matter here.
 fn is_traceparent(value: &str) -> bool {
     (11..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 /// Ceiling on tracked tenants.
 ///
 /// a tenant id arrives from a token (§13), so a caller can invent
-/// tenants for free — an unbounded map here would be a memory-exhaustion vector
+/// tenants for free: an unbounded map here would be a memory-exhaustion vector
 /// created by the very thing meant to prevent one.
 pub const MAX_TENANTS: usize = 10_000;
 
@@ -25,7 +25,7 @@ pub const MAX_TENANTS: usize = 10_000;
 pub struct Limit {
     /// Sustained requests per second.
     pub per_second: f64,
-    /// Tokens the bucket holds when full — how far ahead a caller may run.
+    /// Tokens the bucket holds when full: how far ahead a caller may run.
     pub burst: f64,
 }
 
@@ -52,7 +52,7 @@ impl Limit {
     };
 
     /// Effectively no limit, for callers that have their own reason to be
-    /// exempt — a load test that would otherwise be measuring this module
+    /// exempt: a load test that would otherwise be measuring this module
     /// instead of the thing it claims to measure.
     ///
     /// A large finite number rather than infinity: `0.0 * f64::INFINITY` is
@@ -68,7 +68,7 @@ impl Limit {
 /// The deploy bucket must stay far tighter than the execute bucket.
 ///
 /// A compile-time assertion rather than a test, because clippy is right that a
-/// comparison between two constants is not something a test run discovers — and
+/// comparison between two constants is not something a test run discovers, and
 /// an invariant that fails the build is strictly better than one that fails an
 /// afternoon later. `PUT /functions/{id}` runs Wizer, which executes the
 /// caller's guest code in a subprocess on the control plane (§11.1). If these
@@ -107,7 +107,7 @@ impl Limiter {
 
     /// Spends one token for `tenant`, or reports how long until there is one.
     ///
-    /// Refill is lazy — computed from the elapsed time on access rather than by
+    /// Refill is lazy: computed from the elapsed time on access rather than by
     /// a background task. A timer per tenant would be a scheduler's worth of
     /// machinery for arithmetic that fits on one line.
     pub fn check(&self, tenant: &str) -> Decision {
@@ -140,7 +140,7 @@ impl Limiter {
         if buckets.len() >= MAX_TENANTS {
             // **Fail closed, and only for newcomers.** Admitting an untracked
             // tenant would hand unlimited capacity to exactly the caller that
-            // filled the map — minting fresh bearer tokens is free. Tenants
+            // filled the map: minting fresh bearer tokens is free. Tenants
             // already in the map are unaffected, so the cost of being wrong
             // here is one new tenant waiting while an operator looks at why
             // ten thousand of them are active.
@@ -225,7 +225,7 @@ mod tests {
 
         // A tenant idle for a long time must not bank credit. Without the
         // clamp, going quiet for a minute would buy a minute's worth of
-        // requests to spend at once — the opposite of a rate limit.
+        // requests to spend at once: the opposite of a rate limit.
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(spend(&limiter, "acme", 10), 3, "banked more than the burst");
     }

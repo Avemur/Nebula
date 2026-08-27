@@ -4,7 +4,7 @@
 //! benchmark harness link this directly, so the security and latency goals can
 //! be tested without one. gRPC and clustering live in `nebula-worker`.
 //!
-//! It does carry `rustls`, for the outbound HTTP of §22.8 — an egress host
+//! It does carry `rustls`, for the outbound HTTP of §22.8: an egress host
 //! function that cannot speak TLS cannot reach any real API. Nothing on the
 //! guest side touches it: TLS is terminated host-side, behind the allowlist and
 //! the address checks, and a `Runtime` with no egress policy never builds a
@@ -37,7 +37,7 @@ use crate::kv::Kv;
 /// The WASI reactor initializer (§4.3).
 ///
 /// A guest with expensive boot work exports this. A guest that has been through
-/// Wizer had it run at build time and no longer exports it — which is the whole
+/// Wizer had it run at build time and no longer exports it, which is the whole
 /// of the "zero-boot-time path": one code path, and a wizened module simply has
 /// nothing here to call.
 pub const INIT_EXPORT: &str = "_initialize";
@@ -45,7 +45,7 @@ pub const INIT_EXPORT: &str = "_initialize";
 /// Attached to an execution error when the store's limiter refused a growth
 /// request during the call (§6.3).
 ///
-/// The trap the guest ultimately hit is usually `MemoryOutOfBounds` — it asked
+/// The trap the guest ultimately hit is usually `MemoryOutOfBounds`: it asked
 /// for memory, was told no, and used the pointer anyway. Reporting that as a
 /// plain trap loses the only fact that matters, which is that *the host* said
 /// no. §12 calls this `MEMORY_LIMIT`.
@@ -62,7 +62,7 @@ impl std::error::Error for MemoryLimitExceeded {}
 
 /// Per-request host state.
 ///
-/// One of these per `Store`, never shared or reused across requests — that is
+/// One of these per `Store`, never shared or reused across requests: that is
 /// what makes tenant isolation structural rather than argued (§4.2, §13
 /// invariant 2). The KV handle is the one exception, and it is namespaced by
 /// `tenant` on every access.
@@ -88,7 +88,7 @@ pub struct HostCtx {
     ///
     /// Egress needs both: the epoch deadline of §6.1 only fires at WASM
     /// instruction boundaries, so a guest parked in a host call cannot be
-    /// interrupted — a socket timeout has to come out of the same budget or the
+    /// interrupted: a socket timeout has to come out of the same budget or the
     /// deadline stops being one.
     started: Instant,
     budget: Duration,
@@ -115,7 +115,7 @@ impl HostCtx {
         // "allowed but every address denied".
         //
         // stdin carries the request body. A guest that must survive Wizer can
-        // import nothing but WASI (R2), which rules out `nebula.request_read` —
+        // import nothing but WASI (R2), which rules out `nebula.request_read`,
         // so the interpreter guests of §22.1 read their source from here. The
         // clone is one memcpy of a body already capped at 1 MiB.
         let wasi = WasiCtxBuilder::new()
@@ -265,7 +265,7 @@ impl Runtime {
     /// Fetch-or-compile, instantiate, and call the exported `entry` function.
     ///
     /// Returns the store's `HostCtx` so the caller can read what the guest
-    /// produced. A guest trap surfaces as `Err` — Phase 3 maps that to the typed
+    /// produced. A guest trap surfaces as `Err`: Phase 3 maps that to the typed
     /// `Outcome` of §11.2 rather than an error, but at this layer an error is
     /// the honest representation.
     pub fn execute(
@@ -312,7 +312,7 @@ impl Runtime {
             let instance = cached.pre.instantiate(&mut *store)?;
 
             // Presence is checked with `get_func` rather than by treating a
-            // failed `get_typed_func` as "absent" — that would silently skip an
+            // failed `get_typed_func` as "absent": that would silently skip an
             // initializer with an unexpected signature instead of reporting it.
             if instance.get_func(&mut *store, INIT_EXPORT).is_some() {
                 instance
