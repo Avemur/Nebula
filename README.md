@@ -29,6 +29,7 @@
 20. [Risks & Open Questions](#20-risks--open-questions)
 21. [Deferred Work](#21-deferred-work)
 22. [Agent Ecosystem Integration](#22-agent-ecosystem-integration)
+23. [Handoff](#23-handoff)
 
 ---
 
@@ -819,7 +820,8 @@ received an answer to replay, so the retry is exactly as unsafe as before
 PUT  /functions/{function_id}      # deploy: body is the .wasm artifact
      X-Nebula-Tool-Schema: <opt, JSON descriptor, <= 16 KiB, §22.2>
      -> 201 { "content_hash": "...", "wizened": bool, "described": bool }
-     # no compile timing: compilation happens lazily on the worker, not here
+     # a worker compiles the artifact before the function is registered (§8.2),
+     # so a module that cannot compile is a 400 here rather than a 500 later
 GET  /healthz                      # gateway liveness
 GET  /cluster                      # node list, ring occupancy, per-node load
 GET  /tools                        # tool descriptors for agent clients (§22.2)
@@ -2485,3 +2487,138 @@ not an accident of luck. It is what the reserved plumbing in §21 was for. The
 work here is exposure, not architecture, and the moment an item on this list
 requires changing §4.2's fresh-instance invariant or §6's per-request budgets,
 it has left this section and belongs in §21.
+
+---
+
+## 23. Handoff
+
+Written at the point where the code stops. It records what is true right now,
+how to run the thing, and the handful of things that would otherwise be worked
+out a second time.
+
+### 23.1 The two conventions worth keeping
+
+**This document is the specification, and the code cites it.** Comments name
+section numbers, and when an implementation contradicts a section, the section
+is wrong and gets corrected in the same commit as the code. That rule produced
+most of the retractions here: §4.3's claim that Wizer made interpreters viable,
+§22.4's claim that an idempotency key would let a `502` carry `Retry-After`,
+§8.2's deploy-time `Module::validate` that was never implemented, §17's "no
+networking dependency", and G2 itself, which §19 measured as a sevenfold miss
+before deploy-time compilation closed it. A design document that disagrees with
+its code is worse than none, because it is read and believed.
+
+**A test that has never been seen to fail has not been seen to do anything.**
+Before trusting any guarantee in §13 or §22, delete the line under test and
+confirm the assertion goes red. Doing that found a registry collector matching
+the wrong filename, an idempotency replay path passing on a coincidence, a
+partition-key routing test that held whether or not routing worked, and an mTLS
+test that passed because the *client* distrusted the server rather than the
+reverse.
+
+### 23.2 Running a cluster
+
+Three processes. None needs another to be up first.
+
+```
+cargo run --release -p nebula-control        # gRPC :7000, HTTP gateway :8080
+cargo run --release -p nebula-worker         # gRPC :7001
+cargo run --release -p nebula-mcp            # HTTP :8090, optional (§22.3)
+```
+
+Everything is configured by environment, and every variable is optional:
+
+| Variable | Default | Process |
+|---|---|---|
+| `NEBULA_CONTROL_ADDR` | `127.0.0.1:7000` | control |
+| `NEBULA_HTTP_ADDR` | `127.0.0.1:8080` | control |
+| `NEBULA_REGISTRY_DIR` | `/tmp/nebula-registry` | control |
+| `NEBULA_AUTH_SECRET` | unset, meaning **no authentication** (§13) | control |
+| `NEBULA_WORKER_ADDR` | `127.0.0.1:7001` | worker |
+| `NEBULA_CONTROL_URL` | `http://127.0.0.1:7000` | worker |
+| `NEBULA_CACHE_DIR` | `/tmp/nebula-l2` | worker |
+| `NEBULA_EGRESS_ALLOW` | unset, meaning **no outbound HTTP** (§22.8) | worker |
+| `NEBULA_TLS_CA`, `_CERT`, `_KEY` | unset, meaning a plaintext mesh (§13) | both, all three or none |
+| `NEBULA_MCP_ADDR`, `NEBULA_GATEWAY_ADDR` | `127.0.0.1:8090`, `127.0.0.1:8080` | mcp |
+| `NEBULA_TOKEN`, `NEBULA_JS_FUNCTION` | `mcp`, `js` | mcp |
+| `NEBULA_LOG` | `info` | all, for example `nebula_worker=debug` |
+
+Deploying and calling a function, with authentication off:
+
+```
+$ curl -X PUT --data-binary @module.wasm -H 'Authorization: Bearer acme' \
+       http://127.0.0.1:8080/functions/echo
+{"content_hash":"...","wizened":false,"described":false}
+
+$ curl -X POST --data 'hello' -H 'Authorization: Bearer acme' \
+       http://127.0.0.1:8080/execute/echo
+```
+
+Under `Auth::Insecure` the bearer token *is* the tenant id, which is why the
+binaries announce it at startup. With a secret set, mint a real one:
+
+```
+$ NEBULA_AUTH_SECRET=... cargo run -p nebula-control -- mint acme
+acme.3f7c...
+```
+
+The JavaScript interpreter of §22.1 is what makes any of this reachable by an
+agent, and its artifact is not checked in because it is 7 MiB:
+
+```
+$ bash guests/build.sh
+$ curl -X PUT --data-binary @guests/interpreters/js/dist/nebula_js.wasm \
+       -H 'Authorization: Bearer acme' http://127.0.0.1:8080/functions/js
+```
+
+Tests that need it skip with a pointer rather than fail when it is missing.
+
+### 23.3 Verifying a change
+
+```
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run --release -p nebula-bench          # §19, a few minutes
+```
+
+Two things that each cost an afternoon and are not discoverable:
+
+- **Set `CARGO_INCREMENTAL=0` for a verification run.** Corrupt incremental
+  artifacts in `target/` surface as "invalid metadata" errors that read like a
+  broken dependency and are not.
+- **Do not chain those commands with `;` in PowerShell.** A `;` runs the next
+  command whether or not the previous one failed, which is how a commit once
+  went out with `cargo fmt --check` red. The chain is `if ($?) { ... }`.
+
+Note also that `cargo` is on `PATH` under bash here but not under PowerShell.
+
+### 23.4 Documented and not built
+
+Recorded so nobody goes looking for it in the source. Nothing here is blocked;
+nothing here has earned a caller yet.
+
+| Item | Described in | State |
+|---|---|---|
+| `GET /functions/{id}`, `GET /metrics` | §11.1, §14 | No route. §14's metric names are a design, not an exposition format |
+| `Drain` | §11.2 | Implemented on the worker and tested, but nothing calls it. There is no rolling-deploy driver to call it from |
+| The Wizer `400` branch | §11.1 | Unit-tested, never exercised end to end through the gateway |
+| Interpreter-level hostile corpus | §15 | The corpus is wasm-level. A hostile *script* against the Boa guest is a different attack surface and is untested |
+| §19's full protocol | §19 | The measured table is one machine, one run, no burst profile. §19 asks for a 30 s warmup, a 60 s window, three runs, and two machines for R5 |
+| Concurrent precompilation | §8.2 | `PUT` compiles on the two ring candidates one after the other, adding about 1.4 s to deploying a 7 MiB module. Doing both at once is a `join`, not a design change |
+
+### 23.5 Where a change is most likely to break something quietly
+
+- **`ExecuteRequest.tenant` is trusted by the worker.** Every isolation
+  guarantee in §22 keys on that field, and the only thing behind it is the mesh
+  mTLS of §13. Anything that lets an unauthenticated caller reach a worker's
+  gRPC port undoes all of them at once, and no test in this repository will
+  notice, because they all run inside the mesh.
+- **The fresh-instance-per-request invariant (§4.2).** §22.5 gives sessions
+  state without touching it, by keeping the state in the host rather than in the
+  guest. Anything that keeps a guest instance alive across requests moves the
+  system into §21's actor problem, which needs ownership leases and fencing
+  tokens rather than a routing change.
+- **The control plane has no `wasmtime` dependency (§8.2).** Adding it is one
+  line and removing it again is an architecture. If deploy needs a compiler, ask
+  a worker, which is what `Precompile` is for.
